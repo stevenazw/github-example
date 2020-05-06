@@ -1,0 +1,538 @@
+---
+title: "Bankruptcy forecast"
+author: "Shaochen Liu, Zewen Ai, Hanyi Shu, Jiajun Wang, Ruohan Wang"
+date: "2019/11/30"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+library(ggcorrplot)
+library(dplyr)
+library(scales)
+library(RColorBrewer)
+library(gridExtra)
+library(ggthemes)
+library(tidyr)
+library(ggplot2)
+library(plm)
+library(gplots)
+library(lattice)
+library(data.table)
+library(randomForest)
+library(ipred)
+library(caret)
+library(neuralnet)
+library(gmodels)
+library(kernlab)
+library(ROCR)
+```
+
+# Introduction: 
+
+Our team gets the financial distress data from https://archive.ics.uci.edu/ml/datasets/Polish+companies+bankruptcy+data. The dataset is about the bankruptcy prediction of Polish companies. The data was collected from Emerging Markets Information Serviced. The bankrupt companies were analyzed in the period 2000-2012, while the still operating companies were evaluated from 2007 to 2013. In this project, we used the "5thYear" dataset,  which contains financial rates from the 5th year of the forecasting period and corresponding class label that indicates bankruptcy status after one year. The data includes 5910 instances (financial statements), 410 represents bankrupted companies, 5500 firms that did not bankrupt in the forecasting period. The aim is to build models and conduct bankruptcy predication.
+
+In our project, we used T-1 corporate financial data to predict the state of bankruptcy at T time. Our team has asked the following questions:
+1. Which features will affect the probability of bankruptcy?
+2.Among all factors, which factors are most indicative of bankruptcy?
+3. What types of machine learning models perform best on this dataset?
+
+# Part I: Clean Data
+## Initial Data
+
+We load the initial data and are trying to find out the null variable and fill in them through the mean method. 
+```{r}
+set.seed(123)
+library(foreign)
+data <- read.arff("5year.arff")
+```
+
+```{r}
+# check the NA value
+na_table <- data.frame(names(data),colSums(is.na(data)),nrow(data)-colSums(is.na(data)))
+colnames(na_table) <- c("variable","NAs","Not_NAs")
+
+ggplot(data=gather(na_table,key = "is_na", value = count,-variable),aes(x = variable, y = count, fill = is_na)) + geom_bar(stat="identity") + coord_flip()+scale_colour_wsj()
+
+# build the binary variable in bankruptcy
+Bankruptcy <- data$class
+data <- data[-65]
+nahandle <- function(x) {
+  x <- ifelse(is.na(x),mean(x,na.rm = TRUE),x)
+  return(x)
+}
+data <- sapply(data,nahandle)
+data <- cbind.data.frame(Bankruptcy,data)
+#summary(data)
+#str(data)
+ggcorrplot(cor(data[2:64]))
+```
+
+From the bar plot of NA variables, it's clear that the dataset is complete except the variable "Attr37," and it will be filled with the average value of that. As we concerned that financial data have a high correlation between many of them, multicollinearity will be a big issue for the logistic model. In the following part, these high correlation data will be eliminated if one's correlation is more than 0.5. However, another exciting feature is that these variables have either a high positive/negative correlation or none correlation. Nearly one-third of variables have less correlative with others. The descriptive analysis of them is below.
+
+## Feature of Data
+
+Based on the correlation table, we are going to delete the high correlate variables to remain the minimum amounts of variables with enough information based on the whole dataset.
+```{r}
+#data_clean <- data[1]                               
+vec=as.data.frame(data)[2:64]
+
+N_col=length(vec)
+corwithdata=cor(vec)
+names=colnames(vec)
+
+corfunction <- function(){
+  l = cbind()
+  m = 1
+  n = 2
+  for (i in 1:N_col) {
+    for (j in 1:N_col){
+      if (abs(corwithdata[i,j]) > 0.5 & i<j ) {
+        l[m] <- names[i]
+        m = m + 2
+        l[n] <- names[j]
+        n = n + 2
+      }
+    }
+  }
+  l
+}
+datadelete=corfunction()
+table(datadelete)
+```
+We dropped the variables above always occurred, which are correlated to other variables. And we selected the variables which have no highly correlations. 
+
+### Bankruptcy with other variables
+
+```{r}
+h=c(1,10,11,12,14,16,17,18,19,2,22,23,24,25,26,28,3,30,31,33,34,35,36,38,39,4,40,42,43,44,45,46,47,48,49,50,51,52,53,54,56,58,6,60,62,63,7,8)
+h2=c(3,45,47,51,52,60,64,61,55,57,59,5,9,13,15,20,21,27,29,32,37,41)
+
+data_clean <- data[1]
+
+for (i in h2){
+  data_clean <- cbind(data_clean,data[i+1])
+}
+
+data_clean %>%
+  gather(-Bankruptcy,key = "var",value = "value") %>%
+  ggplot(aes(x = value, y=Bankruptcy))+geom_point()+stat_smooth()+facet_wrap(~var,scales = 'free')+theme_bw()
+
+```
+
+From the plots above, we can find the variables affect binary variable bankruptcy such as attr3, attr9, attr15, attr20, attr29, attr47, attr57.  The detail information below.
+
+3 = working capital / total assets 
+
+47 = (current assets - inventory - receivables) / short-term liabilities 
+
+57 = (current assets - inventory - short-term liabilities) / (sales - gross profit - depreciation)
+
+9 = sales / total assets
+
+15 = (total liabilities * 365) / (gross profit + depreciation) 
+
+20 = (inventory * 365) / sales
+
+29 = logarithm of total assets 
+
+According to the financial knowledge, the varibales above do affect the operation of a company. 
+
+### Variables's histogram
+
+```{r}
+h3=c(3,9,15,20,29,47,57)
+data_clean2 <- data[1]
+
+for (i in h3){
+  data_clean2 <- cbind(data_clean2,data[i+1])
+}
+
+g3 <- ggplot(data_clean2, aes(data_clean2$Attr3, fill = data_clean$Bankruptcy)) + geom_histogram(binwidth = function(x) 2 * IQR(x) / (length(x)^(1/3)))
+g9 <- ggplot(data_clean2, aes(data_clean2$Attr9, fill = data_clean$Bankruptcy)) + geom_histogram(binwidth = function(x) 2 * IQR(x) / (length(x)^(1/3)))
+g15 <- ggplot(data_clean2, aes(data_clean2$Attr15, fill = data_clean$Bankruptcy)) + geom_histogram()
+g20 <- ggplot(data_clean2, aes(data_clean2$Attr20, fill = data_clean$Bankruptcy)) + geom_histogram(binwidth = function(x) 2 * IQR(x) / (length(x)^(1/3)))
+g29 <- ggplot(data_clean2, aes(data_clean2$Attr29, fill = data_clean$Bankruptcy)) + geom_histogram(binwidth = function(x) 2 * IQR(x) / (length(x)^(1/3)))
+g47 <- ggplot(data_clean2, aes(data_clean2$Attr47, fill = data_clean$Bankruptcy)) + geom_histogram()
+g57 <- ggplot(data_clean2, aes(data_clean2$Attr57, fill = data_clean$Bankruptcy)) + geom_histogram()
+
+#grid.arrange(g3, g9, g15, g20, g29, g47, g57, nrow = 3)
+g3
+g9
+g15
+g20
+g29
+g47
+g57
+```
+
+```{r}
+#data_clean2 %>%
+#  gather(-Bankruptcy,key = "var",value = "value") %>%
+#  ggplot(aes(value)) + facet_wrap(~var, scales = 'free_x') + #geom_histogram(binwidth = function(x) 2 * IQR(x) / (length(x)^(1/3)))
+```
+
+# Part II: Logistic model
+
+Since the bankruptcy data is binary data, we just directly do the Logistic Regression Model and observe the effect of current financial performance on Bankruptcy.
+
+Step1: 
+```{r}
+data_logistic2=data
+set.seed(123)
+data_rand=data_logistic2[order(runif(nrow(data_logistic2))),]
+#str(data_rand)
+train <- data_rand[1:4000, ]
+test <- data_rand[4001:5910, ]
+
+model_logistic=glm(Bankruptcy~., family ="binomial", data=train)
+summary(model_logistic)
+```
+
+
+Step2: All variables are significant from the logistic model above, we doubt the high correlation of variables causes that.  To select the variables,  We dropped the variables which are correlated to more other variables. And we decided on the variables which have no highly correlations. [Based on the method we did in the feature of data.]
+
+
+Step 3: Conduct the best logistic model for now.
+
+We also used the backstepping method to get the minimum AIC model and then adjusted the variables to make sure they're significant.
+
+
+```{r}
+set.seed(123)
+data_rand=data_logistic2[order(runif(nrow(data_logistic2))),]
+#str(data_rand)
+train <- data_rand[1:4000, ]
+test <- data_rand[4001:5910, ]
+model_logistic2=glm(Bankruptcy~Attr3 + Attr45 + Attr47 + Attr51 + Attr52 + Attr60 + Attr64+ Attr61 + Attr55 +Attr57+ Attr59+ Attr5 +Attr9 +Attr13+Attr15+Attr20+Attr21+Attr27+Attr29+Attr32+Attr37+Attr41, family ="binomial", data=train)
+
+summary(model_logistic2)
+#backmodel_logistic2=step(model_logistic2,direction="backward")
+#summary(backmodel_logistic2)
+
+#After we use backstep to get the Minimum AIC model, we find the best logistic model with minimum AIC.
+backmodel_logistic2_final=glm(Bankruptcy~ Attr3 + Attr47 + Attr51 + Attr57 + 
+    Attr9 + Attr15 + Attr20 + Attr29, family ="binomial", data=train)
+summary(backmodel_logistic2_final)
+```
+
+
+# Part III: Model Selection
+
+Based on the historical financial data of a sample of companies, we applied logistic regression, KKN, random forest, and other models to predict the probability of bankruptcy. 
+
+## Model 1: Logistic
+
+```{r}
+set.seed(123)
+logistic2 <- glm(formula = Bankruptcy ~ Attr3 + Attr47 + Attr51 + Attr57 + 
+    Attr9 + Attr15 + Attr20 + Attr29, family = "binomial", 
+    data = train)
+plot(logistic2)
+summary(logistic2)
+```
+
+
+In the logistic model, we conclude that following variables are signal for bankruptcy next year: Attr3--working capital/total assets, Attr47--(inventory x 365)/COGS, Attr51--(short term liabilities/total assets), Attr57--(current assets-inventory-short term liabilities)/(sales-gross profit-depreciation),Attr9--(sales/total asset), Attr15--(total liabilities x 365)/(Gross profit + depreciation), Attr20--(inventory x 365/sales) and Attr29--logarithm of total assets. Working capital is an important measure of financial health since creditors can measure a company's ability to pay off its debts within a year. Inventory turnover, asset turnover, and liability turnover indicate the efficiency or effectiveness of a company's management and debt-paying ability. Log (Asset), and the current liability ratio reflect the financial position in the balance of sheet directly. Therefore, after measuring the financial positions, Operation Capability, and debt-pay ability, we could know the healthy states of companies and conclude whether it would be bankruptcy next year.
+
+
+```{r}
+##Predict bankruptcy using logistic regression
+pred1=predict(logistic2,test)
+prob1=exp(pred1/(1-exp(pred1)))
+bankruptcy.pred=1*(pred1>.3)
+##Accuracy
+table(bankruptcy.pred, test$Bankruptcy)
+agreement_log <- bankruptcy.pred == test$Bankruptcy
+table(agreement_log)
+prop.table(table(agreement_log))
+```
+
+
+The accuracy for logistic model: `r prop.table(table(agreement_log))[2]` 
+
+
+
+### ROC curve
+```{r}
+
+library(ROCR)
+pred <- prediction(predictions = prob1, labels = test$Bankruptcy)
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+plot(perf, main = "ROC curve for Bankruptcy", col = "blue", lwd = 3)
+abline(a = 0, b = 1, lwd = 2, lty = 2)
+```
+
+
+
+## Model 2: KNN
+
+```{r}
+##Predict bankruptcy using knn
+set.seed(123) 
+##Build the normalized function and normalize the dataframe
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+knndata_n = as.data.frame(lapply(data_rand[2:65], normalize))
+#summary(knndata_n)
+
+##Choose the training and testing group for knn model
+knn_train = knndata_n[1:4000, ]
+knn_test = knndata_n[4001:5910, ]
+knn_train_labels = data_rand$Bankruptcy[1:4000]
+knn_test_labels = data_rand$Bankruptcy[4001:5910]
+
+##We choose multiple k values to run knn models and it turns out that k=15 gives us the highest accuracy of predicting bankruptcy.
+library(class)
+for (k in c(1,3,5,7,9,11,13,15)) {
+set.seed(123) 
+knn_test_pred <- knn(train = knn_train, test = knn_test,
+                      cl = knn_train_labels, k=k)
+table(knn_test_pred, knn_test_labels)
+print(k)
+print(mean(knn_test_pred == knn_test_labels))
+}
+
+##Choose k=9 as our best knn model
+knn_best_pred <- knn(train = knn_train, test = knn_test,
+                      cl = knn_train_labels, k=9)
+plot(knn_best_pred)
+summary(knn_best_pred)
+```
+
+
+```{r}
+##Confusion matrix for k=9
+library(gmodels)
+CrossTable(x = knn_test_labels, y = knn_best_pred, 
+           prop.chisq=FALSE)
+
+table(knn_best_pred, knn_test_labels)
+agreement_knn <- knn_best_pred == knn_test_labels
+table(agreement_knn)
+prop.table(table(agreement_knn))
+```
+
+The Accuracy for knn model is: `r prop.table(table(agreement_knn))[2]`
+
+
+
+## Model 3: Decision Tree 
+```{r results="hide"}
+library(C50)
+set.seed(123)
+data_rand$Bankruptcy <- as.factor(data_rand$Bankruptcy)
+train$Bankruptcy <- as.factor(train$Bankruptcy)
+test$Bankruptcy <- as.factor(test$Bankruptcy)
+b_modeldt <- C5.0(train[-1], train$Bankruptcy,trials = 10)
+b_modeldt
+plot(b_modeldt)
+#summary(b_modeldt)
+```
+
+
+```{r}
+## Confusion table
+b_modeldt_pred <- predict(b_modeldt, test)
+table(b_modeldt_pred, test$Bankruptcy)
+agreement_dt <- b_modeldt_pred == test$Bankruptcy
+table(agreement_dt)
+prop.table(table(agreement_dt))
+```
+
+The Accurancy for decision tree is: `r prop.table(table(agreement_dt))[2]`
+
+Then we used the ipred bagged decision tree 
+```{r}
+library(ipred)
+set.seed(123)
+mybag <- bagging(Bankruptcy ~ ., data = data_rand, nbagg = 25)
+
+b_pred <- predict(mybag, data_rand)
+table(b_pred, data_rand$Bankruptcy)
+
+# estimate performance of ipred bagged trees
+library(caret)
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 10)
+train(Bankruptcy ~ ., data = data_rand, method = "treebag", 
+      trControl = ctrl)
+```
+
+The accurate rate of ipred bagged trees model gets the rate of 0.9637902 with Kappa rate of 0.6757133.
+
+## Model 4: Random Forest
+
+```{r}
+library(randomForest)
+rfmodel <- randomForest(Bankruptcy ~ .,mtry=8,ntree=2000, data = data_rand)
+rfmodel
+library(caret)
+varImpPlot(rfmodel,type=2,main="Random Forest Ranking Plot---Bankruptcy Prediction")
+```
+
+Accrancy: for the random forest model, the acurrancy is 95.57%
+
+## Model 5: Neural Network
+```{r results='hide'}
+##Predict bankruptcy using neural network, we choose a model with 2 hidden neuros.
+set.seed(123) 
+nn_train=data_rand[1:4000,]
+nn_test=data_rand[4001:5910,]
+library(neuralnet)
+nnmodel1=neuralnet(formula = Bankruptcy ~ .,data=nn_train)
+summary(nnmodel1)
+plot(nnmodel1)
+```
+
+
+```{r}
+model_results1 <- compute(nnmodel1, nn_test)
+predicted_results1=ifelse(model_results1$net.result[,1]>=.5,1,0)
+
+library(gmodels)
+CrossTable(x= nn_test$Bankruptcy,  y = predicted_results1,prop.chisq=FALSE)
+table(predicted_results1, nn_test$Bankruptcy)
+agreement_nn <- predicted_results1 == nn_test$Bankruptcy
+table(agreement_nn)
+prop.table(table(agreement_nn))
+```
+Accrancy: for the Neural Network model, the acurrancy is: `r prop.table(table(agreement_nn))`
+
+## Model 6: SVM Model
+```{r}
+library(kernlab)
+set.seed(123)
+b_classifier <- ksvm(Bankruptcy~ ., data = train, kernel = "rbfdot")
+```
+
+
+```{r}
+## Confusion table
+b_predictions <- predict(b_classifier, test)
+table(b_predictions, test$Bankruptcy)
+agreement_svm <- b_predictions == test$Bankruptcy
+table(agreement_svm)
+prop.table(table(agreement_svm))
+```
+Accrancy: for the SVM model, the acurrancy is: `r prop.table(table(agreement_svm))[2]`
+
+# Part IV: Best model Analysis
+
+Answer the questions we mentioned before
+```{r}
+library("ggplot2")
+# Show accuracies of each model in a table
+finalperformance <- data.frame( "Logistic" = 93.19, "KNN" = 93.54, "Random Forest" = 95.57, "Decision Tree"=96.39, "Neural Network" = 93.25,"SNM" = 92.88)
+finalperformance
+
+final <- data.frame(method = c("Logistic", "KNN", "Random Forest", "Decision Tree", "Neural Network", "SVM"), performance = c(93.19, 93.54, 95.57, 96.39, 93.25, 92.88))
+# Plot the preformance
+#ggplot(final, aes(method, performance)) + geom_col()+ggtitle("Prediction Preformance")
+ggplot(data = final) + geom_bar(aes(x = method, y = performance, fill=method), stat="identity") + ggtitle("Prediction Preformance")
+```
+
+The problems mentioned at the beginning of the report showed below.
+
+Q1.Which features will affect the probability of bankruptcy?
+In the logistic model, we found that following variables are signal for bankruptcy next year: working capital/total assets, (inventory x 365)/COGS, (short term liabilities/total assets), (current assets-inventory-short term liabilities)/(sales-gross profit-depreciation),(sales/total asset), (total liabilities x 365)/(Gross profit + depreciation), (inventory x 365/sales) and logarithm of total assets. 
+
+Q2.Among all factors, which factors are most indicative of bankruptcy?
+When estimating the healthy states of companies, we could emphasize Working capital, Operation Capability, and asset-liability position and Solvency indicators, These financial performances could help us to conclude whether it would be bankruptcy next year.
+
+Q3.What types of machine learning models perform best on this dataset?
+After applying the logistic model and various models, We select our best final model--Decision Tree. Its predicted accuracy is 96.39%.
+
+
+Q4.Who can benefit from this model? 
+1. Bank/lender- This model can be used to decide if we should give those companies loans depending on the key factors. By predicting the bankruptcy of a company, lenders are able to control cash flow risk and protect themselves from bad debt scenarios in order to achieve stability.
+2. Companies- Since we take into consideration the lag effect of all variables, it is possible for companies to leverage the key current operation or financial factors to detect the company health state in advance. 
+3. Regulating agency/ Rating agency- Set criterias for company financial health.
+
+Q5: How to use this model? 
+This model's key predictor variables are from the companies' financial reports. And all of these factors are very common in internal or external financial audit and evaluation. Thus, no matter for bank, companies or regulation agencies, they can utilize our model easily--just find these easily accessible variables in the financial reports and apply our model. Then they can predict the probability of bankruptcy.
+
+Q6: What are the risk and challenges?
+1. Company size or capital size is not included in our model. For some mature company with large capital size, they might be public companies. Then they have higher capital liquidity and more funding methods. It will definitely help these companies to prevent from bankruptcy.
+2. Sectors or industry is not considered here. Our model used Polish companies data to conduct our prediction. As we know, the difference between different countries, industries and sectors can be very large. We haven't tried other countries' data and it can be the next step to improve our model.
+3. Data accuracy is very important for our model. It is very obvious that only the true data can predict the bankruptcy accurately. Our model hasn't considered the fake information factor and conducted the sensitivity test of the true and false data. The model user need to pay attention to the data accuracy.
+
+
+
+
+
+
+# Appendix
+```{}
+## Appendix
+
+Data Description
+
+Attr1	net profit / total assets 
+Attr2	total liabilities / total assets 
+Attr3	working capital / total assets 
+Attr4	current assets / short-term liabilities 
+Attr5	[(cash + short-term securities + receivables - short-term liabilities) / (operating expenses - depreciation)] * 365 
+Attr6	retained earnings / total assets 
+Attr7	EBIT / total assets 
+Attr8	book value of equity / total liabilities 
+Attr9	sales / total assets 
+Attr10	equity / total assets 
+Attr11	(gross profit + extraordinary items + financial expenses) / total assets 
+Attr12	gross profit / short-term liabilities 
+Attr13	(gross profit + depreciation) / sales 
+Attr14	(gross profit + interest) / total assets 
+Attr15	(total liabilities * 365) / (gross profit + depreciation) 
+Attr16	(gross profit + depreciation) / total liabilities 
+Attr17	total assets / total liabilities 
+Attr18	gross profit / total assets 
+Attr19	gross profit / sales 
+Attr20	(inventory * 365) / sales
+Attr21	sales (n) / sales (n-1) 
+Attr22	profit on operating activities / total assets 
+Attr23	net profit / sales 
+Attr24	gross profit (in 3 years) / total assets 
+Attr25	(equity - share capital) / total assets 
+Attr26	(net profit + depreciation) / total liabilities 
+Attr27	profit on operating activities / financial expenses 
+Attr28	working capital / fixed assets 
+Attr29	logarithm of total assets 
+Attr30	(total liabilities - cash) / sales 
+Attr31	(gross profit + interest) / sales 
+Attr32	(current liabilities * 365) / cost of products sold 
+Attr33	operating expenses / short-term liabilities 
+Attr34	operating expenses / total liabilities 
+Attr35	profit on sales / total assets 
+Attr36	total sales / total assets 
+Attr37	(current assets - inventories) / long-term liabilities 
+Attr38	constant capital / total assets 
+Attr39	profit on sales / sales 
+Attr40	(current assets - inventory - receivables) / short-term liabilities 
+Attr41	total liabilities / ((profit on operating activities + depreciation) * (12/365)) 
+Attr42	profit on operating activities / sales 
+Attr43	rotation receivables + inventory turnover in days 
+Attr44	(receivables * 365) / sales 
+Attr45	net profit / inventory 
+Attr46	(current assets - inventory) / short-term liabilities 
+Attr47	(inventory * 365) / cost of products sold 
+Attr48	EBITDA (profit on operating activities - depreciation) / total assets 
+Attr49	EBITDA (profit on operating activities - depreciation) / sales 
+Attr50	current assets / total liabilities 
+Attr51	short-term liabilities / total assets 
+Attr52	(short-term liabilities * 365) / cost of products sold) 
+Attr53	equity / fixed assets 
+Attr54	constant capital / fixed assets 
+Attr55	working capital 
+Attr56	(sales - cost of products sold) / sales 
+Attr57	(current assets - inventory - short-term liabilities) / (sales - gross profit - depreciation) 
+Attr58	total costs /total sales 
+Attr59	long-term liabilities / equity 
+Attr60	sales / inventory 
+Attr61	sales / receivables 
+Attr62	(short-term liabilities *365) / sales
+Attr63	sales / short-term liabilities 
+Attr64	sales / fixed assets
+```
