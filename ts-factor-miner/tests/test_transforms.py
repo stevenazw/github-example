@@ -38,12 +38,25 @@ def test_chg_log_for_price_arith_for_level():
     pd.testing.assert_series_equal(sig_l, d2 / d2.rolling(252, min_periods=126).std(), check_names=False)
 
 
-def test_price_with_nonpositive_falls_back_to_arith():
-    x = make_x(kind="level")
-    x.iloc[10] = -1.0
-    sig = make_signal(x, "chg_5", "price")
-    pd.testing.assert_series_equal(sig, make_signal(x, "chg_5", "level"))
-    assert np.isfinite(sig.dropna()).all()
+def test_price_with_nonpositive_is_nan_pointwise():
+    x = make_x(kind="price")
+    x.iloc[400] = -1.0
+    sig = make_signal(x, "chg_5", "price")  # must not raise
+    # the non-positive point and the point 5 rows later (its lag partner) are NaN
+    assert np.isnan(sig.iloc[400]) and np.isnan(sig.iloc[405])
+    assert np.isfinite(sig.iloc[399]) and np.isfinite(sig.iloc[406])
+    assert not np.isinf(sig).any()
+
+
+def test_price_nonpositive_in_future_does_not_change_past():
+    x = make_x(kind="price")
+    t0 = 400
+    x2 = x.copy()
+    x2.iloc[t0 + 20] = -1.0
+    for name in TRANSFORM_NAMES:
+        a = make_signal(x, name, "price")
+        b = make_signal(x2, name, "price")
+        pd.testing.assert_series_equal(a.iloc[:t0 + 1], b.iloc[:t0 + 1])
 
 
 def test_z_window_nan_and_constant():

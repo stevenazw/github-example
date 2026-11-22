@@ -19,9 +19,9 @@ def allowed_transforms(freq):
 
 
 def _raw_change(x, k, kind):
-    """Unstandardized k-day change: log diff for positive prices, else arithmetic diff."""
-    if kind == "price" and (x.dropna() > 0).all():
-        lx = np.log(x)
+    """Unstandardized k-day change: log diff for prices (NaN where x_t or x_{t-k} <= 0), else arithmetic diff."""
+    if kind == "price":
+        lx = np.log(x.where(x > 0))
         return lx - lx.shift(k)
     return x - x.shift(k)
 
