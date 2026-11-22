@@ -17,7 +17,6 @@ ENV_CACHE = "DATABANK_CACHE"
 TOP_SECTIONS = {"target", "databank", "sample", "universe", "lags", "signals", "stats", "verdict"}
 TARGET_KINDS = {"futures_chain", "spot"}
 CLASS_KEYS = {"class_one", "class_two", "class_three"}
-VERDICT_MODES = {"per_factor", "family"}
 
 
 @dataclass
@@ -70,7 +69,7 @@ class SignalsConfig:
 @dataclass
 class StatsConfig:
     hac_lags: int = 5
-    min_obs: int = 500
+    min_obs: int = 250
     n_boot: int = 1000
     min_shift: int = 60
     seed: int = 20261122
@@ -78,13 +77,10 @@ class StatsConfig:
 
 @dataclass
 class VerdictConfig:
-    fwer_alpha: float = 0.05
-    fdr_q: float = 0.10
-    dedupe_corr: float = 0.7
-    extra_lag_t_min: float = 2.0
-    mode: str = "per_factor"
     z_pass: float = 2.5
     z_weak: float = 2.0
+    dedupe_corr: float = 0.7
+    extra_lag_t_min: float = 2.0
 
 
 @dataclass
@@ -281,12 +277,8 @@ def load_config(path: str | os.PathLike) -> Config:
                     {"std_window": (int,), "clip": (int, float), "vol_halflife": (int,)})
     sec = _section(raw, "stats", {"hac_lags", "min_obs", "n_boot", "min_shift", "seed"})
     stats = _fill(StatsConfig, sec, "stats", {k: (int,) for k in sec})
-    sec = _section(raw, "verdict", {"fwer_alpha", "fdr_q", "dedupe_corr", "extra_lag_t_min", "mode",
-                                    "z_pass", "z_weak"})
-    verdict = _fill(VerdictConfig, sec, "verdict",
-                    {k: ((str,) if k == "mode" else (int, float)) for k in sec})
-    if verdict.mode not in VERDICT_MODES:
-        raise ValueError(f"verdict.mode must be one of {sorted(VERDICT_MODES)}, got {verdict.mode!r}")
+    sec = _section(raw, "verdict", {"z_pass", "z_weak", "dedupe_corr", "extra_lag_t_min"})
+    verdict = _fill(VerdictConfig, sec, "verdict", {k: (int, float) for k in sec})
     if not verdict.z_pass > verdict.z_weak > 0:
         raise ValueError("verdict requires z_pass > z_weak > 0")
 

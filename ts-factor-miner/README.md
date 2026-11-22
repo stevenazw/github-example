@@ -8,25 +8,26 @@
 
 1. 从 DataBank 数据库取几百条原始序列。
 2. 每条序列按固定的变换集合生成候选信号。
-3. 在 train 段上逐个检验候选对次日收益的预测力。
-4. 按单因子门槛筛选候选，并并排给出实际通过数与纯噪声预期通过数（族错误率方式可选）。
-5. 给出 shortlist 和组合因子。
+3. 每个候选作为独立的单因子检验，在它自己与标的重叠的 train 样本上检验对次日收益的预测力。
+4. 过门槛（PASS / WEAK_PASS）的候选留下。
+5. 对留下的候选按相关性去重，代表组成 shortlist。
 6. 在 holdout 上只确认一次。
 
 ## 2. 设计原则
 
-- **挖掘阶段按单因子门槛筛选，成立与否交给 holdout。** 以 TY 为例，train 段约 5400 天、族大小约 2500 时，族错误率（FWER）门槛要求 |z| ≥ 4.2，相当于日频 IC ≈ 0.057，现实因子的 IC 多在 0.02–0.04，这个门槛对现实因子不可达，因此只作参考。默认模式 `per_factor` 沿用单因子检验的门槛（|z| ≥ 2.5 为 PASS，2.0–2.5 为 WEAK_PASS，< 2 为 REJECT），不因同批测了多少个而打折。作为诚实性的配套，报告并排给出"实际通过数"与"纯噪声下预期通过数"（全族与各分组，用循环平移零分布算，自动考虑候选之间的相关性）；observed 接近 null_mean 说明通过名单大部分来自噪声。holdout 是最终裁判。族错误率方式保留为可选模式（`mode = "family"`）。
-- **变换集合小而固定（6 个）。** 不做参数网格，不做公式搜索。每多一个候选，族错误率门槛和纯噪声下的预期通过数都会上升。
+- **逐候选的单因子检验。** 每个候选都是一次独立检验，没有"同批"概念，也没有跨候选的校正或组合。门槛（|z| ≥ 2.5 为 PASS，2.0–2.5 为 WEAK_PASS，< 2 为 REJECT）事先固定，不因测了多少个候选而打折。通过门槛只是"留下"，成立与否由 holdout 判定。
+- **短历史候选在自身重叠样本上检验，并各自切分。** 候选序列的历史可能比标的短（例如标的 TY 从 1999 年开始，某序列 2019 年才有）。每个候选只用它自己与标的重叠的有效行，train / holdout 按这个候选自己的样本切分，而不是按标的日期一刀切。
+- **变换集合小而固定（6 个）。** 不做参数网格，不做公式搜索。
 - **防前视是数据层的职责。** 所有序列先 as-of 对齐到标的日历，再按可得性滞后；信号只用因果变换。
-- **train/holdout 隔离。** `mine` 的任何输出不依赖 holdout；`confirm` 是唯一打开 holdout 的入口，用 lock 文件保证只看一次。
+- **train/holdout 隔离（逐候选）。** 候选 j 在 `mine` 中的任何统计量都不依赖它自己 holdout 行（行号 ≥ `end_row[j]`）的数据，包括 y 在这些行的取值；`confirm` 是唯一打开 holdout 的入口，用 lock 文件保证只看一次。
 - **判据在看数据前固定。** 门槛写在配置的 `[verdict]` 里。
 
 ## 3. 流程
 
 ```
-databank.py        transforms.py      stats.py            pipeline.py          confirm.py
-数据库 --> Panel --> 候选信号 S --> HAC t / 零分布 / EB --> 判决+输出 runs/ --> holdout 确认
- (as-of 对齐+滞后)  (6 个因果变换)   (只用 train 段)        (shortlist 等)      (一次, lock)
+databank.py        transforms.py      stats.py              pipeline.py            confirm.py
+数据库 --> Panel --> 候选信号 S --> HAC t / 零分布 sd --> 逐候选检验+去重 runs/ --> holdout 确认
+ (as-of 对齐+滞后)  (6 个因果变换)   (只用各自 train 行)    (shortlist 等)           (一次, lock)
 ```
 
 ### 3.1 时间约定
@@ -53,38 +54,36 @@ databank.py        transforms.py      stats.py            pipeline.py          c
 
 6 个变换：`chg_1`、`chg_5`、`chg_20`、`chg_60`（k 日变化）和 `z_60`、`z_252`（相对滚动均值与标准差的 z-score）。k 日变化除以其自身在 `std_window`（默认 252）上的滚动标准差，最后截尾到 ±`clip`（默认 4）。日频序列用全部 6 个，周频序列只用 `chg_5`、`chg_20`、`chg_60`、`z_252`，因为周频序列再取 1 日变化或 60 日 z 没有意义。候选 id 形如 `<series>|<transform>`。所有变换只用 ≤ t 的数据。
 
-### 3.4 检验统计量（`stats.py`）
+### 3.4 逐候选样本与切分（`pipeline.split_rows`）
 
-统计量是 y_fwd 对 s 的一元回归斜率的 Newey–West HAC t 值（`hac_lags`，默认 5）。
+设 `y_fwd` 为目标，`S` 为候选信号（全时间轴）。先只保留 `y_fwd` 有限的行（`rows`，行号 0..T−1 指这些行内的位置）。候选 j 的有效行是 `S[:, j]` 有限的行，共 `n_j` 个。切分点：
 
-零分布：把 y 相对信号做循环平移（平移量在 `min_shift`..`T-min_shift` 间均匀取），重复 `n_boot` 次。这样保留各自的自相关和信号间的相关性，只打断对齐。每个候选除以自身零分布的标准差得到 z，因为厚尾信号的 t 天然更分散，不标准化会不公平。
+- `k_j = floor(n_j × (1 − holdout_frac))`，`p_j` 为第 k_j+1 个有效行的行号（k_j = n_j 时取 T）；
+- 向下取整到 21 的倍数：`end_row[j] = (p_j // 21) × 21`，这样切分点只取少数几个不同的值，零分布按切分点分桶计算；
+- train 行 = 有效行且行号 < `end_row[j]`；holdout 行 = 有效行且行号 ≥ `end_row[j]`。
 
-### 3.5 判决与提示（`pipeline.py`）
+每一行 p 的目标是 `r[p+1]`，行不相交即收益不相交。`split_rows` 对列用 cumsum 向量化。
 
-判决模式由 `[verdict] mode` 决定：
+### 3.5 检验统计量（`stats.py`）
 
-- `per_factor`（默认，单因子门槛）：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`；z 非有限为 `REJECT`。不做同批校正。
-- `family`（族错误率 / FDR 校正）：single-step maxT 的 `p_fwer ≤ fwer_alpha` 为 `PASS`，BH `q_bh ≤ fdr_q` 为 `WEAK_PASS`，否则 `REJECT`。
+统计量是 y_fwd 对 s 的一元回归斜率的 Newey–West HAC t 值（`hac_lags`，默认 5），只在候选自己的 train 行上算；train 有效行数不足 `min_obs`（默认 250）的候选记为样本不足，不进入结果表（`n_skipped`）。
 
-两种模式下 `p_fwer`、`q_bh`、omnibus、EB 都照常计算并输出，另一种模式的读数仅供参考。shortlist 的定义不变：非 REJECT 候选去冗余后的代表。
+零分布标准差 `null_sd`：对候选 j，把 y 在 `[0, end_row[j])` 上做循环平移（平移量在 `min_shift`..`e-min_shift` 间均匀取），重复 `n_boot` 次重算 t*，取其标准差。这保留各自的自相关，只打断对齐；厚尾信号的 t 天然更分散，除以自身的 null_sd 才公平。具有相同 `end_row` 的候选共用一次计算。`end_row − 2×min_shift < 1` 的候选样本太短无法平移，同样计入 `n_skipped`。
 
-**通过数与噪声预期。** 对阈值 `z_weak`、`z_pass`、3.0，在全族和每个分组上给出 `observed`（实际 \|z\| ≥ 阈值的候选数）、`null_mean`（循环平移零分布各次重复中同一计数的均值，即纯噪声下的预期通过数）和 `p = (1 + #{零分布计数 ≥ observed}) / (B + 1)`，写入 `exceed.csv`。降低门槛不会增加证据；分组内候选高度相关，observed 不等于独立发现的个数。
+`z = t / null_sd`；`p` 是由 |z| 按正态近似得到的双侧 p，仅供展示。
 
-`flags` 列给出两个提示，不改变判决：
+### 3.6 判决、提示与去重（`pipeline.py`）
 
-- `half_flip`：train 前后半段的 t 异号。
-- `xlag_weak`：信号再多滞后一天后 |t| 低于 `extra_lag_t_min` 或变号，说明信息集中在最近一天，信号短命，或取值时刻晚于假设。
-
-### 3.6 Omnibus、经验贝叶斯与组合因子
-
-- **omnibus**：全族与各分组（按 `class_two`，加上 Chain / Carry / Spread）的 mean(z²) 对比零分布；分组之间做 Holm 校正（`groups.csv`）。
-- **经验贝叶斯**：两组混合模型 z ~ π0·N(0, v0) + (1−π0)·N(0, v0 + n·τ²)。v0 是零分布下 z² 的均值，n = (z/ic)²。每个候选得到 `p_signal`（= 1 − local fdr）、收缩后的 `post_ic`、`p_pos`（P(IC>0)）。
-- **去冗余**：对非 REJECT 的候选按 |z| 从高到低贪心聚类，信号相关系数绝对值 ≥ `dedupe_corr` 的归入同一代表；各簇代表组成 shortlist。
-- **组合因子**：全族候选按 `post_ic` 加权求和（缺失值按 0），权重在 train 上定死。仅当 τ² > 0 且 π0 < 1 时有定义（`run.json` 的 `composite_defined`）。
+- **判决**：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`；z 非有限为 `REJECT`。门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_train）。
+- **flags**（逐候选，不改变判决）：
+  - `half_flip`：把候选自己的 train 有效行按个数对半分，前后半段的 t 都有限且异号。
+  - `xlag_weak`：信号再多滞后一天后（仍用该候选自己的 train 行）|t| 低于 `extra_lag_t_min`、变号或非有限，说明信息集中在最近一天，信号短命，或取值时刻晚于假设。
+- **去重**：对所有非 REJECT 候选按 |z| 从高到低贪心聚类。两两相关系数只用双方 train 行的交集，共同行少于 100 视为不相关；相关系数绝对值 ≥ `dedupe_corr` 的归入同一代表。各簇代表组成 shortlist，每个代表附 `cluster_size`（它代表的非 REJECT 候选数，含自己）。
+- **描述性回测**：shortlist 候选在各自 train 行上算 Sharpe（毛/净）、换手、一阶自相关。
 
 ### 3.7 holdout 确认（`confirm.py`）
 
-shortlist 每个候选按 train 上的符号做单边 HAC t 检验，得到未校正的 `p_one` 和 Holm 校正的 `p_holm`；组合因子单独做一个单边检验（不并入 Holm）。结论分档：≤ 0.05 为 `CONFIRMED`，≤ 0.10 为 `WEAK`，否则 `NOT_CONFIRMED`；t 非有限为 `INSUFFICIENT`。分档依据随模式而异：`per_factor` 用 `p_one`（`p_holm` 仍输出，仅供参考），`family` 用 `p_holm`。`confirm.json` 另含 `verdict_mode`、`n_tested`（t 有限的候选数）和 `expected_by_chance`（= 0.05 × `n_tested`，按 5% 显著性纯运气预期被确认的个数），应与实际的 `n_confirmed` 对照着读。完成后写入 `confirm.lock`。
+shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对每个 shortlist 候选取它自己的 holdout 行，按 train 上的符号做单边 HAC t 检验（至少 60 个观测）：`t_signed = sign_train × t_hold`，`p_one = norm_sf(t_signed)`。`p_one ≤ 0.05` 为 `CONFIRMED`，`≤ 0.10` 为 `WEAK`，否则 `NOT_CONFIRMED`；t 非有限为 `INSUFFICIENT`。结果含 holdout 的 `n`、起止日期、IC 与 Sharpe（毛/净）。没有跨候选的校正。完成后写入 `confirm.lock`。短样本候选的 holdout 也短，确认能力有限。
 
 ## 4. 快速开始
 
@@ -121,13 +120,10 @@ python -m pytest -q
 
 | 文件 | 内容 |
 |---|---|
-| `report.md` | 人类可读报告：结论、判定门槛与多重检验参考、通过数量与噪声预期、shortlist、watchlist、分组 omnibus；confirm 之后追加 holdout 结果 |
-| `run.json` | 机器可读摘要：日期切分、族大小、零分布门槛 `hurdle`、omnibus、EB 参数、判决计数、shortlist、`verdict_mode`、全族 `exceed` |
-| `candidates.csv` | 族内全部候选，按 \|z\| 降序 |
-| `shortlist.csv` | 去冗余后的代表候选，另含描述与 train 段回测列 |
-| `watchlist.csv` | |z| 最大的 200 个候选去冗余后取前 20 个，不一定通过检验，仅供参考 |
-| `exceed.csv` | 通过数与噪声预期：`scope`（ALL 或分组名）、`threshold`、`n_cand`、`observed`、`null_mean`、`p` |
-| `groups.csv` | 分组 omnibus：`n_cand`、`mean_z2`、`null_mean_z2`、`p`、`p_holm` |
+| `report.md` | 人类可读报告：结论、数据与样本、判定标准、shortlist、提示与局限、下一步；confirm 之后追加 holdout 确认 |
+| `run.json` | 机器可读摘要：配置快照、`dates`（样本起止）、`n_rows`、`n_series`、`n_candidates`、`n_tested`、`n_skipped`、`n_train_summary`、判决计数、shortlist；不含任何 holdout 取值 |
+| `candidates.csv` | 全部已检验候选，按 \|z\| 降序 |
+| `shortlist.csv` | 去重后的代表候选，另含 `cluster_size`、描述与 train 回测列；可为空表 |
 | `config.toml` | 本次运行所用配置的副本（`confirm` 从这里重建配置） |
 | `panel/` | 保存的 Panel：`panel.pkl`（主数据，pickle）、`meta.csv`、`excluded.csv`、`info.json` |
 | `confirm.csv` / `confirm.json` | holdout 确认结果（`confirm` 之后才出现） |
@@ -136,25 +132,24 @@ python -m pytest -q
 
 `panel.pkl` 含行情数据，且用 pickle 序列化，不要加载来路不明的文件。
 
-`candidates.csv` 主要列：
+`candidates.csv` 列：
 
 | 列 | 含义 |
 |---|---|
 | `id`, `series`, `transform` | 候选 id（`series\|transform`）、原始序列、变换名 |
 | `group`, `kind`, `freq` | 分组（`class_two`，或 Chain / Carry / Spread）、price/level、D/W |
-| `n` | 有效观测数 |
+| `n_train`, `train_start`, `train_end` | 该候选 train 有效行数及首末日期 |
+| `n_holdout` | 该候选 holdout 有效行的个数（只是个数，不含任何取值） |
 | `t`, `null_sd`, `z` | HAC t；该候选零分布 t 的标准差；z = t / null_sd |
-| `ic` | 样本 IC（y 与 s 的相关） |
+| `ic` | train 样本 IC（y 与 s 的相关） |
 | `sign` | t 的符号，`confirm` 用它定方向 |
-| `p_cal`, `q_bh` | 由 \|z\| 按正态近似得到的双侧 p；BH 校正后的 q |
-| `p_fwer` | single-step maxT 的族错误率 p 值 |
-| `verdict` | PASS / WEAK_PASS / REJECT（依 `mode`：per_factor 看 \|z\|，family 看 `p_fwer` / `q_bh`） |
-| `p_signal`, `shrink`, `post_ic`, `p_pos` | EB：非零后验概率、收缩系数、后验 IC、P(IC>0) |
-| `t_h1`, `t_h2`, `t_xlag` | 前半段 t、后半段 t、多滞后一天的 t |
+| `p` | 由 \|z\| 按正态近似得到的双侧 p，仅供展示 |
+| `verdict` | PASS / WEAK_PASS / REJECT |
+| `t_h1`, `t_h2`, `t_xlag` | train 前半段 t、后半段 t、多滞后一天的 t |
 | `flags` | `half_flip` / `xlag_weak`，分号分隔 |
 | `rep` | 非 REJECT 候选所属簇的代表 id |
 
-`shortlist.csv` 和 `watchlist.csv` 在这些列之外还有 `sharpe_gross`、`sharpe_net`、`turnover`、`ac1` 与 `description`。
+`shortlist.csv` 在这些列之外还有 `cluster_size`、`sharpe_gross`、`sharpe_net`、`turnover`、`ac1` 与 `description`。
 
 ## 6. 配置说明
 
@@ -164,7 +159,7 @@ python -m pytest -q
 |---|---|
 | `[target]` `name`, `kind`, `cost_per_side` | 必填。`kind = "futures_chain"` 时还需 `root`；`kind = "spot"` 时需 `ticker` 和 `field`（日收益为该序列的对数差）。`cost_per_side` 是单边成本（收益率单位） |
 | `[databank]` `toolkit_dir`, `cache_dir` | 工具包与缓存目录，可被环境变量覆盖 |
-| `[sample]` `start`, `holdout_frac` | `start` 为空则用标的全部历史；`holdout_frac` 是尾部 holdout 占比（TY 为 0.2，EURUSD 为 0.3） |
+| `[sample]` `start`, `holdout_frac` | `start` 为空则用标的全部历史；`holdout_frac` 是每个候选各自有效行中尾部 holdout 的占比（TY 为 0.2，EURUSD 为 0.3） |
 | `[universe]` `fields` | 字段优先级，每个 ticker 取它拥有的第一个 |
 | `[universe]` `chains`, `carry_chains` | 期货链：生成 `chain:<root>`（return index，price）与 `carry:<root>`（日历价差 / 活跃价格，level）序列 |
 | `[universe]` `exclude_tickers` | 从候选池剔除的 ticker |
@@ -172,12 +167,11 @@ python -m pytest -q
 | `[[universe.spread]]` | `id`、`a`、`b`：生成 `spread:<id>` = a − b（level） |
 | `[lags]` `D`, `W`, `class`, `ticker` | 见 3.2。`class` 的键形如 `"class_one/class_two"` |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
-| `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选最少观测数、零分布重复次数、循环平移的最小位移、随机种子 |
-| `[verdict]` `mode` | `"per_factor"`（默认，单因子门槛筛选，不做同批校正）或 `"family"`（族错误率 / FDR 校正）；其他值报错 |
-| `[verdict]` `z_pass`, `z_weak` | per_factor 模式的 PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0`；同时决定 `exceed.csv` 的阈值集合 `{z_weak, z_pass, 3.0}` |
-| `[verdict]` `fwer_alpha`, `fdr_q`, `dedupe_corr`, `extra_lag_t_min` | family 模式 PASS 的 FWER 水平、WEAK_PASS 的 FDR 水平（per_factor 下仅作参考）；去冗余相关阈值；`xlag_weak` 的 \|t\| 阈值 |
+| `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 train 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |
+| `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0` |
+| `[verdict]` `dedupe_corr`, `extra_lag_t_min` | 去重的相关阈值（默认 0.7）；`xlag_weak` 的 \|t\| 阈值（默认 2.0） |
 
-**缩小族。** 按经济假设只选相关类别，而不是把能取到的都放进来。族越小，纯噪声下的预期通过数越少（family 模式下 FWER 门槛也越低：族从约 2500 降到 50 时，大约从 |z| 4.2 降到 3.2）。这个选择必须在看数据之前做出。
+**候选池要按经济假设选。** 过门槛只代表单因子证据，候选越多，纯运气过门槛的候选也越多，最终靠 holdout 判定。选择必须在看数据之前做出。
 
 ## 7. 已知局限
 
@@ -186,7 +180,7 @@ python -m pytest -q
 - ACM 期限溢价被有意排除：它是全样本重估的模型序列，历史值含前视。
 - spot 标的（EURUSD）的收益是现货对数收益，不含 carry。
 - 回测指标（Sharpe 毛/净、换手）只是描述性的，成本模型是单边固定比例。
-- BH 的 p 值用正态近似；候选之间高度相关，FDR 控制是近似的。FWER 的 maxT 不受此影响。
+- 门槛对所有候选一视同仁：短样本上同样的 z 需要更高的 IC，短样本候选的 holdout 也短，确认能力有限。
 - 只检验"次日收益"这一个 horizon；更慢的信息通过 `chg_20`、`chg_60`、`z_252` 这类平滑变换进入。
 - EURUSD 在数据库里只从 2018 年开始，样本短、功效低。
 
@@ -195,10 +189,10 @@ python -m pytest -q
 测试编码的是设计意图，而不只是函数输出。`python -m pytest -q` 在项目根目录运行。最重要的几类：
 
 - **因果性 / 无前视**：`test_causality`、`test_no_lookahead_invariance`、`test_forward_target_no_lookahead`、`test_lag_semantics_never_earlier`（改动未来数据不应改变过去的信号或对齐结果）。
-- **holdout 隔离**：`test_holdout_isolation`、`test_prepare_split`。
-- **FWER 控制**：`test_fwer_control_pure_noise`、`test_null_calibration_*`、`test_pure_noise_no_pass_family_mode`（family 模式下纯噪声不应出现 PASS）。
-- **通过数计数口径**：`test_shift_null_count_thresholds_*`、`test_per_factor_noise_exceed`（per_factor 模式下噪声中出现 PASS 是预期行为，只检查 observed 与 null_mean 同量级）。
-- **植入信号可检出**：`test_planted_signal_detected`、`test_planted_signal_confirmed`。
-- **lock**：`test_lock_and_force`、`test_cli_locked_exit_code`。
+- **逐候选切分**：`test_split_rows*`（掩码不相交、切分点是 21 的倍数、holdout 占比、只有后段有数据的列在自己的有效区间内切分）。
+- **逐候选隔离**：`test_per_candidate_isolation`（把行号 ≥ `end_row` 之后的 target 与该候选原始序列换成随机数，该候选的所有统计量逐值不变，长历史与短历史候选各验证一次）。
+- **短历史候选可检验**：`test_short_history_candidate_is_tested`、`test_short_history_candidate_confirmed`。
+- **零分布标准差**：`test_null_sd_*`，以及 HAC t 的朴素对照与零假设校准。
+- **植入信号 / lock / 空 shortlist**：`test_planted_signal_confirmed`、`test_lock_and_force`、`test_cli_locked_exit_code`、`test_nothing_to_confirm`。
 
 集成测试 `test_build_panel_ty_integration` 需要本地数据库，数据库不存在时会 skip。

@@ -165,24 +165,26 @@ def test_load_shipped_configs(name):
 
 def test_minimal_config_defaults(tmp_path):
     cfg = load_config(_write(tmp_path, MINIMAL))
-    assert cfg.stats.seed == 20261122 and cfg.lags.W == 6 and cfg.verdict.fdr_q == 0.10
+    assert cfg.stats.seed == 20261122 and cfg.lags.W == 6 and cfg.verdict.dedupe_corr == 0.7 and cfg.stats.min_obs == 250
 
 
-def test_verdict_new_fields(tmp_path):
+def test_verdict_fields(tmp_path):
     v = load_config(_write(tmp_path, MINIMAL)).verdict
-    assert (v.mode, v.z_pass, v.z_weak) == ("per_factor", 2.5, 2.0)
-    v = load_config(_write(tmp_path, MINIMAL + '\n[verdict]\nmode = "family"\nz_pass = 3\nz_weak = 1.5\n')).verdict
-    assert (v.mode, v.z_pass, v.z_weak) == ("family", 3, 1.5)
-    for bad in ('mode = "bogus"', 'mode = 1', 'z_pass = 2.0\nz_weak = 2.0', 'z_pass = 1.5\nz_weak = 2.0',
-                'z_weak = 0', 'z_weak = -1', 'z_pass = 2.0'):
+    assert (v.z_pass, v.z_weak, v.dedupe_corr, v.extra_lag_t_min) == (2.5, 2.0, 0.7, 2.0)
+    v = load_config(_write(tmp_path, MINIMAL + '\n[verdict]\nz_pass = 3\nz_weak = 1.5\n')).verdict
+    assert (v.z_pass, v.z_weak) == (3, 1.5)
+    for bad in ('mode = "per_factor"', 'fwer_alpha = 0.05', 'fdr_q = 0.1', 'z_pass = 2.0\nz_weak = 2.0',
+                'z_pass = 1.5\nz_weak = 2.0', 'z_weak = 0', 'z_weak = -1', 'z_pass = 2.0', 'z_pass = "x"'):
         with pytest.raises(ValueError):
             load_config(_write(tmp_path, MINIMAL + f"\n[verdict]\n{bad}\n"))
 
 
 @pytest.mark.parametrize("name", ["ty", "eurusd"])
 def test_shipped_configs_verdict_fields(name):
-    v = load_config(CONFIGS / f"{name}.toml").verdict
-    assert (v.mode, v.z_pass, v.z_weak) == ("per_factor", 2.5, 2.0)
+    cfg = load_config(CONFIGS / f"{name}.toml")
+    v = cfg.verdict
+    assert (v.z_pass, v.z_weak) == (2.5, 2.0)
+    assert cfg.stats.min_obs == 250
 
 
 def test_missing_required(tmp_path):

@@ -1,8 +1,7 @@
 import numpy as np
 import pytest
 
-from tsminer.stats import (bh_q, eb_two_group, fwer_p, hac_t, holm, norm_sf,
-                           shift_null, two_sided_p)
+from tsminer.stats import hac_t, norm_sf, null_sd, two_sided_p
 
 
 def naive_hac_t(S, y, lags, min_obs):
@@ -82,224 +81,56 @@ def test_null_calibration_persistent_signal_vol_clustering():
     assert 0.9 <= t.std() <= 1.1
 
 
-def test_fwer_control_pure_noise():
+def test_null_sd_pure_noise_near_one():
     rng = np.random.default_rng(4)
-    T, N, B, R = 500, 40, 199, 150
-    hits = 0
-    for r in range(R):
-        f = ar1(rng, T, 3, 0.7)               # common factors -> correlated, autocorrelated columns
-        S = f @ rng.standard_normal((3, N)) + ar1(rng, T, N, 0.5)
-        y = rng.standard_normal(T)
-        t, _, _ = hac_t(S, y, 5, min_obs=100)
-        res = shift_null(S, y, 5, min_obs=100, n_boot=B, min_shift=30, seed=r)
-        hits += np.nanmin(fwer_p(t / res["t_sd"], res["max_abs_z"])) <= 0.05
-    assert 0.01 <= hits / R <= 0.11
-
-
-def test_planted_signal_detected():
-    rng = np.random.default_rng(5)
-    T, N = 3000, 300
+    T, N = 1500, 60
+    S = rng.standard_normal((T, N))
     y = rng.standard_normal(T)
-    S = rng.standard_normal((T, N + 1))
-    S[:, -1] = 0.1 * y + np.sqrt(1 - 0.01) * rng.standard_normal(T)
-    t, _, _ = hac_t(S, y, 5)
-    res = shift_null(S, y, 5, n_boot=300, seed=0)
-    p = fwer_p(t / res["t_sd"], res["max_abs_z"])
-    assert p[-1] <= 0.05
-    assert np.argmin(p) == N
+    sd = null_sd(S, y, 5, min_obs=250, n_boot=400, min_shift=60, seed=1)
+    assert sd.shape == (N,) and np.isfinite(sd).all()
+    assert 0.9 <= sd.mean() <= 1.1
 
 
-def test_shift_null_group_mean_consistent():
+def test_null_sd_heavy_tailed_sparse_column():
+    rng = np.random.default_rng(8)
+    T = 1500
+    normal = rng.standard_normal((T, 3))
+    spike = rng.standard_normal((T, 3)) * (rng.random((T, 3)) < 0.05) * 6.0   # ~95% zeros
+    y = rng.standard_normal(T)
+    sd = null_sd(np.hstack([normal, spike]), y, 5, min_obs=100, n_boot=300, min_shift=60, seed=1)
+    assert np.isfinite(sd).all() and (sd > 0).all()
+
+
+def test_null_sd_matches_naive_and_marks_unusable():
     rng = np.random.default_rng(6)
-    T, N, B = 400, 9, 20
+    T, N, B = 400, 4, 20
     S = rng.standard_normal((T, N))
-    S[:100, 2] = np.nan
-    S[:, 4] = np.nan                      # invalid column excluded from group means
+    S[:, 2] = np.nan                       # unusable
+    S[:350, 3] = np.nan                    # too few obs
     y = rng.standard_normal(T)
-    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
-    res = shift_null(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7, groups=groups)
-    assert res["group_mean_z2"].shape == (B, 3)
-    # recompute by hand on the same shifts (documented rng contract)
-    ks = np.random.default_rng(7).integers(20, T - 20 + 1, size=B)
-    tt = np.array([naive_hac_t(S, np.roll(y, k), 3, 100)[0] for k in ks])      # (B, N)
-    fin = np.isfinite(tt)
-    sd = np.full(tt.shape[1], np.nan)
-    for j in np.flatnonzero(fin.any(axis=0)):
-        sd[j] = np.std(tt[fin[:, j], j])
-    np.testing.assert_allclose(res["t_sd"], sd, rtol=1e-6)
-    assert np.isnan(res["t_sd"][4])
-    z2 = (tt / sd) ** 2
-    for b in range(B):
-        assert res["max_abs_z"][b] == pytest.approx(np.nanmax(np.sqrt(z2[b])), rel=1e-6)
-        assert res["mean_z2"][b] == pytest.approx(np.nanmean(z2[b]), rel=1e-6)
-        for g in range(3):
-            assert res["group_mean_z2"][b, g] == pytest.approx(np.nanmean(z2[b][groups == g]), rel=1e-6)
-    # weighted-average identity with valid counts
-    valid = np.isfinite(naive_hac_t(S, y, 3, 100)[0])
-    w = np.array([valid[groups == g].sum() for g in range(3)])
-    np.testing.assert_allclose((res["group_mean_z2"] * w).sum(1) / w.sum(), res["mean_z2"], rtol=1e-9)
-    assert shift_null(S, y, 3, min_obs=100, n_boot=5, min_shift=20)["group_mean_z2"] is None
-
-
-def test_shift_null_count_thresholds_shapes_and_consistency():
-    rng = np.random.default_rng(21)
-    T, N, B = 400, 9, 25
-    S = rng.standard_normal((T, N))
-    S[:100, 2] = np.nan
-    S[:, 4] = np.nan                      # unusable column: never counted
-    y = rng.standard_normal(T)
-    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
-    thr = [0.0, 1.0, 2.0, 3.0]
-    res = shift_null(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7, groups=groups, count_thresholds=thr)
-    ec, gc = res["exceed_counts"], res["group_exceed_counts"]
-    assert ec.shape == (B, 4) and gc.shape == (B, 3, 4)
-    assert (np.diff(ec, axis=1) <= 0).all()                      # non-increasing in the threshold
-    assert (ec[:, 0] == N - 1).all()                              # threshold 0: all usable columns
-    np.testing.assert_array_equal(gc.sum(axis=1), ec)
-    # hand check against the documented rng contract
+    sd = null_sd(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7)
     ks = np.random.default_rng(7).integers(20, T - 20 + 1, size=B)
     tt = np.array([naive_hac_t(S, np.roll(y, k), 3, 100)[0] for k in ks])
-    fin = np.isfinite(tt)
-    sd = np.array([np.std(tt[fin[:, j], j]) if fin[:, j].any() else np.nan for j in range(N)])
-    with np.errstate(invalid="ignore"):
-        az = np.abs(tt / sd)
-    for i, c in enumerate(thr):
-        np.testing.assert_array_equal(ec[:, i], np.sum(np.isfinite(az) & (az >= c), axis=1))
-    # without groups: group counts are None
-    r2 = shift_null(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7, count_thresholds=thr)
-    assert r2["group_exceed_counts"] is None
-    np.testing.assert_array_equal(r2["exceed_counts"], ec)
+    for j in (0, 1):
+        assert sd[j] == pytest.approx(np.std(tt[:, j]), rel=1e-6)
+    assert np.isnan(sd[2]) and np.isnan(sd[3])
 
 
-def test_shift_null_count_thresholds_default_none():
-    rng = np.random.default_rng(22)
-    S, y = rng.standard_normal((300, 4)), rng.standard_normal(300)
-    res = shift_null(S, y, 3, min_obs=100, n_boot=5, min_shift=20, groups=np.zeros(4, dtype=int))
-    assert res["exceed_counts"] is None and res["group_exceed_counts"] is None
+def test_null_sd_reproducible_same_seed():
+    rng = np.random.default_rng(9)
+    S, y = rng.standard_normal((500, 5)), rng.standard_normal(500)
+    a = null_sd(S, y, 5, min_obs=100, n_boot=50, min_shift=30, seed=3)
+    b = null_sd(S, y, 5, min_obs=100, n_boot=50, min_shift=30, seed=3)
+    c = null_sd(S, y, 5, min_obs=100, n_boot=50, min_shift=30, seed=4)
+    np.testing.assert_array_equal(a, b)
+    assert not np.array_equal(a, c)
 
 
-def test_shift_null_exceed_rate_pure_noise():
-    rng = np.random.default_rng(23)
-    T, N, B = 1500, 100, 300
-    S = rng.standard_normal((T, N))
-    y = rng.standard_normal(T)
-    res = shift_null(S, y, 5, min_obs=100, n_boot=B, min_shift=60, seed=3, count_thresholds=[2.0])
-    mean = res["exceed_counts"][:, 0].mean()
-    expect = N * 0.0455
-    print("mean exceed at 2.0:", mean, "expected", expect)
-    assert 0.7 * expect <= mean <= 1.3 * expect
-
-
-def test_studentized_max_is_balanced_across_heavy_tails():
-    rng = np.random.default_rng(8)
-    T, half, B = 1500, 20, 400
-    normal = rng.standard_normal((T, half))
-    spike = rng.standard_normal((T, half)) * (rng.random((T, half)) < 0.05) * 6.0   # ~95% zeros
-    S = np.hstack([normal, spike])
-    y = rng.standard_normal(T)
-    res = shift_null(S, y, 5, min_obs=100, n_boot=B, min_shift=60, seed=1)
-    sd = res["t_sd"]
-    print("t_sd normal:", sd[:half].mean(), "t_sd heavy:", sd[half:].mean())
-    assert np.isfinite(sd).all() and (sd > 0).all()
-    # which column attains max|z*| in each replicate (same shifts as the contract)
-    ks = np.random.default_rng(1).integers(60, T - 60 + 1, size=B)
-    Z = np.array([hac_t(S, np.roll(y, k), 5, 100)[0] for k in ks]) / sd
-    share = np.mean(np.argmax(np.abs(Z), axis=1) >= half)
-    print("heavy-tail share of argmax |z*|:", share)
-    assert 0.3 <= share <= 0.7
-
-
-def test_shift_null_bad_args():
+def test_null_sd_too_short_raises():
     with pytest.raises(ValueError):
-        shift_null(np.zeros((100, 2)), np.zeros(100), 3, min_shift=50)
-
-
-def test_bh_and_holm_known_values():
-    p = np.array([0.01, 0.04, 0.03, 0.005])
-    # BH: sorted .005,.01,.03,.04 -> *4/rank = .02,.02,.04,.04
-    np.testing.assert_allclose(bh_q(p), [0.02, 0.04, 0.04, 0.02])
-    # Holm: sorted *(4,3,2,1) = .02,.03,.06,.04 -> cummax .02,.03,.06,.06
-    np.testing.assert_allclose(holm(p), [0.03, 0.06, 0.06, 0.02])
-    pn = np.array([0.01, np.nan, 0.04, 0.03, 0.005])
-    qb, qh = bh_q(pn), holm(pn)
-    assert np.isnan(qb[1]) and np.isnan(qh[1])
-    np.testing.assert_allclose(qb[[0, 2, 3, 4]], bh_q(p))
-    np.testing.assert_allclose(qh[[0, 2, 3, 4]], holm(p))
-    np.testing.assert_allclose(bh_q(np.array([0.9, 0.8])), [0.9, 0.9])
-    np.testing.assert_allclose(holm(np.array([0.6, 0.7])), [1.0, 1.0])
-
-
-def test_fwer_p_hand_example():
-    null = np.array([1.0, 2.0, 3.0, 4.0])
-    t = np.array([2.5, -4.0, 0.5, np.nan, 5.0])
-    np.testing.assert_allclose(fwer_p(t, null), [3 / 5, 2 / 5, 1.0, np.nan, 1 / 5])
-    np.testing.assert_allclose(fwer_p(np.array([2.0]), null), [4 / 5])  # ties count (>=)
+        null_sd(np.zeros((100, 2)), np.zeros(100), 3, min_shift=50)
 
 
 def test_normal_helpers():
     np.testing.assert_allclose(norm_sf(np.array([0.0, 1.959964])), [0.5, 0.025], atol=1e-6)
     np.testing.assert_allclose(two_sided_p(np.array([-1.959964, np.nan])), [0.05, np.nan], atol=1e-6, equal_nan=True)
-
-
-def _z_ic(z, rng, lo=1000, hi=3000):
-    n_eff = rng.uniform(lo, hi, len(z))
-    return z, z / np.sqrt(n_eff)
-
-
-def test_eb_two_group_sparse():
-    rng = np.random.default_rng(9)
-    N, K = 1000, 20
-    z = rng.standard_normal(N)
-    z[:K] = rng.choice([-1, 1], K) * 5.0 + rng.standard_normal(K)
-    z, ic = _z_ic(z, rng)
-    r = eb_two_group(z, ic, 1.0)
-    print("sparse: pi0=%.4f tau2=%.3g med p_signal sig=%.3f noise=%.3f sum|post_ic| sig=%.4f noise=%.4f" % (
-        r["pi0"], r["tau2"], np.median(r["p_signal"][:K]), np.median(r["p_signal"][K:]),
-        np.abs(r["post_ic"][:K]).sum(), np.abs(r["post_ic"][K:]).sum()))
-    assert 0.9 <= r["pi0"] < 1.0
-    assert np.median(r["p_signal"][:K]) > 0.9
-    assert np.median(r["p_signal"][K:]) < 0.1
-    assert np.abs(r["post_ic"][K:]).sum() < np.abs(r["post_ic"][:K]).sum()
-
-
-def test_eb_two_group_pure_noise():
-    rng = np.random.default_rng(10)
-    z, ic = _z_ic(rng.standard_normal(1000), rng)
-    r = eb_two_group(z, ic, 1.0)
-    ratio = np.mean(np.abs(r["post_ic"])) / np.mean(np.abs(ic))
-    print("noise: pi0=%.4f tau2=%.3g ratio=%.4f p_pos range=(%.3f, %.3f)" % (
-        r["pi0"], r["tau2"], ratio, r["p_pos"].min(), r["p_pos"].max()))
-    assert ratio < 0.2
-    assert np.all((r["p_pos"] > 0.2) & (r["p_pos"] < 0.8))
-    if r["tau2"] == 0:
-        assert r["pi0"] == 1.0 and np.all(r["p_signal"] == 0) and np.all(r["post_ic"] == 0)
-        assert np.all(r["p_pos"] == 0.5)
-
-
-def test_eb_two_group_tau2_zero_is_all_null():
-    rng = np.random.default_rng(12)
-    z = rng.uniform(-0.5, 0.5, 200)   # every z^2 < v0, so tau2 collapses to 0
-    z, ic = _z_ic(z, rng)
-    r = eb_two_group(z, ic, 1.0)
-    assert r["tau2"] == 0 and r["pi0"] == 1.0
-    assert np.all(r["p_signal"] == 0) and np.all(r["post_ic"] == 0) and np.all(r["shrink"] == 0)
-    assert np.all(r["p_pos"] == 0.5)
-
-
-def test_eb_two_group_sign_and_nan():
-    rng = np.random.default_rng(11)
-    z = rng.standard_normal(300)
-    z[:10] += 5.0
-    z, ic = _z_ic(z, rng)
-    base = eb_two_group(z, ic, 1.0)
-    ok = np.isfinite(z)
-    assert np.all(np.sign(base["post_ic"][ok]) == np.sign(ic[ok]))
-    z2, ic2 = z.copy(), ic.copy()
-    z2[50], ic2[60], ic2[70] = np.nan, np.nan, 0.0
-    r = eb_two_group(z2, ic2, 1.0)
-    bad = [50, 60, 70]
-    for k in ("p_signal", "shrink", "post_ic", "p_pos"):
-        assert np.isnan(r[k][bad]).all()
-        assert np.isfinite(np.delete(r[k], bad)).all()
-    assert np.all(np.sign(np.delete(r["post_ic"], bad)) == np.sign(np.delete(ic2, bad)))
-    assert np.isnan(eb_two_group(np.full(3, np.nan), np.ones(3), 1.0)["pi0"])

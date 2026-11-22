@@ -1,7 +1,8 @@
-"""Mining pipeline: train-only statistics, multiple-testing verdicts, outputs.
+"""Mining pipeline: per-candidate single-factor tests on each candidate's own train rows.
 
-Nothing computed here may depend on the holdout segment; ``confirm`` is the only
-place that opens it (and only once).
+Every candidate is tested on the rows where it overlaps the target, split into train / holdout
+by its own sample. Nothing computed here may depend on a candidate's holdout rows;
+``confirm`` is the only place that opens them (and only once).
 """
 from __future__ import annotations
 
@@ -14,50 +15,62 @@ import numpy as np
 import pandas as pd
 
 from .databank import Panel, build_panel
-from .stats import bh_q, eb_two_group, fwer_p, hac_t, holm, shift_null, two_sided_p
+from .stats import hac_t, null_sd, two_sided_p
 from .transforms import build_candidates, forward_target
 
-WATCHLIST_POOL = 200
-WATCHLIST_SIZE = 20
-CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n", "t", "null_sd", "z", "ic", "sign",
-                "p_cal", "q_bh", "p_fwer", "verdict", "p_signal", "shrink", "post_ic", "p_pos",
-                "t_h1", "t_h2", "t_xlag", "flags", "rep"]
+SPLIT_QUANTUM = 21
+CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n_train", "train_start", "train_end",
+                "n_holdout", "t", "null_sd", "z", "ic", "sign", "p", "verdict", "t_h1", "t_h2", "t_xlag",
+                "flags", "rep"]
 BT_COLUMNS = ["sharpe_gross", "sharpe_net", "turnover", "ac1"]
+SHORT_COLUMNS = CAND_COLUMNS + ["cluster_size"] + BT_COLUMNS + ["description"]
+
+
+# ------------------------------------------------------------------ split
+def split_rows(valid, holdout_frac, quantum=SPLIT_QUANTUM):
+    """Per-column train / holdout masks on the rows of ``valid`` (T, N bool).
+
+    Column j has n_j valid rows; the holdout starts at the (k_j+1)-th valid row, k_j = floor(n_j * (1 - frac)),
+    rounded down to a multiple of ``quantum``: end_row[j] = (p_j // quantum) * quantum (p_j = T if k_j == n_j).
+    train = valid & row < end_row, holdout = valid & row >= end_row. Returns (train, holdout, end_row).
+    """
+    valid = np.asarray(valid, dtype=bool)
+    cs = np.cumsum(valid, axis=0)
+    n = cs[-1] if len(valid) else np.zeros(valid.shape[1], dtype=int)
+    k = np.floor(n * (1.0 - holdout_frac)).astype(int)
+    p = (cs < (k + 1)[None, :]).sum(axis=0)   # first row where the running count reaches k+1; T if none
+    end_row = (p // quantum) * quantum
+    before = np.arange(valid.shape[0])[:, None] < end_row[None, :]
+    return valid & before, valid & ~before, end_row
 
 
 # ------------------------------------------------------------------ prepare
 def prepare(panel: Panel, cfg) -> dict:
-    """Candidate signals on the full (causal) time axis plus the train / holdout row split."""
+    """Candidate signals on the full (causal) time axis plus each candidate's own train / holdout rows.
+
+    ``rows`` are the calendar positions where y_fwd is finite; ``train_mask``, ``holdout_mask`` (len(rows), N)
+    and ``end_row`` (N,) are defined on those rows.
+    """
     S, cand_meta = build_candidates(panel.X, panel.meta, cfg.signals.std_window, cfg.signals.clip)
     y_fwd, sigma = forward_target(panel.target, cfg.signals.vol_halflife)
-    n = len(panel.target)
-    split_idx = int(np.floor(n * (1.0 - cfg.sample.holdout_frac)))
-    pos = np.arange(n)
-    fin = np.isfinite(y_fwd.to_numpy(dtype=float))
-    # row split_idx-1 carries the return of the first holdout day, so it belongs to holdout
-    train_rows = pos[(pos < split_idx - 1) & fin]
-    holdout_rows = pos[(pos >= split_idx - 1) & fin]
-    return {"S": S, "cand_meta": cand_meta, "y_fwd": y_fwd, "sigma": sigma,
-            "split_idx": split_idx, "train_rows": train_rows, "holdout_rows": holdout_rows}
+    rows = np.flatnonzero(np.isfinite(y_fwd.to_numpy(dtype=float)))
+    valid = np.isfinite(S.to_numpy(dtype=float)[rows])
+    train_mask, holdout_mask, end_row = split_rows(valid, cfg.sample.holdout_frac)
+    return {"S": S, "cand_meta": cand_meta, "y_fwd": y_fwd, "sigma": sigma, "rows": rows,
+            "train_mask": train_mask, "holdout_mask": holdout_mask, "end_row": end_row}
 
 
 # ------------------------------------------------------------ pure helpers
-def assign_verdict(z, p_fwer, q_bh, vd) -> str:
-    """per_factor: single-factor |z| thresholds; family: FWER / BH thresholds."""
-    if vd.mode == "per_factor":
-        if not np.isfinite(z):
-            return "REJECT"
-        a = abs(float(z))
-        return "PASS" if a >= vd.z_pass else "WEAK_PASS" if a >= vd.z_weak else "REJECT"
-    if np.isfinite(p_fwer) and p_fwer <= vd.fwer_alpha:
-        return "PASS"
-    if np.isfinite(q_bh) and q_bh <= vd.fdr_q:
-        return "WEAK_PASS"
-    return "REJECT"
+def assign_verdict(z, z_pass, z_weak) -> str:
+    """Single-factor |z| thresholds; non-finite z is REJECT."""
+    if not np.isfinite(z):
+        return "REJECT"
+    a = abs(float(z))
+    return "PASS" if a >= z_pass else "WEAK_PASS" if a >= z_weak else "REJECT"
 
 
 def dedupe(ids, S_train_df, thresh, min_overlap=100) -> dict:
-    """Greedy de-redundancy; ids must be ordered by |t| descending. Returns id -> representative id."""
+    """Greedy de-redundancy; ids must be ordered by |z| descending. Returns id -> representative id."""
     ids = list(ids)
     if not ids:
         return {}
@@ -136,6 +149,15 @@ def _jsonable(o):
 
 
 # --------------------------------------------------------------------- mine
+def _edge_dates(mask, rows, cal):
+    """First / last calendar date (str) of the True rows of each column; "" for empty columns."""
+    any_ = mask.any(axis=0)
+    first = rows[np.argmax(mask, axis=0)]
+    last = rows[mask.shape[0] - 1 - np.argmax(mask[::-1], axis=0)]
+    fmt = lambda pos: np.where(any_, cal[pos].strftime("%Y-%m-%d"), "")
+    return fmt(first), fmt(last)
+
+
 def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     from .report import write_report
 
@@ -150,79 +172,52 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
 
     st, vd = cfg.stats, cfg.verdict
     prep = prepare(panel, cfg)
-    S, cm, y_fwd, sigma = prep["S"], prep["cand_meta"], prep["y_fwd"], prep["sigma"]
-    tr = prep["train_rows"]
-    S_tr = S.to_numpy(dtype=float)[tr]
-    y_tr = y_fwd.to_numpy(dtype=float)[tr]
-    sig_tr = sigma.to_numpy(dtype=float)[tr]
-
-    t_all, ic_all, n_all = hac_t(S_tr, y_tr, st.hac_lags, st.min_obs)
-    fam0 = np.flatnonzero(np.isfinite(t_all))
-    if len(fam0) == 0:
-        raise ValueError("no candidate has a finite t on the train segment")
-    gcodes0, guniq0 = pd.factorize(cm.loc[np.array(S.columns)[fam0], "group"].to_numpy(), sort=True)
-    thresholds = sorted({float(vd.z_weak), float(vd.z_pass), 3.0})
-    null = shift_null(S_tr[:, fam0], y_tr, st.hac_lags, st.min_obs, st.n_boot, st.min_shift, st.seed,
-                      groups=gcodes0, count_thresholds=thresholds)
-    # studentization needs a valid null sd; candidates without one leave the family
-    keep = np.isfinite(null["t_sd"]) & (null["t_sd"] > 0)
-    fam = fam0[keep]
-    n_dropped = int(len(t_all) - len(fam))
-    m = len(fam)
-    if m == 0:
-        raise ValueError("no candidate has a valid null sd")
-    ids = np.array(S.columns)[fam]
-    t, ic, n_obs = t_all[fam], ic_all[fam], n_all[fam]
-    null_sd = null["t_sd"][keep]
-    z = t / null_sd
-    S_fam = S_tr[:, fam]
-    gcodes, K, guniq = gcodes0[keep], len(guniq0), guniq0
-    print(f"[mine] rows={len(S)} train_rows={len(tr)} candidates={S.shape[1]} family={m} dropped={n_dropped}")
-
-    B = st.n_boot
-    p_fwer = fwer_p(z, null["max_abs_z"])
-    t_var = null["t_var"]
-    p_cal = two_sided_p(np.abs(z))
-    q_bh = bh_q(p_cal)
-    hurdle = float(np.nanquantile(null["max_abs_z"], 1.0 - vd.fwer_alpha))
-    obs = float(np.mean(z ** 2))
-    p_omni = float((1 + np.sum(null["mean_z2"] >= obs)) / (B + 1))
-    present = np.flatnonzero(np.bincount(gcodes, minlength=K) > 0)
-    g_obs = np.array([np.mean(z[gcodes == k] ** 2) for k in present])
-    g_p = np.array([(1 + np.sum(null["group_mean_z2"][:, k] >= o)) / (B + 1) for k, o in zip(present, g_obs)])
-    g_holm = holm(g_p)
-    v0 = float(np.nanmean(null["mean_z2"]))
-    eb = eb_two_group(z, ic, v0)
-    verdict = np.array([assign_verdict(a, b, c, vd) for a, b, c in zip(z, p_fwer, q_bh)])
-
-    # exceedance counts: observed vs circular-shift null, whole family and per group
-    # (columns dropped for lack of a valid null sd have NaN z*, so they never count in the null either)
-    az = np.abs(z)
-    exceed_rows = []
-
-    def _exc(scope, nulls, observed_mask_fn, n_cand):
-        for i, thr in enumerate(thresholds):
-            o = int(np.sum(observed_mask_fn(az >= thr)))
-            nc = nulls[:, i]
-            exceed_rows.append({"scope": scope, "threshold": thr, "n_cand": int(n_cand), "observed": o,
-                                "null_mean": float(np.mean(nc)), "p": float((1 + np.sum(nc >= o)) / (B + 1))})
-
-    _exc("ALL", null["exceed_counts"], lambda hit: hit, m)
-    for k in present:
-        _exc(str(guniq[k]), null["group_exceed_counts"][:, k, :], lambda hit, k=k: hit & (gcodes == k),
-             int(np.sum(gcodes == k)))
-    exceed_df = pd.DataFrame(exceed_rows, columns=["scope", "threshold", "n_cand", "observed", "null_mean", "p"])
-
-    # flags (informational only)
-    h = len(tr) // 2
-    mo_half = max(60, st.min_obs // 2)
-    t_h1 = hac_t(S_fam[:h], y_tr[:h], st.hac_lags, mo_half)[0]
-    t_h2 = hac_t(S_fam[h:], y_tr[h:], st.hac_lags, mo_half)[0]
+    S, cm, y_fwd, sigma, rows = prep["S"], prep["cand_meta"], prep["y_fwd"], prep["sigma"], prep["rows"]
+    tr_mask, ho_mask, end_row = prep["train_mask"], prep["holdout_mask"], prep["end_row"]
+    cal = panel.target.index
+    y = y_fwd.to_numpy(dtype=float)[rows]
+    sig = sigma.to_numpy(dtype=float)[rows]
     S_np = S.to_numpy(dtype=float)
-    S_lag = np.vstack([np.full((1, S_np.shape[1]), np.nan), S_np[:-1]])
-    t_xlag = hac_t(S_lag[tr][:, fam], y_tr, st.hac_lags, st.min_obs)[0]
+    S_tr = np.where(tr_mask, S_np[rows], np.nan)
+    N = S.shape[1]
+
+    t_all, ic_all, n_tr_all = hac_t(S_tr, y, st.hac_lags, st.min_obs)
+
+    # per-candidate null scale: candidates sharing a split point share one circular-shift run on y[:e]
+    sd_all = np.full(N, np.nan)
+    finite_t = np.isfinite(t_all)
+    for e in np.unique(end_row[finite_t]):
+        if e - 2 * st.min_shift < 1:
+            continue
+        cols = np.flatnonzero(finite_t & (end_row == e))
+        sd_all[cols] = null_sd(S_tr[:e][:, cols], y[:e], st.hac_lags, st.min_obs, st.n_boot, st.min_shift,
+                               st.seed)
+    ok = finite_t & np.isfinite(sd_all) & (sd_all > 0)
+    sel = np.flatnonzero(ok)
+    n_tested = int(len(sel))
+    n_skipped = int(N - n_tested)
+    if n_tested == 0:
+        raise ValueError("no candidate has a finite t and a valid null sd on its train rows")
+    ids = np.array(S.columns)[sel]
+    t, ic, n_tr = t_all[sel], ic_all[sel], n_tr_all[sel]
+    null = sd_all[sel]
+    z = t / null
+    p = two_sided_p(z)
+    verdict = np.array([assign_verdict(a, vd.z_pass, vd.z_weak) for a in z])
+    print(f"[mine] rows={len(rows)} candidates={N} tested={n_tested} skipped={n_skipped}")
+
+    # flags (informational only), on each candidate's own train rows
+    trs = tr_mask[:, sel]
+    S_sel = S_tr[:, sel]
+    cs = np.cumsum(trs, axis=0)
+    half = trs.sum(axis=0) // 2
+    mo_half = max(60, st.min_obs // 2)
+    t_h1 = hac_t(np.where(trs & (cs <= half), S_sel, np.nan), y, st.hac_lags, mo_half)[0]
+    t_h2 = hac_t(np.where(trs & (cs > half), S_sel, np.nan), y, st.hac_lags, mo_half)[0]
+    S_lag = np.vstack([np.full((1, N), np.nan), S_np[:-1]])[rows][:, sel]
+    t_xlag = hac_t(np.where(trs, S_lag, np.nan), y, st.hac_lags, st.min_obs)[0]
     flags = []
-    for i in range(m):
+    for i in range(n_tested):
         f = []
         if np.isfinite(t_h1[i]) and np.isfinite(t_h2[i]) and t_h1[i] * t_h2[i] < 0:
             f.append("half_flip")
@@ -230,69 +225,50 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
             f.append("xlag_weak")
         flags.append(";".join(f))
 
+    tr_start, tr_end = _edge_dates(trs, rows, cal)
     order = np.argsort(-np.abs(z), kind="stable")
     cand = pd.DataFrame({
         "id": ids, "series": cm.loc[ids, "series"].to_numpy(), "transform": cm.loc[ids, "transform"].to_numpy(),
         "group": cm.loc[ids, "group"].to_numpy(), "kind": cm.loc[ids, "kind"].to_numpy(),
-        "freq": cm.loc[ids, "freq"].to_numpy(), "n": n_obs, "t": t, "null_sd": null_sd, "z": z, "ic": ic, "sign": np.sign(t),
-        "p_cal": p_cal, "q_bh": q_bh, "p_fwer": p_fwer, "verdict": verdict,
-        "p_signal": eb["p_signal"], "shrink": eb["shrink"], "post_ic": eb["post_ic"], "p_pos": eb["p_pos"],
-        "t_h1": t_h1, "t_h2": t_h2, "t_xlag": t_xlag, "flags": flags,
+        "freq": cm.loc[ids, "freq"].to_numpy(), "n_train": n_tr, "train_start": tr_start, "train_end": tr_end,
+        "n_holdout": ho_mask[:, sel].sum(axis=0), "t": t, "null_sd": null, "z": z, "ic": ic, "sign": np.sign(t),
+        "p": p, "verdict": verdict, "t_h1": t_h1, "t_h2": t_h2, "t_xlag": t_xlag, "flags": flags,
     }).iloc[order].reset_index(drop=True)
 
-    # de-redundancy
+    # de-redundancy of the non-REJECT candidates (pairwise correlation on the common train rows)
     S_tr_df = pd.DataFrame(S_tr, columns=S.columns)
     passed = cand.loc[cand["verdict"] != "REJECT", "id"].tolist()
     rep_map = dedupe(passed, S_tr_df, vd.dedupe_corr)
     cand["rep"] = [rep_map.get(i, "") for i in cand["id"]]
     short_ids = list(dict.fromkeys(rep_map.values()))
-    pool = cand["id"].head(WATCHLIST_POOL).tolist()
-    watch_ids = list(dict.fromkeys(dedupe(pool, S_tr_df, vd.dedupe_corr).values()))[:WATCHLIST_SIZE]
+    cluster = pd.Series(list(rep_map.values())).value_counts()
 
+    col_of = {c: i for i, c in enumerate(S.columns)}
     cidx = cand.set_index("id", drop=False)
     desc = panel.meta["description"]
-
-    def table(sel):
-        rows = []
-        for cid in sel:
-            r = cidx.loc[cid]
-            bt = backtest(S_tr_df[cid].to_numpy(), y_tr, sig_tr, float(r["sign"]), cfg.target.cost_per_side)
-            rows.append({**{c: r[c] for c in CAND_COLUMNS}, **bt, "description": desc.get(r["series"], "")})
-        return pd.DataFrame(rows, columns=CAND_COLUMNS + BT_COLUMNS + ["description"])
+    rows_out = []
+    for cid in short_ids:
+        r = cidx.loc[cid]
+        m = tr_mask[:, col_of[cid]]
+        bt = backtest(S_np[rows][m, col_of[cid]], y[m], sig[m], float(r["sign"]), cfg.target.cost_per_side)
+        rows_out.append({**{c: r[c] for c in CAND_COLUMNS}, "cluster_size": int(cluster[cid]), **bt,
+                         "description": desc.get(r["series"], "")})
+    short = pd.DataFrame(rows_out, columns=SHORT_COLUMNS)
 
     cand.to_csv(run_dir / "candidates.csv", index=False)
-    table(short_ids).to_csv(run_dir / "shortlist.csv", index=False)
-    table(watch_ids).to_csv(run_dir / "watchlist.csv", index=False)
-    pd.DataFrame({"group": guniq[present], "n_cand": np.bincount(gcodes, minlength=K)[present],
-                  "mean_z2": g_obs, "null_mean_z2": np.nanmean(null["group_mean_z2"], axis=0)[present], "p": g_p,
-                  "p_holm": g_holm}).to_csv(run_dir / "groups.csv", index=False)
+    short.to_csv(run_dir / "shortlist.csv", index=False)
 
-    exceed_df.to_csv(run_dir / "exceed.csv", index=False)
-
-    cal = panel.target.index
-    tau2 = eb["tau2"]
     run = {
         "target": cfg.target.name,
         "config": cfg.to_dict(),
         "panel_info": panel.info,
-        "dates": {"sample_start": str(cal[0].date()),
-                  "train_end": str(cal[tr[-1] + 1].date()),
-                  "holdout_start": str(cal[prep["split_idx"]].date()),
-                  "sample_end": str(cal[-1].date())},
-        "n_rows": len(cal), "split_idx": prep["split_idx"],
-        "n_train_rows": len(tr), "n_holdout_rows": len(prep["holdout_rows"]),
-        "n_series": int(panel.X.shape[1]), "n_candidates": int(S.shape[1]),
-        "n_dropped": n_dropped, "family_size": m,
-        "null": {"t_var": t_var, "hurdle": hurdle, "v0": v0, "n_boot": B,
-                 "null_sd_median": float(np.median(null_sd)), "null_sd_min": float(null_sd.min()),
-                 "null_sd_max": float(null_sd.max())},
-        "omnibus": {"mean_z2": obs, "p": p_omni},
-        "eb_tau2": tau2, "eb_pi0": eb["pi0"],
-        "composite_defined": bool(tau2 > 0 and eb["pi0"] < 1),
+        "dates": {"sample_start": str(cal[0].date()), "sample_end": str(cal[-1].date())},
+        "n_rows": len(cal),
+        "n_series": int(panel.X.shape[1]), "n_candidates": int(N),
+        "n_tested": n_tested, "n_skipped": n_skipped,
+        "n_train_summary": {"min": int(n_tr.min()), "median": float(np.median(n_tr)), "max": int(n_tr.max())},
         "verdict_counts": {v: int((verdict == v).sum()) for v in ("PASS", "WEAK_PASS", "REJECT")},
         "shortlist": short_ids,
-        "verdict_mode": vd.mode,
-        "exceed": exceed_df[exceed_df["scope"] == "ALL"].to_dict(orient="records"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     run = _jsonable(run)

@@ -15,7 +15,7 @@ cache_dir = "/home/user/databank-work/databank-cache"
 
 [sample]
 start = ""                  # 可选 ISO 日期; 空 = 标的全部历史
-holdout_frac = 0.2
+holdout_frac = 0.2          # 每个候选在自己与标的重叠的样本上独立检验, 并各自把最后 holdout_frac 的有效行留作 holdout
 
 [universe]
 fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: 每个 ticker 取它拥有的第一个
@@ -109,21 +109,18 @@ vol_halflife = 20
 
 [stats]
 hac_lags = 5
-min_obs = 500
+min_obs = 250    # 每个候选在 train 段至少需要的有效观测数, 不足者不检验
 n_boot = 1000
 min_shift = 60
 seed = 20261122
 
 [verdict]
-# 判定模式:
-#   per_factor: 单因子门槛筛选。|z| >= z_pass 为 PASS, z_weak <= |z| < z_pass 为 WEAK_PASS, 其余 REJECT;
-#               不按同批候选数做校正, 成立与否交给 holdout 逐个判定; 报告并排给出实际通过数与纯噪声预期通过数。
-#   family:     族错误率/FDR 校正。p_fwer <= fwer_alpha 为 PASS, q_bh <= fdr_q 为 WEAK_PASS。
-mode = "per_factor"
+# 每个候选都是独立的单因子检验(没有"同批"概念, 不做族错误率 / FDR 校正):
+#   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的 train 行。
+#   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
+#   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_train))。
+# 通过门槛的候选再按相关性去重, 代表组成 shortlist; 成立与否由 holdout 确认(只打开一次)。
 z_pass = 2.5
 z_weak = 2.0
-# fwer_alpha / fdr_q 在 family 模式下用于判定, per_factor 模式下仅作参考输出; dedupe_corr / extra_lag_t_min 两种模式通用
-fwer_alpha = 0.05
-fdr_q = 0.10
-dedupe_corr = 0.7
-extra_lag_t_min = 2.0
+dedupe_corr = 0.7        # 去重: train 共同行上信号相关系数绝对值 >= 此值归入同一代表
+extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)

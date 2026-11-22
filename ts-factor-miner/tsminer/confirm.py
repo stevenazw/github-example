@@ -12,9 +12,9 @@ from .config import load_config
 from .databank import Panel
 from .pipeline import _jsonable, backtest, prepare
 from .report import append_confirm
-from .stats import hac_t, holm, norm_sf
+from .stats import hac_t, norm_sf
 
-HOLDOUT_MIN_OBS = 120
+HOLDOUT_MIN_OBS = 60
 
 
 class HoldoutLockedError(RuntimeError):
@@ -38,62 +38,46 @@ def confirm(run_dir, force_reason=None) -> dict:
             fh.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "reason": force_reason},
                                 ensure_ascii=False) + "\n")
 
-    run = json.loads((d / "run.json").read_text())
-    cands = pd.read_csv(d / "candidates.csv")
     short = pd.read_csv(d / "shortlist.csv")
-    if len(short) == 0 and not run["composite_defined"]:
+    if len(short) == 0:
         return {"status": "NOTHING_TO_CONFIRM"}
 
     cfg = load_config(d / "config.toml")
     panel = Panel.load(d / "panel")
     prep = prepare(panel, cfg)
-    S, y_fwd, sigma = prep["S"], prep["y_fwd"], prep["sigma"]
-    ho, tr = prep["holdout_rows"], prep["train_rows"]
-    y_ho = y_fwd.to_numpy(dtype=float)[ho]
-    sig_ho = sigma.to_numpy(dtype=float)[ho]
+    S, y_fwd, sigma, rows = prep["S"], prep["y_fwd"], prep["sigma"], prep["rows"]
+    ho_mask = prep["holdout_mask"]
+    cal = panel.target.index
+    y = y_fwd.to_numpy(dtype=float)[rows]
+    sig = sigma.to_numpy(dtype=float)[rows]
+    S_np = S.to_numpy(dtype=float)[rows]
+    col_of = {c: i for i, c in enumerate(S.columns)}
     hl = cfg.stats.hac_lags
     cost = cfg.target.cost_per_side
 
-    rows = []
+    out_rows = []
     for _, r in short.iterrows():
-        s = S[r["id"]].to_numpy(dtype=float)[ho]
-        t_hold, ic, n = hac_t(s[:, None], y_ho, hl, HOLDOUT_MIN_OBS)
+        j = col_of[r["id"]]
+        m = ho_mask[:, j]
+        s, yh = S_np[m, j], y[m]
+        t_hold, ic, n = hac_t(s[:, None], yh, hl, HOLDOUT_MIN_OBS)
         sign = float(r["sign"])
         t_signed = sign * t_hold[0]
-        bt = backtest(s, y_ho, sig_ho, sign, cost)
-        rows.append({"id": r["id"], "sign_train": int(sign), "n": int(n[0]), "t_hold": t_hold[0],
-                     "t_signed": t_signed, "ic": ic[0], "p_one": float(norm_sf(t_signed)),
-                     "sharpe_gross": bt["sharpe_gross"], "sharpe_net": bt["sharpe_net"]})
-    cols = ["id", "sign_train", "n", "t_hold", "t_signed", "ic", "p_one", "p_holm", "verdict",
-            "sharpe_gross", "sharpe_net"]
-    df = pd.DataFrame(rows, columns=[c for c in cols if c not in ("p_holm", "verdict")])
-    df["p_holm"] = holm(df["p_one"].where(np.isfinite(df["t_signed"])).to_numpy(dtype=float))
-    mode = cfg.verdict.mode
-    basis = df["p_one"].where(np.isfinite(df["t_signed"])) if mode == "per_factor" else df["p_holm"]
-    df["verdict"] = [_verdict(p) for p in basis]
-    df = df[cols]
+        p_one = float(norm_sf(t_signed))
+        bt = backtest(s, yh, sig[m], sign, cost)
+        pos = rows[np.flatnonzero(m)]
+        out_rows.append({"id": r["id"], "sign_train": int(sign),
+                         "holdout_start": str(cal[pos[0]].date()) if len(pos) else "",
+                         "holdout_end": str(cal[pos[-1]].date()) if len(pos) else "",
+                         "n": int(n[0]), "t_hold": t_hold[0], "t_signed": t_signed, "ic": ic[0], "p_one": p_one,
+                         "verdict": _verdict(p_one), "sharpe_gross": bt["sharpe_gross"],
+                         "sharpe_net": bt["sharpe_net"]})
+    df = pd.DataFrame(out_rows)
 
-    n_tested = int(np.isfinite(df["t_signed"]).sum())
-    composite = None
-    if run["composite_defined"]:
-        w = cands.set_index("id")["post_ic"].fillna(0.0)
-        S_np = S[w.index].to_numpy(dtype=float)
-        comp = np.where(np.isfinite(S_np), S_np, 0.0) @ w.to_numpy()
-        t_c, _, _ = hac_t(comp[ho][:, None], y_ho, hl, HOLDOUT_MIN_OBS)
-        p_c = float(norm_sf(t_c[0])) if np.isfinite(t_c[0]) else float("nan")
-        sd = float(np.std(comp[tr]))
-        bt = backtest(comp[ho] / sd if sd > 0 else comp[ho] * np.nan, y_ho, sig_ho, 1.0, cost)
-        composite = {"t": t_c[0], "p": p_c, "verdict": _verdict(p_c),
-                     "sharpe_gross": bt["sharpe_gross"], "sharpe_net": bt["sharpe_net"]}
-
-    cal = panel.target.index
     out = _jsonable({
         "status": "DONE", "forced": bool(locked and force_reason), "force_reason": force_reason,
-        "holdout_start": str(cal[ho[0] + 1].date()), "holdout_end": str(cal[-1].date()),
-        "n_holdout_rows": len(ho), "n_confirmed": int((df["verdict"] == "CONFIRMED").sum()),
-        "verdict_mode": mode, "n_tested": n_tested, "expected_by_chance": 0.05 * n_tested,
-        "composite": composite, "candidates": df.to_dict(orient="records"),
-        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "n_tested": int(np.isfinite(df["t_signed"]).sum()), "n_confirmed": int((df["verdict"] == "CONFIRMED").sum()),
+        "candidates": df.to_dict(orient="records"), "opened_at": datetime.now(timezone.utc).isoformat(),
     })
     df.to_csv(d / "confirm.csv", index=False)
     (d / "confirm.json").write_text(json.dumps(out, indent=2, ensure_ascii=False))

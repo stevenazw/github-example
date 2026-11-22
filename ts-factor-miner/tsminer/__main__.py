@@ -37,7 +37,7 @@ def main(argv=None) -> int:
         return 2
     print(f"[confirm] status={res['status']}")
     if res["status"] == "DONE":
-        print(f"[confirm] confirmed={res['n_confirmed']} composite={res['composite']}")
+        print(f"[confirm] confirmed={res['n_confirmed']} of {res['n_tested']}")
     return 0
 
 

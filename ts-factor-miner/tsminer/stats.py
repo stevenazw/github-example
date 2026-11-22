@@ -1,4 +1,4 @@
-"""HAC t-stats, circular-shift null for max|t|, multiple-testing and EB helpers."""
+"""HAC t-stats and the circular-shift null scale for single-factor tests."""
 import math
 
 import numpy as np
@@ -78,19 +78,12 @@ def hac_t(S, y, lags, min_obs=250):
     return t, ic, pre.n_all.copy()
 
 
-def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, groups=None,
-               count_thresholds=None):
-    """Circular-shift null: y is rolled by k ~ U{min_shift..T-min_shift}, t* recomputed.
+def null_sd(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0):
+    """Circular-shift null scale of the HAC t of each column of S.
 
-    Each candidate's t* is studentized by its own null sd (sd_j = std of t*[:, j] over the same
-    B replicates, ddof=0): z* = t* / sd_j, so heavy-tailed candidates get no extra chance at the
-    max. Summaries (max_abs_z, mean_z2, group_mean_z2) are on z*; t_sd (length N, NaN for unusable
-    columns) is returned so observed z = t / t_sd; t_var is the pooled variance of raw t* (diagnostic).
-
-    count_thresholds (optional float sequence): also return exceed_counts (B, n_thr), the number of columns
-    with |z*| >= each threshold in every replicate (NaN not counted), and, when groups is given,
-    group_exceed_counts (B, K, n_thr); both are None otherwise.
-
+    y is rolled by k ~ U{min_shift..T-min_shift}, t* recomputed for every column, and the sd of t*
+    over the n_boot replicates (ddof=0, finite values only) is returned per column, shape (N,).
+    Unusable columns (fewer than min_obs finite values, zero variance, no valid null t) are NaN.
     The shifts are rng = default_rng(seed); ks = rng.integers(min_shift, T-min_shift+1, n_boot).
     """
     S = np.asarray(S, dtype=float)
@@ -103,65 +96,21 @@ def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, group
     rng = np.random.default_rng(seed)
     ks = rng.integers(min_shift, T - min_shift + 1, size=n_boot)
     pre = _Pre(S, min_obs)
-    Y = y[(np.arange(T)[:, None] - ks[None, :]) % T]  # column b == np.roll(y, ks[b])
-    K = None if groups is None else int(np.max(groups)) + 1
-    max_abs = np.full(n_boot, np.nan)
-    mean_z2 = np.full(n_boot, np.nan)
-    gm = None if groups is None else np.full((n_boot, K), np.nan)
-    t_var = float("nan")
-    t_sd = np.full(S.shape[1], np.nan)
-    thr = None if count_thresholds is None else np.asarray(count_thresholds, dtype=float).ravel()
-    exc = None if thr is None else np.zeros((n_boot, len(thr)))
-    gexc = None if thr is None or groups is None else np.zeros((n_boot, K, len(thr)))
+    sd_all = np.full(pre.N, np.nan)
     if len(pre.cols):
+        Y = y[(np.arange(T)[:, None] - ks[None, :]) % T]  # column b == np.roll(y, ks[b])
         sxy, V, _ = _core(pre, Y, lags)
         ok = V > 0
         with np.errstate(divide="ignore", invalid="ignore"):
             t = np.where(ok, sxy / np.sqrt(np.where(ok, V, 1.0)), np.nan)
-        fin_t = np.isfinite(t)
-        if fin_t.any():
-            t_var = float(np.var(t[fin_t]))
-        c = fin_t.sum(axis=0)
-        t0 = np.where(fin_t, t, 0.0)
+        fin = np.isfinite(t)
+        c = fin.sum(axis=0)
+        t0 = np.where(fin, t, 0.0)
         with np.errstate(divide="ignore", invalid="ignore"):
             mu = t0.sum(axis=0) / c
-            sd = np.sqrt((np.where(fin_t, (t - mu) ** 2, 0.0)).sum(axis=0) / c)
-        sd = np.where((c > 0) & np.isfinite(sd) & (sd > 0), sd, np.nan)
-        t_sd[pre.cols] = sd
-        with np.errstate(divide="ignore", invalid="ignore"):
-            z = t / sd
-        fin = np.isfinite(z)
-        z2 = np.where(fin, z * z, 0.0)
-        cnt = fin.sum(axis=1)
-        has = cnt > 0
-        max_abs[has] = np.sqrt(z2.max(axis=1))[has]
-        mean_z2[has] = (z2.sum(axis=1) / np.maximum(cnt, 1))[has]
-        if groups is not None:
-            G = np.zeros((len(pre.cols), K))
-            G[np.arange(len(pre.cols)), np.asarray(groups)[pre.cols]] = 1.0
-            gc = fin.astype(float) @ G
-            with np.errstate(divide="ignore", invalid="ignore"):
-                gm = np.where(gc > 0, (z2 @ G) / gc, np.nan)
-        if thr is not None:
-            with np.errstate(invalid="ignore"):
-                az = np.abs(z)
-            for i, c_ in enumerate(thr):
-                hit = fin & (az >= c_)
-                exc[:, i] = hit.sum(axis=1)
-                if gexc is not None:
-                    gexc[:, :, i] = hit.astype(float) @ G
-    return {"max_abs_z": max_abs, "mean_z2": mean_z2, "group_mean_z2": gm, "t_sd": t_sd, "t_var": t_var,
-            "exceed_counts": exc, "group_exceed_counts": gexc}
-
-
-def fwer_p(t_obs, max_abs_t_null):
-    """Single-step maxT p-values (pass studentized z and the max_abs_z null): (1 + #{null >= |t|}) / (B + 1); NaN stays NaN."""
-    t = np.asarray(t_obs, dtype=float)
-    null = np.sort(np.asarray(max_abs_t_null, dtype=float))
-    B = len(null)
-    a = np.abs(t)
-    cnt = B - np.searchsorted(null, np.where(np.isfinite(a), a, 0.0), side="left")
-    return np.where(np.isfinite(a), (1.0 + cnt) / (B + 1.0), np.nan)
+            sd = np.sqrt(np.where(fin, (t - mu) ** 2, 0.0).sum(axis=0) / c)
+        sd_all[pre.cols] = np.where((c > 0) & np.isfinite(sd) & (sd > 0), sd, np.nan)
+    return sd_all
 
 
 _erfc = np.vectorize(math.erfc, otypes=[float])
@@ -174,90 +123,3 @@ def norm_sf(z):
 
 def two_sided_p(t):
     return 2.0 * norm_sf(np.abs(np.asarray(t, dtype=float)))
-
-
-def bh_q(p):
-    """Benjamini-Hochberg adjusted p-values; NaN ignored and preserved."""
-    p = np.asarray(p, dtype=float)
-    q = np.full(p.shape, np.nan)
-    idx = np.flatnonzero(np.isfinite(p))
-    m = len(idx)
-    if m == 0:
-        return q
-    order = idx[np.argsort(p[idx], kind="stable")]
-    adj = p[order] * m / np.arange(1, m + 1)
-    adj = np.minimum.accumulate(adj[::-1])[::-1]
-    q[order] = np.minimum(adj, 1.0)
-    return q
-
-
-def holm(p):
-    """Holm step-down adjusted p-values; NaN ignored and preserved."""
-    p = np.asarray(p, dtype=float)
-    out = np.full(p.shape, np.nan)
-    idx = np.flatnonzero(np.isfinite(p))
-    m = len(idx)
-    if m == 0:
-        return out
-    order = idx[np.argsort(p[idx], kind="stable")]
-    adj = p[order] * (m - np.arange(m))
-    out[order] = np.minimum(np.maximum.accumulate(adj), 1.0)
-    return out
-
-
-def eb_two_group(z, ic, v0, n_iter=200, tol=1e-8):
-    """Two-groups empirical Bayes: z_j ~ pi0 N(0, v0) + (1-pi0) N(0, v0 + n_j tau2), n_j = (z_j/ic_j)^2.
-
-    Fitted by EM on columns with finite z and finite non-zero ic; other outputs are NaN.
-    p_signal = posterior P(non-null); post_ic = p_signal * shrink * ic;
-    p_pos = p_signal * Phi(z sqrt(shrink / v0)) + (1 - p_signal) * 0.5.
-    tau2 == 0 means the data support no non-null candidate (pi0 is then unidentified): the model
-    degenerates to all-null, reported as pi0 = 1, p_signal = shrink = post_ic = 0, p_pos = 0.5.
-    """
-    z = np.asarray(z, dtype=float)
-    ic = np.asarray(ic, dtype=float)
-    ok = np.isfinite(z) & np.isfinite(ic) & (ic != 0)
-    out = {k: np.full(z.shape, np.nan) for k in ("p_signal", "shrink", "post_ic", "p_pos")}
-    out.update(pi0=float("nan"), tau2=float("nan"))
-    if not ok.any():
-        return out
-    zv, iv = z[ok], ic[ok]
-    n = (zv / iv) ** 2
-    z2 = zv * zv
-    pi0 = 0.9
-    tau2 = max(float(np.mean(z2)) - v0, 0.05) / ((1.0 - pi0) * float(np.mean(n)))
-
-    def logphi(var):
-        return -0.5 * (np.log(2.0 * np.pi * var) + z2 / var)
-
-    def resp(pi0, tau2):
-        a = np.log(pi0) + logphi(v0)
-        b = np.log(max(1.0 - pi0, 1e-300)) + logphi(v0 + n * tau2)
-        mx = np.maximum(a, b)
-        return np.exp(b - mx) / (np.exp(a - mx) + np.exp(b - mx))
-
-    for _ in range(n_iter):
-        r = resp(pi0, tau2)
-        pi_new = 1.0 - float(np.mean(r))
-        pi_new = min(max(pi_new, 1e-12), 1.0 - 1e-12)
-        den = float((r * n).sum())
-        tau_new = max(0.0, float((r * (z2 - v0)).sum())) / den if den > 0 else 0.0
-        done = abs(pi_new - pi0) < tol and abs(tau_new - tau2) < tol
-        pi0, tau2 = pi_new, tau_new
-        if done:
-            break
-    if not tau2 > 0:
-        out["p_signal"][ok] = 0.0
-        out["shrink"][ok] = 0.0
-        out["post_ic"][ok] = 0.0
-        out["p_pos"][ok] = 0.5
-        out["pi0"], out["tau2"] = 1.0, 0.0
-        return out
-    r = resp(pi0, tau2)
-    sh = n * tau2 / (v0 + n * tau2)
-    out["p_signal"][ok] = r
-    out["shrink"][ok] = sh
-    out["post_ic"][ok] = r * sh * iv
-    out["p_pos"][ok] = r * (1.0 - norm_sf(zv * np.sqrt(sh / v0))) + (1.0 - r) * 0.5
-    out["pi0"], out["tau2"] = float(pi0), float(tau2)
-    return out
