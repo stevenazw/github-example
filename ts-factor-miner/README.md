@@ -9,14 +9,14 @@
 1. 从 DataBank 数据库取几百条原始序列。
 2. 每条序列按固定的变换集合生成候选信号。
 3. 在 train 段上逐个检验候选对次日收益的预测力。
-4. 用多重检验控制"同批测了几千个"的问题。
+4. 按单因子门槛筛选候选，并并排给出实际通过数与纯噪声预期通过数（族错误率方式可选）。
 5. 给出 shortlist 和组合因子。
 6. 在 holdout 上只确认一次。
 
 ## 2. 设计原则
 
-- **默认结论是"没有发现"。** 单资产日频数据的样本量有限。以 TY 为例，train 段约 5400 天、族大小约 2500 时，单个候选要通过 FWER 门槛大约需要 |z| ≥ 4.2，相当于日频 IC ≈ 0.057。现实因子的 IC 多在 0.02–0.04，单独看几乎不可能通过。这是样本量算术，不是方法失败。因此系统同时给出三层读数：单个候选的判决、分组/全族 omnibus 检验（这批候选整体是否含有信息）、经验贝叶斯后验与组合因子。
-- **变换集合小而固定（6 个）。** 不做参数网格，不做公式搜索。每多一个候选都会抬高门槛。
+- **挖掘阶段按单因子门槛筛选，成立与否交给 holdout。** 以 TY 为例，train 段约 5400 天、族大小约 2500 时，族错误率（FWER）门槛要求 |z| ≥ 4.2，相当于日频 IC ≈ 0.057，现实因子的 IC 多在 0.02–0.04，这个门槛对现实因子不可达，因此只作参考。默认模式 `per_factor` 沿用单因子检验的门槛（|z| ≥ 2.5 为 PASS，2.0–2.5 为 WEAK_PASS，< 2 为 REJECT），不因同批测了多少个而打折。作为诚实性的配套，报告并排给出"实际通过数"与"纯噪声下预期通过数"（全族与各分组，用循环平移零分布算，自动考虑候选之间的相关性）；observed 接近 null_mean 说明通过名单大部分来自噪声。holdout 是最终裁判。族错误率方式保留为可选模式（`mode = "family"`）。
+- **变换集合小而固定（6 个）。** 不做参数网格，不做公式搜索。每多一个候选，族错误率门槛和纯噪声下的预期通过数都会上升。
 - **防前视是数据层的职责。** 所有序列先 as-of 对齐到标的日历，再按可得性滞后；信号只用因果变换。
 - **train/holdout 隔离。** `mine` 的任何输出不依赖 holdout；`confirm` 是唯一打开 holdout 的入口，用 lock 文件保证只看一次。
 - **判据在看数据前固定。** 门槛写在配置的 `[verdict]` 里。
@@ -61,9 +61,14 @@ databank.py        transforms.py      stats.py            pipeline.py          c
 
 ### 3.5 判决与提示（`pipeline.py`）
 
-- `PASS`：single-step maxT 的族错误率 `p_fwer ≤ fwer_alpha`。
-- `WEAK_PASS`：BH `q_bh ≤ fdr_q`。
-- 否则 `REJECT`。
+判决模式由 `[verdict] mode` 决定：
+
+- `per_factor`（默认，单因子门槛）：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`；z 非有限为 `REJECT`。不做同批校正。
+- `family`（族错误率 / FDR 校正）：single-step maxT 的 `p_fwer ≤ fwer_alpha` 为 `PASS`，BH `q_bh ≤ fdr_q` 为 `WEAK_PASS`，否则 `REJECT`。
+
+两种模式下 `p_fwer`、`q_bh`、omnibus、EB 都照常计算并输出，另一种模式的读数仅供参考。shortlist 的定义不变：非 REJECT 候选去冗余后的代表。
+
+**通过数与噪声预期。** 对阈值 `z_weak`、`z_pass`、3.0，在全族和每个分组上给出 `observed`（实际 \|z\| ≥ 阈值的候选数）、`null_mean`（循环平移零分布各次重复中同一计数的均值，即纯噪声下的预期通过数）和 `p = (1 + #{零分布计数 ≥ observed}) / (B + 1)`，写入 `exceed.csv`。降低门槛不会增加证据；分组内候选高度相关，observed 不等于独立发现的个数。
 
 `flags` 列给出两个提示，不改变判决：
 
@@ -79,7 +84,7 @@ databank.py        transforms.py      stats.py            pipeline.py          c
 
 ### 3.7 holdout 确认（`confirm.py`）
 
-shortlist 每个候选按 train 上的符号做单边 HAC t 检验，对 p 做 Holm 校正；组合因子单独做一个单边检验（不并入 Holm）。结论按 p 分档：≤ 0.05 为 `CONFIRMED`，≤ 0.10 为 `WEAK`，否则 `NOT_CONFIRMED`。完成后写入 `confirm.lock`。
+shortlist 每个候选按 train 上的符号做单边 HAC t 检验，得到未校正的 `p_one` 和 Holm 校正的 `p_holm`；组合因子单独做一个单边检验（不并入 Holm）。结论分档：≤ 0.05 为 `CONFIRMED`，≤ 0.10 为 `WEAK`，否则 `NOT_CONFIRMED`；t 非有限为 `INSUFFICIENT`。分档依据随模式而异：`per_factor` 用 `p_one`（`p_holm` 仍输出，仅供参考），`family` 用 `p_holm`。`confirm.json` 另含 `verdict_mode`、`n_tested`（t 有限的候选数）和 `expected_by_chance`（= 0.05 × `n_tested`，按 5% 显著性纯运气预期被确认的个数），应与实际的 `n_confirmed` 对照着读。完成后写入 `confirm.lock`。
 
 ## 4. 快速开始
 
@@ -116,11 +121,12 @@ python -m pytest -q
 
 | 文件 | 内容 |
 |---|---|
-| `report.md` | 人类可读报告：结论、门槛、shortlist、watchlist、分组 omnibus；confirm 之后追加 holdout 结果 |
-| `run.json` | 机器可读摘要：日期切分、族大小、零分布门槛 `hurdle`、omnibus、EB 参数、判决计数、shortlist |
+| `report.md` | 人类可读报告：结论、判定门槛与多重检验参考、通过数量与噪声预期、shortlist、watchlist、分组 omnibus；confirm 之后追加 holdout 结果 |
+| `run.json` | 机器可读摘要：日期切分、族大小、零分布门槛 `hurdle`、omnibus、EB 参数、判决计数、shortlist、`verdict_mode`、全族 `exceed` |
 | `candidates.csv` | 族内全部候选，按 \|z\| 降序 |
 | `shortlist.csv` | 去冗余后的代表候选，另含描述与 train 段回测列 |
 | `watchlist.csv` | |z| 最大的 200 个候选去冗余后取前 20 个，不一定通过检验，仅供参考 |
+| `exceed.csv` | 通过数与噪声预期：`scope`（ALL 或分组名）、`threshold`、`n_cand`、`observed`、`null_mean`、`p` |
 | `groups.csv` | 分组 omnibus：`n_cand`、`mean_z2`、`null_mean_z2`、`p`、`p_holm` |
 | `config.toml` | 本次运行所用配置的副本（`confirm` 从这里重建配置） |
 | `panel/` | 保存的 Panel：`panel.pkl`（主数据，pickle）、`meta.csv`、`excluded.csv`、`info.json` |
@@ -142,7 +148,7 @@ python -m pytest -q
 | `sign` | t 的符号，`confirm` 用它定方向 |
 | `p_cal`, `q_bh` | 由 \|z\| 按正态近似得到的双侧 p；BH 校正后的 q |
 | `p_fwer` | single-step maxT 的族错误率 p 值 |
-| `verdict` | PASS / WEAK_PASS / REJECT |
+| `verdict` | PASS / WEAK_PASS / REJECT（依 `mode`：per_factor 看 \|z\|，family 看 `p_fwer` / `q_bh`） |
 | `p_signal`, `shrink`, `post_ic`, `p_pos` | EB：非零后验概率、收缩系数、后验 IC、P(IC>0) |
 | `t_h1`, `t_h2`, `t_xlag` | 前半段 t、后半段 t、多滞后一天的 t |
 | `flags` | `half_flip` / `xlag_weak`，分号分隔 |
@@ -167,9 +173,11 @@ python -m pytest -q
 | `[lags]` `D`, `W`, `class`, `ticker` | 见 3.2。`class` 的键形如 `"class_one/class_two"` |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选最少观测数、零分布重复次数、循环平移的最小位移、随机种子 |
-| `[verdict]` `fwer_alpha`, `fdr_q`, `dedupe_corr`, `extra_lag_t_min` | PASS 的 FWER 水平、WEAK_PASS 的 FDR 水平、去冗余相关阈值、`xlag_weak` 的 \|t\| 阈值 |
+| `[verdict]` `mode` | `"per_factor"`（默认，单因子门槛筛选，不做同批校正）或 `"family"`（族错误率 / FDR 校正）；其他值报错 |
+| `[verdict]` `z_pass`, `z_weak` | per_factor 模式的 PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0`；同时决定 `exceed.csv` 的阈值集合 `{z_weak, z_pass, 3.0}` |
+| `[verdict]` `fwer_alpha`, `fdr_q`, `dedupe_corr`, `extra_lag_t_min` | family 模式 PASS 的 FWER 水平、WEAK_PASS 的 FDR 水平（per_factor 下仅作参考）；去冗余相关阈值；`xlag_weak` 的 \|t\| 阈值 |
 
-**缩小族以降低门槛。** 按经济假设只选相关类别，而不是把能取到的都放进来。族从约 2500 降到 50 时，FWER 门槛大约从 |z| 4.2 降到 3.2，对应所需 IC 明显下降。这个选择必须在看数据之前做出。
+**缩小族。** 按经济假设只选相关类别，而不是把能取到的都放进来。族越小，纯噪声下的预期通过数越少（family 模式下 FWER 门槛也越低：族从约 2500 降到 50 时，大约从 |z| 4.2 降到 3.2）。这个选择必须在看数据之前做出。
 
 ## 7. 已知局限
 
@@ -188,7 +196,8 @@ python -m pytest -q
 
 - **因果性 / 无前视**：`test_causality`、`test_no_lookahead_invariance`、`test_forward_target_no_lookahead`、`test_lag_semantics_never_earlier`（改动未来数据不应改变过去的信号或对齐结果）。
 - **holdout 隔离**：`test_holdout_isolation`、`test_prepare_split`。
-- **FWER 控制**：`test_fwer_control_pure_noise`、`test_null_calibration_*`、`test_pure_noise_no_pass`（纯噪声模拟下不应出现 PASS）。
+- **FWER 控制**：`test_fwer_control_pure_noise`、`test_null_calibration_*`、`test_pure_noise_no_pass_family_mode`（family 模式下纯噪声不应出现 PASS）。
+- **通过数计数口径**：`test_shift_null_count_thresholds_*`、`test_per_factor_noise_exceed`（per_factor 模式下噪声中出现 PASS 是预期行为，只检查 observed 与 null_mean 同量级）。
 - **植入信号可检出**：`test_planted_signal_detected`、`test_planted_signal_confirmed`。
 - **lock**：`test_lock_and_force`、`test_cli_locked_exit_code`。
 
