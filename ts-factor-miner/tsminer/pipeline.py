@@ -14,13 +14,13 @@ import numpy as np
 import pandas as pd
 
 from .databank import Panel, build_panel
-from .stats import bh_q, eb_shrink, fwer_p, hac_t, holm, shift_null, two_sided_p
+from .stats import bh_q, eb_two_group, fwer_p, hac_t, holm, shift_null, two_sided_p
 from .transforms import build_candidates, forward_target
 
 WATCHLIST_POOL = 200
 WATCHLIST_SIZE = 20
-CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n", "t", "ic", "sign",
-                "p_cal", "q_bh", "p_fwer", "verdict", "shrink", "post_ic", "p_pos",
+CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n", "t", "null_sd", "z", "ic", "sign",
+                "p_cal", "q_bh", "p_fwer", "verdict", "p_signal", "shrink", "post_ic", "p_pos",
                 "t_h1", "t_h2", "t_xlag", "flags", "rep"]
 BT_COLUMNS = ["sharpe_gross", "sharpe_net", "turnover", "ac1"]
 
@@ -151,33 +151,41 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     sig_tr = sigma.to_numpy(dtype=float)[tr]
 
     t_all, ic_all, n_all = hac_t(S_tr, y_tr, st.hac_lags, st.min_obs)
-    fam = np.flatnonzero(np.isfinite(t_all))
+    fam0 = np.flatnonzero(np.isfinite(t_all))
+    if len(fam0) == 0:
+        raise ValueError("no candidate has a finite t on the train segment")
+    gcodes0, guniq0 = pd.factorize(cm.loc[np.array(S.columns)[fam0], "group"].to_numpy(), sort=True)
+    null = shift_null(S_tr[:, fam0], y_tr, st.hac_lags, st.min_obs, st.n_boot, st.min_shift, st.seed,
+                      groups=gcodes0)
+    # studentization needs a valid null sd; candidates without one leave the family
+    keep = np.isfinite(null["t_sd"]) & (null["t_sd"] > 0)
+    fam = fam0[keep]
     n_dropped = int(len(t_all) - len(fam))
     m = len(fam)
     if m == 0:
-        raise ValueError("no candidate has a finite t on the train segment")
+        raise ValueError("no candidate has a valid null sd")
     ids = np.array(S.columns)[fam]
     t, ic, n_obs = t_all[fam], ic_all[fam], n_all[fam]
+    null_sd = null["t_sd"][keep]
+    z = t / null_sd
     S_fam = S_tr[:, fam]
-    gcodes, guniq = pd.factorize(cm.loc[ids, "group"].to_numpy(), sort=True)
-    K = len(guniq)
+    gcodes, K, guniq = gcodes0[keep], len(guniq0), guniq0
     print(f"[mine] rows={len(S)} train_rows={len(tr)} candidates={S.shape[1]} family={m} dropped={n_dropped}")
 
-    null = shift_null(S_fam, y_tr, st.hac_lags, st.min_obs, st.n_boot, st.min_shift, st.seed, groups=gcodes)
     B = st.n_boot
-    p_fwer = fwer_p(t, null["max_abs_t"])
+    p_fwer = fwer_p(z, null["max_abs_z"])
     t_var = null["t_var"]
-    scale = np.sqrt(max(1.0, t_var)) if np.isfinite(t_var) else 1.0
-    p_cal = two_sided_p(np.abs(t) / scale)
+    p_cal = two_sided_p(np.abs(z))
     q_bh = bh_q(p_cal)
-    hurdle = float(np.nanquantile(null["max_abs_t"], 1.0 - vd.fwer_alpha))
-    obs = float(np.mean(t ** 2))
-    p_omni = float((1 + np.sum(null["mean_t2"] >= obs)) / (B + 1))
-    g_obs = np.array([np.mean(t[gcodes == k] ** 2) for k in range(K)])
-    g_p = np.array([(1 + np.sum(null["group_mean_t2"][:, k] >= g_obs[k])) / (B + 1) for k in range(K)])
+    hurdle = float(np.nanquantile(null["max_abs_z"], 1.0 - vd.fwer_alpha))
+    obs = float(np.mean(z ** 2))
+    p_omni = float((1 + np.sum(null["mean_z2"] >= obs)) / (B + 1))
+    present = np.flatnonzero(np.bincount(gcodes, minlength=K) > 0)
+    g_obs = np.array([np.mean(z[gcodes == k] ** 2) for k in present])
+    g_p = np.array([(1 + np.sum(null["group_mean_z2"][:, k] >= o)) / (B + 1) for k, o in zip(present, g_obs)])
     g_holm = holm(g_p)
-    v0 = float(np.nanmean(null["mean_t2"]))
-    eb = eb_shrink(t, ic, v0)
+    v0 = float(np.nanmean(null["mean_z2"]))
+    eb = eb_two_group(z, ic, v0)
     verdict = np.array([assign_verdict(a, b, vd.fwer_alpha, vd.fdr_q) for a, b in zip(p_fwer, q_bh)])
 
     # flags (informational only)
@@ -197,13 +205,13 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
             f.append("xlag_weak")
         flags.append(";".join(f))
 
-    order = np.argsort(-np.abs(t), kind="stable")
+    order = np.argsort(-np.abs(z), kind="stable")
     cand = pd.DataFrame({
         "id": ids, "series": cm.loc[ids, "series"].to_numpy(), "transform": cm.loc[ids, "transform"].to_numpy(),
         "group": cm.loc[ids, "group"].to_numpy(), "kind": cm.loc[ids, "kind"].to_numpy(),
-        "freq": cm.loc[ids, "freq"].to_numpy(), "n": n_obs, "t": t, "ic": ic, "sign": np.sign(t),
+        "freq": cm.loc[ids, "freq"].to_numpy(), "n": n_obs, "t": t, "null_sd": null_sd, "z": z, "ic": ic, "sign": np.sign(t),
         "p_cal": p_cal, "q_bh": q_bh, "p_fwer": p_fwer, "verdict": verdict,
-        "shrink": eb["shrink"], "post_ic": eb["post_ic"], "p_pos": eb["p_pos"],
+        "p_signal": eb["p_signal"], "shrink": eb["shrink"], "post_ic": eb["post_ic"], "p_pos": eb["p_pos"],
         "t_h1": t_h1, "t_h2": t_h2, "t_xlag": t_xlag, "flags": flags,
     }).iloc[order].reset_index(drop=True)
 
@@ -230,8 +238,8 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     cand.to_csv(run_dir / "candidates.csv", index=False)
     table(short_ids).to_csv(run_dir / "shortlist.csv", index=False)
     table(watch_ids).to_csv(run_dir / "watchlist.csv", index=False)
-    pd.DataFrame({"group": guniq, "n_cand": np.bincount(gcodes, minlength=K), "mean_t2": g_obs,
-                  "null_mean_t2": np.nanmean(null["group_mean_t2"], axis=0), "p": g_p,
+    pd.DataFrame({"group": guniq[present], "n_cand": np.bincount(gcodes, minlength=K)[present],
+                  "mean_z2": g_obs, "null_mean_z2": np.nanmean(null["group_mean_z2"], axis=0)[present], "p": g_p,
                   "p_holm": g_holm}).to_csv(run_dir / "groups.csv", index=False)
 
     cal = panel.target.index
@@ -248,10 +256,12 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         "n_train_rows": len(tr), "n_holdout_rows": len(prep["holdout_rows"]),
         "n_series": int(panel.X.shape[1]), "n_candidates": int(S.shape[1]),
         "n_dropped": n_dropped, "family_size": m,
-        "null": {"t_var": t_var, "hurdle": hurdle, "v0": v0, "n_boot": B},
-        "omnibus": {"mean_t2": obs, "p": p_omni},
-        "eb_tau2": tau2,
-        "composite_defined": bool(tau2 > 0),
+        "null": {"t_var": t_var, "hurdle": hurdle, "v0": v0, "n_boot": B,
+                 "null_sd_median": float(np.median(null_sd)), "null_sd_min": float(null_sd.min()),
+                 "null_sd_max": float(null_sd.max())},
+        "omnibus": {"mean_z2": obs, "p": p_omni},
+        "eb_tau2": tau2, "eb_pi0": eb["pi0"],
+        "composite_defined": bool(tau2 > 0 and eb["pi0"] < 1),
         "verdict_counts": {v: int((verdict == v).sum()) for v in ("PASS", "WEAK_PASS", "REJECT")},
         "shortlist": short_ids,
         "created_at": datetime.now(timezone.utc).isoformat(),

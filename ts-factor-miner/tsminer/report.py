@@ -40,10 +40,10 @@ def _read_csv(path: Path) -> pd.DataFrame:
 
 
 def _cand_table(df: pd.DataFrame) -> str:
-    headers = ["id", "description", "t", "IC", "p_fwer", "q_bh", "verdict", "post_ic", "P(IC>0)",
+    headers = ["id", "description", "t", "z", "IC", "p_fwer", "q_bh", "verdict", "P(signal)", "post_ic", "P(IC>0)",
                "Sharpe 毛/净", "flags"]
-    rows = [[r["id"], r["description"], _num(r["t"], 2), _num(r["ic"], 4), _num(r["p_fwer"], 3),
-             _num(r["q_bh"], 3), r["verdict"], _num(r["post_ic"], 4), _num(r["p_pos"], 3),
+    rows = [[r["id"], r["description"], _num(r["t"], 2), _num(r["z"], 2), _num(r["ic"], 4), _num(r["p_fwer"], 3),
+             _num(r["q_bh"], 3), r["verdict"], _num(r["p_signal"], 3), _num(r["post_ic"], 4), _num(r["p_pos"], 3),
              f"{_num(r['sharpe_gross'], 2)} / {_num(r['sharpe_net'], 2)}", r["flags"]]
             for _, r in df.iterrows()]
     return _md_table(headers, rows)
@@ -87,13 +87,16 @@ def write_report(run_dir) -> None:
 
     L += ["## 多重检验门槛", ""]
     L += [f"- 族大小 m = {run['family_size']}",
-          f"- FWER 门槛：|t| >= {_num(null['hurdle'], 2)}（循环平移零分布 single-step maxT，n_boot = {null['n_boot']}）",
-          f"- 零分布 t 方差：{_num(t_var, 2)}（p_cal 在其大于 1 时按其平方根保守校准）"]
-    if t_var is not None and abs(t_var - 1.0) > 0.1:
-        L.append(f"- 警告：零分布 t 方差偏离 1 超过 0.1（{_num(t_var, 2)}），HAC t 的尺度不准，BH 结果请谨慎解读。")
-    L += [f"- 族 omnibus：mean t² = {_num(omni['mean_t2'], 2)}，p = {_num(omni['p'], 3)}",
-          f"- eb_tau2 = {_num(run['eb_tau2'], 6)}：经验贝叶斯估计的族内平均真实 IC²；为 0 表示 t 的分散度与零分布无法区分，"
-          f"不定义组合因子（composite_defined = {run['composite_defined']}）。", ""]
+          f"- FWER 门槛：|z| >= {_num(null['hurdle'], 2)}（z = t ÷ 该候选自身零分布标准差；"
+          f"循环平移零分布 studentized single-step maxT，n_boot = {null['n_boot']}）",
+          f"- 各候选零分布 t 标准差 null_sd：中位数 {_num(null['null_sd_median'], 2)}，"
+          f"最小 {_num(null['null_sd_min'], 2)}，最大 {_num(null['null_sd_max'], 2)}",
+          f"- 诊断：原始 t* 的汇总方差 t_var = {_num(t_var, 2)}（不参与判定）"]
+    L += [f"- 族 omnibus：mean z² = {_num(omni['mean_z2'], 2)}，p = {_num(omni['p'], 3)}",
+          f"- 经验贝叶斯（两组混合模型）：零假设占比 pi0 = {_num(run['eb_pi0'], 3)}，非零候选的 IC 离散度 "
+          f"tau = {_num(np.sqrt(run['eb_tau2']) if run['eb_tau2'] is not None else None, 4)}（eb_tau2 = {_num(run['eb_tau2'], 6)}）。"
+          f"P(signal) 是该候选非零的后验概率（1 - local fdr），post_ic 是按它加权收缩后的 IC，组合因子按 post_ic 加权"
+          f"（composite_defined = {run['composite_defined']}）。", ""]
 
     L += ["## Shortlist", ""]
     L += [_cand_table(short) if len(short) else "没有候选进入 shortlist。", ""]
@@ -103,8 +106,8 @@ def write_report(run_dir) -> None:
     L += ["## 分组 omnibus", ""]
     if len(groups):
         g = groups.sort_values("p")
-        L.append(_md_table(["group", "n_cand", "mean t²", "null mean t²", "p", "p_holm"],
-                           [[r["group"], int(r["n_cand"]), _num(r["mean_t2"], 2), _num(r["null_mean_t2"], 2),
+        L.append(_md_table(["group", "n_cand", "mean z²", "null mean z²", "p", "p_holm"],
+                           [[r["group"], int(r["n_cand"]), _num(r["mean_z2"], 2), _num(r["null_mean_z2"], 2),
                              _num(r["p"], 3), _num(r["p_holm"], 3)] for _, r in g.iterrows()]))
     L.append("")
 
