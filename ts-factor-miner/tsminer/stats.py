@@ -194,6 +194,8 @@ def eb_two_group(z, ic, v0, n_iter=200, tol=1e-8):
     Fitted by EM on columns with finite z and finite non-zero ic; other outputs are NaN.
     p_signal = posterior P(non-null); post_ic = p_signal * shrink * ic;
     p_pos = p_signal * Phi(z sqrt(shrink / v0)) + (1 - p_signal) * 0.5.
+    tau2 == 0 means the data support no non-null candidate (pi0 is then unidentified): the model
+    degenerates to all-null, reported as pi0 = 1, p_signal = shrink = post_ic = 0, p_pos = 0.5.
     """
     z = np.asarray(z, dtype=float)
     ic = np.asarray(ic, dtype=float)
@@ -227,6 +229,13 @@ def eb_two_group(z, ic, v0, n_iter=200, tol=1e-8):
         pi0, tau2 = pi_new, tau_new
         if done:
             break
+    if not tau2 > 0:
+        out["p_signal"][ok] = 0.0
+        out["shrink"][ok] = 0.0
+        out["post_ic"][ok] = 0.0
+        out["p_pos"][ok] = 0.5
+        out["pi0"], out["tau2"] = 1.0, 0.0
+        return out
     r = resp(pi0, tau2)
     sh = n * tau2 / (v0 + n * tau2)
     out["p_signal"][ok] = r

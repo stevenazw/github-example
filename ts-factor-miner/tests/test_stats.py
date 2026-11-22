@@ -222,6 +222,19 @@ def test_eb_two_group_pure_noise():
         r["pi0"], r["tau2"], ratio, r["p_pos"].min(), r["p_pos"].max()))
     assert ratio < 0.2
     assert np.all((r["p_pos"] > 0.2) & (r["p_pos"] < 0.8))
+    if r["tau2"] == 0:
+        assert r["pi0"] == 1.0 and np.all(r["p_signal"] == 0) and np.all(r["post_ic"] == 0)
+        assert np.all(r["p_pos"] == 0.5)
+
+
+def test_eb_two_group_tau2_zero_is_all_null():
+    rng = np.random.default_rng(12)
+    z = rng.uniform(-0.5, 0.5, 200)   # every z^2 < v0, so tau2 collapses to 0
+    z, ic = _z_ic(z, rng)
+    r = eb_two_group(z, ic, 1.0)
+    assert r["tau2"] == 0 and r["pi0"] == 1.0
+    assert np.all(r["p_signal"] == 0) and np.all(r["post_ic"] == 0) and np.all(r["shrink"] == 0)
+    assert np.all(r["p_pos"] == 0.5)
 
 
 def test_eb_two_group_sign_and_nan():

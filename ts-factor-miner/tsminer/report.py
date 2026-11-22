@@ -93,10 +93,12 @@ def write_report(run_dir) -> None:
           f"最小 {_num(null['null_sd_min'], 2)}，最大 {_num(null['null_sd_max'], 2)}",
           f"- 诊断：原始 t* 的汇总方差 t_var = {_num(t_var, 2)}（不参与判定）"]
     L += [f"- 族 omnibus：mean z² = {_num(omni['mean_z2'], 2)}，p = {_num(omni['p'], 3)}",
-          f"- 经验贝叶斯（两组混合模型）：零假设占比 pi0 = {_num(run['eb_pi0'], 3)}，非零候选的 IC 离散度 "
-          f"tau = {_num(np.sqrt(run['eb_tau2']) if run['eb_tau2'] is not None else None, 4)}（eb_tau2 = {_num(run['eb_tau2'], 6)}）。"
-          f"P(signal) 是该候选非零的后验概率（1 - local fdr），post_ic 是按它加权收缩后的 IC，组合因子按 post_ic 加权"
-          f"（composite_defined = {run['composite_defined']}）。", ""]
+          ("- 经验贝叶斯：两组混合模型未发现非零候选（τ² = 0）：P(signal) 全部为 0，不构造组合因子。"
+           if not run["eb_tau2"] else
+           f"- 经验贝叶斯（两组混合模型）：零假设占比 pi0 = {_num(run['eb_pi0'], 3)}，非零候选的 IC 离散度 "
+           f"tau = {_num(np.sqrt(run['eb_tau2']), 4)}（eb_tau2 = {_num(run['eb_tau2'], 6)}）。"
+           f"P(signal) 是该候选非零的后验概率（1 - local fdr），post_ic 是按它加权收缩后的 IC，组合因子按 post_ic 加权"
+           f"（composite_defined = {run['composite_defined']}）。"), ""]
 
     L += ["## Shortlist", ""]
     L += [_cand_table(short) if len(short) else "没有候选进入 shortlist。", ""]
