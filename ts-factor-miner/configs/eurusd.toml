@@ -1,0 +1,113 @@
+# EURUSD (spot) factor-mining config.
+# NOTE: ACM term premium (class_two=ACM) is deliberately EXCLUDED from the universe:
+# it is a model series re-estimated on the full sample, so its historical values look ahead.
+
+[target]
+name = "EURUSD"
+kind = "spot"
+ticker = "EURUSD BGN Curncy"
+field = "PX_LAST"           # daily return = log difference of this series
+cost_per_side = 0.00005
+
+[databank]
+toolkit_dir = "/home/user/databank-work/entry"
+cache_dir = "/home/user/databank-work/databank-cache"
+
+[sample]
+start = ""                  # 可选 ISO 日期; 空 = 标的全部历史
+holdout_frac = 0.3
+
+[universe]
+fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: 每个 ticker 取它拥有的第一个
+chains = ["TY","TU","FV","US","RX","OE","DU","G","OAT","IK"]
+carry_chains = []
+exclude_tickers = []
+
+[[universe.select]]
+class_two = "FX"
+class_three = ["Currency", "Currency_Index", "Cross_Currency_Basis"]
+
+[[universe.select]]
+tickers = ["EURUSD1W BGN Curncy", "EURUSD1M BGN Curncy", "EURUSD3M BGN Curncy", "EURUSD6M BGN Curncy", "EURUSD12M BGN Curncy"]
+
+[[universe.select]]
+class_two = "VOL"
+
+[[universe.select]]
+class_two = "Government_Bond"
+class_three = ["Yield", "Bill", "Govt_Spread"]
+
+[[universe.select]]
+class_two = "Money_Market"
+class_three = ["MM_Future", "Benchmark_Rate", "Implied_Yield"]
+
+[[universe.select]]
+class_two = "Swap_OIS"
+class_three = ["SOFR_OIS", "ESTR_OIS", "Swap_Spread"]
+
+[[universe.select]]
+class_two = "Equity"
+class_three = ["Equity_Index", "Style"]
+
+[[universe.select]]
+class_two = "Commodity"
+
+[[universe.select]]
+class_two = "Credit"
+
+[[universe.select]]
+class_two = "Inflation_Linked"
+class_three = ["Breakeven", "TIPS_Yield", "Inflation_Swap"]
+
+[[universe.select]]
+class_one = "Macro"
+class_three = ["Surprise_Index", "Financial_Conditions"]
+
+[[universe.select]]
+class_two = "CFTC_COT"
+class_three = ["US_Dollar_Index"]
+
+# US2Y-DE2Y dropped: no German 2Y govt yield ticker in the databank (GTDEM2Y Govt does not exist).
+[[universe.spread]]
+id = "US10Y-DE10Y"
+a = "USGG10YR Index"
+b = "GTDEM10Y Govt"
+
+[[universe.spread]]
+id = "SOFR2Y-ESTR2Y"
+a = "USISSO02 Index"
+b = "EESWE2 Curncy"
+
+[[universe.spread]]
+id = "CESIUSD-CESIEUR"
+a = "CESIUSD Index"
+b = "CESIEUR Index"
+
+[lags]
+D = 1          # 日频默认: t 日收盘的信号只用 <= t-1 日的 x (保守: 不假设 x 的取值时刻早于标的收盘)
+W = 6          # 周频默认: 保守覆盖"下周才发布"的情形
+
+[lags.class]   # 键为 "class_one/class_two", 优先于频率默认
+"Positioning/CFTC_COT" = 4     # 周二数据、周五 15:30 ET 发布 -> 下周一可用
+"FED/Balance_Sheet" = 2        # 周三数据、周四 16:30 ET 发布 -> 周五可用
+"FED/Primary_Dealer" = 8       # 周三数据、下周四发布 -> 保守取 8
+
+[lags.ticker]  # 可选: 按 ticker 精确覆盖, 优先级最高 (默认空)
+
+[signals]
+std_window = 252
+clip = 4.0
+vol_halflife = 20
+
+[stats]
+hac_lags = 5
+min_obs = 500
+n_boot = 1000
+min_shift = 60
+seed = 20261122
+
+[verdict]
+fwer_alpha = 0.05
+fdr_q = 0.10
+dedupe_corr = 0.7
+extra_lag_t_min = 2.0
