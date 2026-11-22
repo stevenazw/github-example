@@ -68,9 +68,12 @@ def confirm(run_dir, force_reason=None) -> dict:
             "sharpe_gross", "sharpe_net"]
     df = pd.DataFrame(rows, columns=[c for c in cols if c not in ("p_holm", "verdict")])
     df["p_holm"] = holm(df["p_one"].where(np.isfinite(df["t_signed"])).to_numpy(dtype=float))
-    df["verdict"] = [_verdict(p) for p in df["p_holm"]]
+    mode = cfg.verdict.mode
+    basis = df["p_one"].where(np.isfinite(df["t_signed"])) if mode == "per_factor" else df["p_holm"]
+    df["verdict"] = [_verdict(p) for p in basis]
     df = df[cols]
 
+    n_tested = int(np.isfinite(df["t_signed"]).sum())
     composite = None
     if run["composite_defined"]:
         w = cands.set_index("id")["post_ic"].fillna(0.0)
@@ -88,6 +91,7 @@ def confirm(run_dir, force_reason=None) -> dict:
         "status": "DONE", "forced": bool(locked and force_reason), "force_reason": force_reason,
         "holdout_start": str(cal[ho[0] + 1].date()), "holdout_end": str(cal[-1].date()),
         "n_holdout_rows": len(ho), "n_confirmed": int((df["verdict"] == "CONFIRMED").sum()),
+        "verdict_mode": mode, "n_tested": n_tested, "expected_by_chance": 0.05 * n_tested,
         "composite": composite, "candidates": df.to_dict(orient="records"),
         "opened_at": datetime.now(timezone.utc).isoformat(),
     })

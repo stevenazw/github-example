@@ -107,6 +107,14 @@ min_shift = 60
 seed = 20261122
 
 [verdict]
+# 判定模式:
+#   per_factor: 单因子门槛筛选。|z| >= z_pass 为 PASS, z_weak <= |z| < z_pass 为 WEAK_PASS, 其余 REJECT;
+#               不按同批候选数做校正, 成立与否交给 holdout 逐个判定; 报告并排给出实际通过数与纯噪声预期通过数。
+#   family:     族错误率/FDR 校正。p_fwer <= fwer_alpha 为 PASS, q_bh <= fdr_q 为 WEAK_PASS。
+mode = "per_factor"
+z_pass = 2.5
+z_weak = 2.0
+# fwer_alpha / fdr_q 在 family 模式下用于判定, per_factor 模式下仅作参考输出; dedupe_corr / extra_lag_t_min 两种模式通用
 fwer_alpha = 0.05
 fdr_q = 0.10
 dedupe_corr = 0.7

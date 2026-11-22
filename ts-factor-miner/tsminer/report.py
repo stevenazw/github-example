@@ -60,15 +60,32 @@ def write_report(run_dir) -> None:
     vc = run["verdict_counts"]
     n_pass, n_weak = vc.get("PASS", 0), vc.get("WEAK_PASS", 0)
     t_var = null["t_var"]
+    vd = run["config"]["verdict"]
+    mode = run.get("verdict_mode", vd.get("mode", "family"))
+    zp, zw = vd.get("z_pass", 2.5), vd.get("z_weak", 2.0)
+    exceed = _read_csv(d / "exceed.csv")
 
     L = [f"# 因子挖掘报告：{run['target']}", ""]
     L += ["## 结论", ""]
-    head = (f"族大小 m = {run['family_size']}，PASS {n_pass} 个，WEAK_PASS {n_weak} 个，"
-            f"shortlist {len(run['shortlist'])} 个，族 omnibus p = {_num(omni['p'], 3)}。")
-    if n_pass + n_weak == 0:
-        head += "没有候选通过多重检验。"
-    elif n_pass == 0:
-        head += "没有候选通过 FWER 检验（无 PASS），仅有 FDR 层面的 WEAK_PASS。"
+    if mode == "per_factor":
+        head = (f"判定模式：单因子门槛（PASS: |z| >= {_num(zp, 2)}，WEAK_PASS: |z| >= {_num(zw, 2)}，不做同批校正，"
+                f"成立与否由 holdout 判定）。族大小 m = {run['family_size']}，PASS（|z| >= {_num(zp, 2)}）{n_pass} 个，"
+                f"WEAK_PASS {n_weak} 个，shortlist {len(run['shortlist'])} 个。")
+        allr = exceed[exceed["scope"] == "ALL"] if len(exceed) else exceed
+
+        def _null_at(thr):
+            r = allr[np.isclose(allr["threshold"], thr)]
+            return _num(r["null_mean"].iloc[0], 1) if len(r) else "-"
+        head += (f"纯噪声下预期有 {_null_at(zp)} 个候选达到 PASS 门槛、{_null_at(zw)} 个达到 WEAK_PASS 门槛以上。")
+        if n_pass + n_weak == 0:
+            head += "没有候选通过。"
+    else:
+        head = (f"判定模式：族错误率（FWER / FDR 校正）。族大小 m = {run['family_size']}，PASS {n_pass} 个，"
+                f"WEAK_PASS {n_weak} 个，shortlist {len(run['shortlist'])} 个，族 omnibus p = {_num(omni['p'], 3)}。")
+        if n_pass + n_weak == 0:
+            head += "没有候选通过多重检验。"
+        elif n_pass == 0:
+            head += "没有候选通过 FWER 检验（无 PASS），仅有 FDR 层面的 WEAK_PASS。"
     L += [head, ""]
 
     L += ["## 数据与样本", ""]
@@ -85,7 +102,13 @@ def write_report(run_dir) -> None:
         L.append("- 被剔除的序列：0 个")
     L.append("")
 
-    L += ["## 多重检验门槛", ""]
+    L += ["## 判定门槛与多重检验参考", ""]
+    if mode == "per_factor":
+        sq = np.sqrt(run["n_train_rows"])
+        L += [f"- 单因子门槛：PASS 为 |z| >= {_num(zp, 2)}（对应 IC ≈ {_num(zp / sq, 4)}），"
+              f"WEAK_PASS 为 |z| >= {_num(zw, 2)}（对应 IC ≈ {_num(zw / sq, 4)}）；"
+              f"IC = z ÷ √n_train_rows，n_train_rows = {run['n_train_rows']}。不按同批候选数打折。",
+              "- 以下为参考信息，不参与判定："]
     L += [f"- 族大小 m = {run['family_size']}",
           f"- FWER 门槛：|z| >= {_num(null['hurdle'], 2)}（z = t ÷ 该候选自身零分布标准差；"
           f"循环平移零分布 studentized single-step maxT，n_boot = {null['n_boot']}）",
@@ -100,7 +123,26 @@ def write_report(run_dir) -> None:
            f"P(signal) 是该候选非零的后验概率（1 - local fdr），post_ic 是按它加权收缩后的 IC，组合因子按 post_ic 加权"
            f"（composite_defined = {run['composite_defined']}）。"), ""]
 
+    L += ["## 通过数量与噪声预期", ""]
+    if len(exceed):
+        allr = exceed[exceed["scope"] == "ALL"]
+        L.append(_md_table(["阈值 |z| >=", "实际通过数 observed", "纯噪声预期 null_mean", "p"],
+                           [[_num(r["threshold"], 2), int(r["observed"]), _num(r["null_mean"], 1), _num(r["p"], 3)]
+                            for _, r in allr.iterrows()]))
+        L += ["", f"各分组在 z_pass = {_num(zp, 2)} 阈值下（按 p 升序）：", ""]
+        gz = exceed[(exceed["scope"] != "ALL") & np.isclose(exceed["threshold"], zp)].sort_values("p", kind="stable")
+        L.append(_md_table(["group", "n_cand", "observed", "null_mean", "p"],
+                           [[r["scope"], int(r["n_cand"]), int(r["observed"]), _num(r["null_mean"], 1),
+                             _num(r["p"], 3)] for _, r in gz.iterrows()]))
+    else:
+        L.append("没有 exceed.csv。")
+    L += ["", "降低门槛不会增加证据。observed 接近 null_mean，说明通过名单大部分来自噪声；observed 明显高于 null_mean 的分组"
+          "才值得优先关注。分组内候选高度相关，observed 不等于独立发现的个数。null_mean 由循环平移零分布算出，"
+          "已自动考虑候选之间的相关性。", ""]
+
     L += ["## Shortlist", ""]
+    if mode == "per_factor":
+        L += ["以下为单因子门槛的筛选结果，未做同批校正；是否成立由 holdout 判定。", ""]
     L += [_cand_table(short) if len(short) else "没有候选进入 shortlist。", ""]
     L += ["## Watchlist（未必通过多重检验，仅供参考）", ""]
     L += [_cand_table(watch) if len(watch) else "watchlist 为空。", ""]
@@ -130,7 +172,12 @@ def append_confirm(run_dir) -> None:
     df = _read_csv(d / "confirm.csv")
     L = ["", "## Holdout 确认", ""]
     L += [f"- holdout 区间：{c['holdout_start']} 至 {c['holdout_end']}，{c['n_holdout_rows']} 行"
-          + ("（强制重跑）" if c.get("forced") else ""), ""]
+          + ("（强制重跑）" if c.get("forced") else "")]
+    if c.get("verdict_mode") == "per_factor":
+        L.append(f"- 判定模式：单因子（未校正单边 p_one：<= 0.05 CONFIRMED，<= 0.10 WEAK）。"
+                 f"共检验 {c['n_tested']} 个，按 5% 显著性纯运气预期确认 {_num(c['expected_by_chance'], 2)} 个，"
+                 f"实际确认 {c['n_confirmed']} 个。")
+    L.append("")
     if len(df):
         L.append(_md_table(["id", "sign_train", "t_hold", "t_signed", "IC", "p_one", "p_holm", "结论",
                             "Sharpe 毛/净"],

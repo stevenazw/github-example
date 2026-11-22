@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tsminer.config import load_config
+from tsminer.config import VerdictConfig, load_config
 from tsminer.confirm import HoldoutLockedError, confirm
 from tsminer.databank import META_COLUMNS, Panel
 from tsminer.pipeline import assign_verdict, backtest, dedupe, mine, prepare
@@ -69,16 +69,40 @@ def make_panel(seed, plant=False, n=N):
                        "sample_end": str(idx[-1].date()), "n_rows": n})
 
 
-@pytest.fixture(scope="module")
-def cfg_path(tmp_path_factory):
-    p = tmp_path_factory.mktemp("cfg") / "test.toml"
-    p.write_text(TOML)
+MODES = ["per_factor", "family"]
+
+
+def _cfg_file(tmp_path_factory, mode):
+    p = tmp_path_factory.mktemp(f"cfg_{mode}") / "test.toml"
+    p.write_text(TOML + f'\n[verdict]\nmode = "{mode}"\n')
     return p
+
+
+@pytest.fixture(scope="module", params=MODES)
+def mode(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def cfg_path(tmp_path_factory, mode):
+    return _cfg_file(tmp_path_factory, mode)
 
 
 @pytest.fixture(scope="module")
 def cfg(cfg_path):
     return load_config(cfg_path)
+
+
+@pytest.fixture(scope="module")
+def cfg_pf(tmp_path_factory):
+    p = _cfg_file(tmp_path_factory, "per_factor")
+    return p, load_config(p)
+
+
+@pytest.fixture(scope="module")
+def cfg_fam(tmp_path_factory):
+    p = _cfg_file(tmp_path_factory, "family")
+    return p, load_config(p)
 
 
 @pytest.fixture(scope="module")
@@ -101,9 +125,19 @@ NOISE_SEED = 11
 
 
 @pytest.fixture(scope="module")
-def noise_run(tmp_path_factory, cfg, cfg_path):
+def noise_run(tmp_path_factory, cfg_fam):
+    """family-mode noise run (no PASS / WEAK_PASS expected for NOISE_SEED)."""
+    path, cfg = cfg_fam
     d = tmp_path_factory.mktemp("noise") / "run"
-    mine(cfg, d, panel=make_panel(NOISE_SEED), config_path=cfg_path)
+    mine(cfg, d, panel=make_panel(NOISE_SEED), config_path=path)
+    return d
+
+
+@pytest.fixture(scope="module")
+def noise_run_pf(tmp_path_factory, cfg_pf):
+    path, cfg = cfg_pf
+    d = tmp_path_factory.mktemp("noise_pf") / "run"
+    mine(cfg, d, panel=make_panel(NOISE_SEED), config_path=path)
     return d
 
 
@@ -119,7 +153,7 @@ def test_holdout_isolation(tmp_path, cfg, cfg_path):
     a, b = tmp_path / "a", tmp_path / "b"
     mine(cfg, a, panel=panel, config_path=cfg_path)
     mine(cfg, b, panel=p2, config_path=cfg_path)
-    for f in ("candidates.csv", "shortlist.csv", "groups.csv"):
+    for f in ("candidates.csv", "shortlist.csv", "groups.csv", "exceed.csv"):
         pd.testing.assert_frame_equal(pd.read_csv(a / f), pd.read_csv(b / f), check_exact=True)
     ra, rb = json.loads((a / "run.json").read_text()), json.loads((b / "run.json").read_text())
     ra.pop("created_at")
@@ -139,8 +173,10 @@ def test_prepare_split(cfg):
     assert prep["split_idx"] == int(np.floor(N * 0.7))
 
 
-def test_planted_signal_confirmed(confirmed_run):
+def test_planted_signal_confirmed(confirmed_run, mode):
     d, res = confirmed_run
+    assert res["verdict_mode"] == mode
+    assert json.loads((d / "run.json").read_text())["verdict_mode"] == mode
     cand = pd.read_csv(d / "candidates.csv").set_index("id")
     assert cand.loc["sig|chg_1", "verdict"] == "PASS"
     short = pd.read_csv(d / "shortlist.csv")
@@ -169,11 +205,62 @@ def test_lock_and_force(confirmed_run):
     assert log[-1]["reason"] == "unit test rerun" and "time" in log[-1]
 
 
-def test_pure_noise_no_pass(noise_run):
+def test_pure_noise_no_pass_family_mode(noise_run):
     cand = pd.read_csv(noise_run / "candidates.csv")
     assert (cand["verdict"] == "PASS").sum() == 0
     assert (cand["verdict"] == "WEAK_PASS").sum() == 0
     assert "没有候选通过多重检验" in (noise_run / "report.md").read_text(encoding="utf-8")
+
+
+def test_per_factor_noise_exceed(noise_run_pf):
+    d = noise_run_pf
+    ex = pd.read_csv(d / "exceed.csv")
+    assert list(ex.columns) == ["scope", "threshold", "n_cand", "observed", "null_mean", "p"]
+    run = json.loads((d / "run.json").read_text())
+    assert run["verdict_mode"] == "per_factor"
+    assert sorted(ex["threshold"].unique()) == [2.0, 2.5, 3.0]
+    allr = ex[ex["scope"] == "ALL"].set_index("threshold")
+    assert len(allr) == 3 and set(allr["n_cand"]) == {run["family_size"]}
+    assert allr.loc[2.0, "observed"] <= 3 * allr.loc[2.0, "null_mean"] + 5
+    assert {r["threshold"] for r in run["exceed"]} == {2.0, 2.5, 3.0}
+    assert all(0 < p <= 1 for p in ex["p"])
+    # observed counts are consistent with candidates.csv and verdicts
+    cand = pd.read_csv(d / "candidates.csv")
+    assert allr.loc[2.5, "observed"] == (cand["z"].abs() >= 2.5).sum() == (cand["verdict"] == "PASS").sum()
+    assert allr.loc[2.0, "observed"] == (cand["verdict"] != "REJECT").sum()
+    # group rows add up to the family
+    g = ex[(ex["scope"] != "ALL") & (ex["threshold"] == 2.0)]
+    assert g["observed"].sum() == allr.loc[2.0, "observed"] and g["n_cand"].sum() == run["family_size"]
+    rep = (d / "report.md").read_text(encoding="utf-8")
+    assert "通过数量与噪声预期" in rep and "判定门槛与多重检验参考" in rep
+    assert "纯噪声下预期有" in rep and "未做同批校正" in rep
+
+
+def test_per_factor_confirm_uses_p_one(tmp_path, noise_run_pf):
+    d = tmp_path / "run"
+    shutil.copytree(noise_run_pf, d)
+    res = confirm(d)
+    assert res["status"] == "DONE" and res["verdict_mode"] == "per_factor"
+    df = pd.read_csv(d / "confirm.csv")
+    assert len(df) > 0 and "p_holm" in df.columns
+    assert res["n_tested"] == int(np.isfinite(df["t_signed"]).sum())
+    assert res["expected_by_chance"] == 0.05 * res["n_tested"]
+    for _, r in df.iterrows():
+        want = "CONFIRMED" if r["p_one"] <= 0.05 else "WEAK" if r["p_one"] <= 0.10 else "NOT_CONFIRMED"
+        assert r["verdict"] == want
+    assert res["n_confirmed"] == int((df["verdict"] == "CONFIRMED").sum())
+    assert "按 5% 显著性纯运气预期确认" in (d / "report.md").read_text(encoding="utf-8")
+
+
+def test_confirm_verdict_basis(confirmed_run, mode):
+    d, res = confirmed_run
+    df = pd.read_csv(d / "confirm.csv")
+    col = "p_one" if mode == "per_factor" else "p_holm"
+    assert len(df) > 0 and res["n_tested"] == int(np.isfinite(df["t_signed"]).sum())
+    assert res["expected_by_chance"] == 0.05 * res["n_tested"]
+    for _, r in df.iterrows():
+        want = "CONFIRMED" if r[col] <= 0.05 else "WEAK" if r[col] <= 0.10 else "NOT_CONFIRMED"
+        assert r["verdict"] == want
 
 
 def test_nothing_to_confirm(tmp_path, noise_run):
@@ -189,11 +276,25 @@ def test_nothing_to_confirm(tmp_path, noise_run):
     assert not (d / "confirm.json").exists()
 
 
-def test_assign_verdict_boundaries():
-    assert assign_verdict(0.05, 0.5, 0.05, 0.10) == "PASS"
-    assert assign_verdict(0.0501, 0.10, 0.05, 0.10) == "WEAK_PASS"
-    assert assign_verdict(0.0501, 0.1001, 0.05, 0.10) == "REJECT"
-    assert assign_verdict(float("nan"), float("nan"), 0.05, 0.10) == "REJECT"
+def test_assign_verdict_family_boundaries():
+    vd = VerdictConfig(mode="family")
+    nan = float("nan")
+    assert assign_verdict(9.0, 0.05, 0.5, vd) == "PASS"
+    assert assign_verdict(9.0, 0.0501, 0.10, vd) == "WEAK_PASS"
+    assert assign_verdict(9.0, 0.0501, 0.1001, vd) == "REJECT"
+    assert assign_verdict(9.0, nan, nan, vd) == "REJECT"
+    assert assign_verdict(0.0, 0.01, 0.01, vd) == "PASS"        # z is ignored in family mode
+
+
+def test_assign_verdict_per_factor_boundaries():
+    vd = VerdictConfig(mode="per_factor")
+    nan = float("nan")
+    for z, want in [(2.5, "PASS"), (2.49, "WEAK_PASS"), (2.0, "WEAK_PASS"), (1.99, "REJECT"),
+                    (-2.5, "PASS"), (-2.49, "WEAK_PASS"), (-2.0, "WEAK_PASS"), (-1.99, "REJECT"),
+                    (nan, "REJECT"), (float("inf"), "REJECT")]:
+        assert assign_verdict(z, 1.0, 1.0, vd) == want, z
+    assert assign_verdict(3.0, 1.0, 1.0, vd) == "PASS"           # p_fwer / q_bh are ignored in per_factor mode
+    assert assign_verdict(0.0, 0.0, 0.0, vd) == "REJECT"
 
 
 def test_dedupe():

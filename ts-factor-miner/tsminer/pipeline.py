@@ -42,10 +42,16 @@ def prepare(panel: Panel, cfg) -> dict:
 
 
 # ------------------------------------------------------------ pure helpers
-def assign_verdict(p_fwer, q_bh, fwer_alpha, fdr_q) -> str:
-    if np.isfinite(p_fwer) and p_fwer <= fwer_alpha:
+def assign_verdict(z, p_fwer, q_bh, vd) -> str:
+    """per_factor: single-factor |z| thresholds; family: FWER / BH thresholds."""
+    if vd.mode == "per_factor":
+        if not np.isfinite(z):
+            return "REJECT"
+        a = abs(float(z))
+        return "PASS" if a >= vd.z_pass else "WEAK_PASS" if a >= vd.z_weak else "REJECT"
+    if np.isfinite(p_fwer) and p_fwer <= vd.fwer_alpha:
         return "PASS"
-    if np.isfinite(q_bh) and q_bh <= fdr_q:
+    if np.isfinite(q_bh) and q_bh <= vd.fdr_q:
         return "WEAK_PASS"
     return "REJECT"
 
@@ -155,8 +161,9 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     if len(fam0) == 0:
         raise ValueError("no candidate has a finite t on the train segment")
     gcodes0, guniq0 = pd.factorize(cm.loc[np.array(S.columns)[fam0], "group"].to_numpy(), sort=True)
+    thresholds = sorted({float(vd.z_weak), float(vd.z_pass), 3.0})
     null = shift_null(S_tr[:, fam0], y_tr, st.hac_lags, st.min_obs, st.n_boot, st.min_shift, st.seed,
-                      groups=gcodes0)
+                      groups=gcodes0, count_thresholds=thresholds)
     # studentization needs a valid null sd; candidates without one leave the family
     keep = np.isfinite(null["t_sd"]) & (null["t_sd"] > 0)
     fam = fam0[keep]
@@ -186,7 +193,25 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     g_holm = holm(g_p)
     v0 = float(np.nanmean(null["mean_z2"]))
     eb = eb_two_group(z, ic, v0)
-    verdict = np.array([assign_verdict(a, b, vd.fwer_alpha, vd.fdr_q) for a, b in zip(p_fwer, q_bh)])
+    verdict = np.array([assign_verdict(a, b, c, vd) for a, b, c in zip(z, p_fwer, q_bh)])
+
+    # exceedance counts: observed vs circular-shift null, whole family and per group
+    # (columns dropped for lack of a valid null sd have NaN z*, so they never count in the null either)
+    az = np.abs(z)
+    exceed_rows = []
+
+    def _exc(scope, nulls, observed_mask_fn, n_cand):
+        for i, thr in enumerate(thresholds):
+            o = int(np.sum(observed_mask_fn(az >= thr)))
+            nc = nulls[:, i]
+            exceed_rows.append({"scope": scope, "threshold": thr, "n_cand": int(n_cand), "observed": o,
+                                "null_mean": float(np.mean(nc)), "p": float((1 + np.sum(nc >= o)) / (B + 1))})
+
+    _exc("ALL", null["exceed_counts"], lambda hit: hit, m)
+    for k in present:
+        _exc(str(guniq[k]), null["group_exceed_counts"][:, k, :], lambda hit, k=k: hit & (gcodes == k),
+             int(np.sum(gcodes == k)))
+    exceed_df = pd.DataFrame(exceed_rows, columns=["scope", "threshold", "n_cand", "observed", "null_mean", "p"])
 
     # flags (informational only)
     h = len(tr) // 2
@@ -242,6 +267,8 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
                   "mean_z2": g_obs, "null_mean_z2": np.nanmean(null["group_mean_z2"], axis=0)[present], "p": g_p,
                   "p_holm": g_holm}).to_csv(run_dir / "groups.csv", index=False)
 
+    exceed_df.to_csv(run_dir / "exceed.csv", index=False)
+
     cal = panel.target.index
     tau2 = eb["tau2"]
     run = {
@@ -264,6 +291,8 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         "composite_defined": bool(tau2 > 0 and eb["pi0"] < 1),
         "verdict_counts": {v: int((verdict == v).sum()) for v in ("PASS", "WEAK_PASS", "REJECT")},
         "shortlist": short_ids,
+        "verdict_mode": vd.mode,
+        "exceed": exceed_df[exceed_df["scope"] == "ALL"].to_dict(orient="records"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     run = _jsonable(run)

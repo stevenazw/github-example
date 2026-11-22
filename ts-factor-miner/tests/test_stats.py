@@ -141,6 +141,55 @@ def test_shift_null_group_mean_consistent():
     assert shift_null(S, y, 3, min_obs=100, n_boot=5, min_shift=20)["group_mean_z2"] is None
 
 
+def test_shift_null_count_thresholds_shapes_and_consistency():
+    rng = np.random.default_rng(21)
+    T, N, B = 400, 9, 25
+    S = rng.standard_normal((T, N))
+    S[:100, 2] = np.nan
+    S[:, 4] = np.nan                      # unusable column: never counted
+    y = rng.standard_normal(T)
+    groups = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    thr = [0.0, 1.0, 2.0, 3.0]
+    res = shift_null(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7, groups=groups, count_thresholds=thr)
+    ec, gc = res["exceed_counts"], res["group_exceed_counts"]
+    assert ec.shape == (B, 4) and gc.shape == (B, 3, 4)
+    assert (np.diff(ec, axis=1) <= 0).all()                      # non-increasing in the threshold
+    assert (ec[:, 0] == N - 1).all()                              # threshold 0: all usable columns
+    np.testing.assert_array_equal(gc.sum(axis=1), ec)
+    # hand check against the documented rng contract
+    ks = np.random.default_rng(7).integers(20, T - 20 + 1, size=B)
+    tt = np.array([naive_hac_t(S, np.roll(y, k), 3, 100)[0] for k in ks])
+    fin = np.isfinite(tt)
+    sd = np.array([np.std(tt[fin[:, j], j]) if fin[:, j].any() else np.nan for j in range(N)])
+    with np.errstate(invalid="ignore"):
+        az = np.abs(tt / sd)
+    for i, c in enumerate(thr):
+        np.testing.assert_array_equal(ec[:, i], np.sum(np.isfinite(az) & (az >= c), axis=1))
+    # without groups: group counts are None
+    r2 = shift_null(S, y, 3, min_obs=100, n_boot=B, min_shift=20, seed=7, count_thresholds=thr)
+    assert r2["group_exceed_counts"] is None
+    np.testing.assert_array_equal(r2["exceed_counts"], ec)
+
+
+def test_shift_null_count_thresholds_default_none():
+    rng = np.random.default_rng(22)
+    S, y = rng.standard_normal((300, 4)), rng.standard_normal(300)
+    res = shift_null(S, y, 3, min_obs=100, n_boot=5, min_shift=20, groups=np.zeros(4, dtype=int))
+    assert res["exceed_counts"] is None and res["group_exceed_counts"] is None
+
+
+def test_shift_null_exceed_rate_pure_noise():
+    rng = np.random.default_rng(23)
+    T, N, B = 1500, 100, 300
+    S = rng.standard_normal((T, N))
+    y = rng.standard_normal(T)
+    res = shift_null(S, y, 5, min_obs=100, n_boot=B, min_shift=60, seed=3, count_thresholds=[2.0])
+    mean = res["exceed_counts"][:, 0].mean()
+    expect = N * 0.0455
+    print("mean exceed at 2.0:", mean, "expected", expect)
+    assert 0.7 * expect <= mean <= 1.3 * expect
+
+
 def test_studentized_max_is_balanced_across_heavy_tails():
     rng = np.random.default_rng(8)
     T, half, B = 1500, 20, 400

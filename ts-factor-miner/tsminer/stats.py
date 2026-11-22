@@ -78,13 +78,18 @@ def hac_t(S, y, lags, min_obs=250):
     return t, ic, pre.n_all.copy()
 
 
-def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, groups=None):
+def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, groups=None,
+               count_thresholds=None):
     """Circular-shift null: y is rolled by k ~ U{min_shift..T-min_shift}, t* recomputed.
 
     Each candidate's t* is studentized by its own null sd (sd_j = std of t*[:, j] over the same
     B replicates, ddof=0): z* = t* / sd_j, so heavy-tailed candidates get no extra chance at the
     max. Summaries (max_abs_z, mean_z2, group_mean_z2) are on z*; t_sd (length N, NaN for unusable
     columns) is returned so observed z = t / t_sd; t_var is the pooled variance of raw t* (diagnostic).
+
+    count_thresholds (optional float sequence): also return exceed_counts (B, n_thr), the number of columns
+    with |z*| >= each threshold in every replicate (NaN not counted), and, when groups is given,
+    group_exceed_counts (B, K, n_thr); both are None otherwise.
 
     The shifts are rng = default_rng(seed); ks = rng.integers(min_shift, T-min_shift+1, n_boot).
     """
@@ -105,6 +110,9 @@ def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, group
     gm = None if groups is None else np.full((n_boot, K), np.nan)
     t_var = float("nan")
     t_sd = np.full(S.shape[1], np.nan)
+    thr = None if count_thresholds is None else np.asarray(count_thresholds, dtype=float).ravel()
+    exc = None if thr is None else np.zeros((n_boot, len(thr)))
+    gexc = None if thr is None or groups is None else np.zeros((n_boot, K, len(thr)))
     if len(pre.cols):
         sxy, V, _ = _core(pre, Y, lags)
         ok = V > 0
@@ -134,7 +142,16 @@ def shift_null(S, y, lags, min_obs=250, n_boot=1000, min_shift=60, seed=0, group
             gc = fin.astype(float) @ G
             with np.errstate(divide="ignore", invalid="ignore"):
                 gm = np.where(gc > 0, (z2 @ G) / gc, np.nan)
-    return {"max_abs_z": max_abs, "mean_z2": mean_z2, "group_mean_z2": gm, "t_sd": t_sd, "t_var": t_var}
+        if thr is not None:
+            with np.errstate(invalid="ignore"):
+                az = np.abs(z)
+            for i, c_ in enumerate(thr):
+                hit = fin & (az >= c_)
+                exc[:, i] = hit.sum(axis=1)
+                if gexc is not None:
+                    gexc[:, :, i] = hit.astype(float) @ G
+    return {"max_abs_z": max_abs, "mean_z2": mean_z2, "group_mean_z2": gm, "t_sd": t_sd, "t_var": t_var,
+            "exceed_counts": exc, "group_exceed_counts": gexc}
 
 
 def fwer_p(t_obs, max_abs_t_null):

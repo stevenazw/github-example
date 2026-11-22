@@ -168,6 +168,23 @@ def test_minimal_config_defaults(tmp_path):
     assert cfg.stats.seed == 20261122 and cfg.lags.W == 6 and cfg.verdict.fdr_q == 0.10
 
 
+def test_verdict_new_fields(tmp_path):
+    v = load_config(_write(tmp_path, MINIMAL)).verdict
+    assert (v.mode, v.z_pass, v.z_weak) == ("per_factor", 2.5, 2.0)
+    v = load_config(_write(tmp_path, MINIMAL + '\n[verdict]\nmode = "family"\nz_pass = 3\nz_weak = 1.5\n')).verdict
+    assert (v.mode, v.z_pass, v.z_weak) == ("family", 3, 1.5)
+    for bad in ('mode = "bogus"', 'mode = 1', 'z_pass = 2.0\nz_weak = 2.0', 'z_pass = 1.5\nz_weak = 2.0',
+                'z_weak = 0', 'z_weak = -1', 'z_pass = 2.0'):
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, MINIMAL + f"\n[verdict]\n{bad}\n"))
+
+
+@pytest.mark.parametrize("name", ["ty", "eurusd"])
+def test_shipped_configs_verdict_fields(name):
+    v = load_config(CONFIGS / f"{name}.toml").verdict
+    assert (v.mode, v.z_pass, v.z_weak) == ("per_factor", 2.5, 2.0)
+
+
 def test_missing_required(tmp_path):
     with pytest.raises(ValueError):
         load_config(_write(tmp_path, '[sample]\nholdout_frac = 0.2\n'))            # no [target]
