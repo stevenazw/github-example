@@ -6,6 +6,7 @@ and returns a nested dataclass tree that can be dumped with ``Config.to_dict``.
 """
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import asdict, dataclass, field
@@ -89,6 +90,7 @@ class VerdictConfig:
     extra_lag_t_min: float = 2.0
     obs_min_retention: float = 0.5
     year_hit_min: float = 0.6
+    min_net_sharpe: float = 0.3   # DEV (IS+OBS) annualised net Sharpe floor, applied before de-duplication
 
 
 @dataclass
@@ -291,10 +293,12 @@ def load_config(path: str | os.PathLike) -> Config:
     sec = _section(raw, "stats", {"hac_lags", "min_obs", "n_boot", "min_shift", "seed"})
     stats = _fill(StatsConfig, sec, "stats", {k: (int,) for k in sec})
     sec = _section(raw, "verdict", {"z_pass", "z_weak", "dedupe_corr", "extra_lag_t_min", "obs_min_retention",
-                                    "year_hit_min"})
+                                    "year_hit_min", "min_net_sharpe"})
     verdict = _fill(VerdictConfig, sec, "verdict", {k: (int, float) for k in sec})
     if not verdict.z_pass > verdict.z_weak > 0:
         raise ValueError("verdict requires z_pass > z_weak > 0")
+    if not math.isfinite(verdict.min_net_sharpe):
+        raise ValueError("verdict.min_net_sharpe must be a finite number")
 
     return Config(target=target, databank=databank, sample=sample, universe=universe,
                   lags=lags, position=position, signals=signals, stats=stats, verdict=verdict)

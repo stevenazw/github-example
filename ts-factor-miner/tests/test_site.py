@@ -278,6 +278,41 @@ def test_site_files(site_dir):
     assert "fetch('data/'" in art
 
 
+# ------------------------------------------------------------------ 5b. criteria and the tradability step
+def test_new_run_has_criteria_and_trade_keep(site_dir, run_dir, locked_data):
+    vd = load_config(run_dir / "config.toml").verdict
+    want = {"z_weak": vd.z_weak, "obs_min_retention": vd.obs_min_retention, "min_net_sharpe": vd.min_net_sharpe}
+    assert want["min_net_sharpe"] == 0.3
+    assert locked_data["criteria"] == want
+    run = json.loads((run_dir / "run.json").read_text())
+    assert locked_data["funnel"]["trade_keep"] == run["funnel"]["trade_keep"]
+    for slug in ("test", "other-1"):
+        d = json.loads((site_dir / "data" / f"{slug}.json").read_text(encoding="utf-8"))
+        assert d["criteria"] == want and d["funnel"]["trade_keep"] == run["funnel"]["trade_keep"]
+    art = (site_dir / "artifact.html").read_text(encoding="utf-8")
+    assert "入选条件" in art and "criteria" in art
+    assert "cost" + "_negative" not in art and "扣成本后收益为负" not in art
+    assert "min_net_sharpe" in art and "扣成本后净 Sharpe ≥ " in art
+
+
+def test_old_style_run_without_trade_keys(tmp_path, run_dir):
+    old = tmp_path / "old"
+    shutil.copytree(run_dir, old)
+    rj = json.loads((old / "run.json").read_text())
+    del rj["funnel"]["trade_keep"], rj["funnel"]["trade_drop"], rj["config"]["verdict"]["min_net_sharpe"]
+    (old / "run.json").write_text(json.dumps(rj))
+    out = tmp_path / "site"
+    build_site([old], out)                                           # must not raise
+    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
+    assert "trade_keep" not in d["funnel"] and "min_net_sharpe" not in d["criteria"]
+    assert d["criteria"]["z_weak"] == rj["config"]["verdict"]["z_weak"]
+    assert d["factors"]
+
+
+def test_flag_text_has_no_cost_flag():
+    assert flag_texts("unstable") == ["逐年方向不稳定"]
+
+
 # ------------------------------------------------------------------ 6. publishing constraints
 def test_publish_constraints(site_dir):
     art = (site_dir / "artifact.html").read_text(encoding="utf-8")

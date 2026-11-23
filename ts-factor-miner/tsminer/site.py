@@ -26,7 +26,6 @@ FLAG_TEXT = {
     "xlag_weak": "对数据可得时点敏感",
     "half_flip": "样本内前后两半方向相反",
     "unstable": "逐年方向不稳定",
-    "cost_negative": "扣成本后收益为负",
     "obs_short": "观察期样本不足",
 }
 RESERVED_PREFIXES = ("settings", "sidebar", "customize", "upgrade", "downloads", "comment-")
@@ -237,12 +236,16 @@ def build_asset_data(run_dir) -> dict:
 
     vc = pd.Series([f["oos_verdict"] for f in factors if f["oos_verdict"]], dtype=object).value_counts()
     cfg_d = run["config"]
+    vd = cfg_d["verdict"]
+    criteria = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
+    if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
+        criteria["min_net_sharpe"] = vd["min_net_sharpe"]
     return {
         "target": target, "slug": slug,
         "db_published_at": run["panel_info"].get("published_at"),
         "sample_start": run["dates"]["sample_start"], "sample_end": run["dates"]["sample_end"],
         "is_frac": cfg_d["sample"]["is_frac"], "obs_frac": cfg_d["sample"]["obs_frac"],
-        "oos_opened": bool(opened), "funnel": run["funnel"],
+        "oos_opened": bool(opened), "funnel": run["funnel"], "criteria": criteria,
         "oos_counts": ({"confirmed": int(vc.get("CONFIRMED", 0)), "consistent": int(vc.get("CONSISTENT", 0)),
                         "failed": int(vc.get("FAILED", 0)), "insufficient": int(vc.get("INSUFFICIENT", 0))}
                        if opened else None),
@@ -496,7 +499,9 @@ function renderOverview() {
   root.appendChild(h('h1', {text: '因子跟踪看板'}));
   root.appendChild(h('p', {class: 'sub', text: '每个标的资产一个页面：展示通过检测的因子（shortlist）的净值走势、公式与交易方向。点击一行进入。'}));
   if (!MANIFEST.assets.length) { root.appendChild(h('div', {class: 'empty', text: '没有资产。'})); return root; }
-  var head = ['标的', '数据截止日', '检验', '样本内通过', '观察期保留', '去重后留下', '样本外'];
+  var hasTrade = MANIFEST.assets.some(function (a) { return a.funnel.trade_keep != null; });
+  var head = ['标的', '数据截止日', '检验', '样本内通过', '观察期保留'].concat(hasTrade ? ['可交易'] : [], ['去重后留下', '样本外']);
+  var numCols = hasTrade ? 6 : 5;
   var tb = h('tbody');
   MANIFEST.assets.forEach(function (a) {
     var f = a.funnel;
@@ -506,19 +511,22 @@ function renderOverview() {
       h('td', {class: 'n', text: fint(f.tested)}),
       h('td', {class: 'n', text: fint(f.is_pass + f.is_weak)}),
       h('td', {class: 'n', text: fint(f.obs_keep + f.obs_insufficient)}),
+      hasTrade ? h('td', {class: 'n', text: fint(f.trade_keep)}) : null,
       h('td', {class: 'n', text: fint(f.shortlist)}),
       h('td', {text: oosText(a)})
     ]);
     tb.appendChild(tr);
   });
-  var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 2 && i <= 5) ? 'n' : null, text: t}); }))]), tb]);
+  var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 2 && i <= numCols) ? 'n' : null, text: t}); }))]), tb]);
   root.appendChild(h('div', {class: 'scroll'}, [tbl]));
-  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：检验 → 样本内通过（PASS + WEAK_PASS）→ 观察期保留 → 去重后留下 → 样本外确认 / 一致 / 失败。样本外只在运行 confirm 之后才显示。'}));
+  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：检验 → 样本内通过（PASS + WEAK_PASS）→ 观察期保留 → ' + (hasTrade ? '可交易（扣成本净 Sharpe 达标）→ ' : '') + '去重后留下 → 样本外确认 / 一致 / 失败。样本外只在运行 confirm 之后才显示。'}));
   return root;
 }
 
 function funnelEl(a) {
-  var f = a.funnel, parts = [['检验', f.tested], ['样本内通过', f.is_pass + f.is_weak], ['观察期保留', f.obs_keep + f.obs_insufficient], ['去重后留下', f.shortlist]];
+  var f = a.funnel, parts = [['检验', f.tested], ['样本内通过', f.is_pass + f.is_weak], ['观察期保留', f.obs_keep + f.obs_insufficient]];
+  if (f.trade_keep != null) parts.push(['可交易', f.trade_keep]);
+  parts.push(['去重后留下', f.shortlist]);
   var el = h('div', {class: 'funnel'});
   parts.forEach(function (p, i) {
     if (i) el.appendChild(h('span', {class: 'arr', text: '→'}));
@@ -530,6 +538,14 @@ function funnelEl(a) {
     el.appendChild(h('span', null, ['确认 ', h('b', {text: String(c.confirmed)}), ' · 一致 ', h('b', {text: String(c.consistent)}), ' · 失败 ', h('b', {text: String(c.failed)}), (c.insufficient ? ' · 样本不足 ' : ''), (c.insufficient ? h('b', {text: String(c.insufficient)}) : null)]));
   } else el.appendChild(h('span', {class: 'muted', text: '样本外未打开'}));
   return el;
+}
+
+function criteriaEl(a) {
+  var c = a.criteria;
+  if (!c || c.z_weak == null || c.obs_min_retention == null) return null;
+  var txt = '样本内 |z| ≥ ' + c.z_weak + '；观察期方向一致且 IC 不低于样本内的 ' + (Math.round(c.obs_min_retention * 1000) / 10) + '%';
+  if (c.min_net_sharpe != null) txt += '；扣成本后净 Sharpe ≥ ' + c.min_net_sharpe + '（样本内+观察期）';
+  return dl('入选条件', [txt], 'wide');
 }
 
 function legendEl(opened) {
@@ -553,7 +569,8 @@ function renderAsset(a) {
     dl('切分规则', ['每个因子在自身有效数据内按 ' + Math.round(a.is_frac * 100) + '/' + Math.round(a.obs_frac * 100) + '/' + Math.round((1 - a.is_frac - a.obs_frac) * 100) + ' 切成样本内 / 观察期 / 样本外']),
     dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%']),
     dl('三段图例', [legendEl(a.oos_opened)]),
-    dl('筛选漏斗', [funnelEl(a)], 'wide')
+    dl('筛选漏斗', [funnelEl(a)], 'wide'),
+    criteriaEl(a)
   ]);
   root.appendChild(sum);
   var bar = h('div', {class: 'filters', role: 'group', 'aria-label': '按样本外结论筛选'});

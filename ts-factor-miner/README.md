@@ -11,8 +11,9 @@
 3. 每个候选在自己的有效数据内切成三段：样本内 IS 70%、观察期 OBS 15%、样本外 OOS 15%。
 4. 第 1 步：在 IS 上做单因子检验，过门槛（PASS / WEAK_PASS）的候选留下。
 5. 第 2 步：在观察期上筛选，方向或强度没有保持的候选被淘汰。
-6. 第 3 步：对未被淘汰的候选按相关性去重，代表组成 shortlist，并给出 IC 衰减、信号自相关、逐年稳定性与连续仓位的回测读数。
-7. OOS 只在 `confirm` 里打开一次。
+6. 第 3 步：可交易性筛选。对未被淘汰的候选在开发样本（IS + OBS）上做扣成本回测，年化净 Sharpe 低于 `min_net_sharpe`（默认 0.3）的被淘汰。
+7. 第 4 步：对通过可交易性筛选的候选按相关性去重，代表组成 shortlist，并给出 IC 衰减、信号自相关、逐年稳定性与连续仓位的回测读数。
+8. OOS 只在 `confirm` 里打开一次。
 
 ## 2. 设计原则
 
@@ -30,7 +31,7 @@
 
 ```
 databank.py        transforms.py      stats.py            pipeline.py                         confirm.py
-数据库 --> Panel --> 候选信号 S --> HAC t / 零分布 sd --> IS 检验 -> OBS 筛选 -> 去重 runs/ --> OOS 确认
+数据库 --> Panel --> 候选信号 S --> HAC t / 零分布 sd --> IS 检验 -> OBS 筛选 -> 可交易 -> 去重 runs/ --> OOS 确认
  (as-of 对齐+可得性)  (日频6/周频4)    (按各自的行集合)       (shortlist 等)                       (一次, lock)
 ```
 
@@ -99,23 +100,33 @@ IS 上的 flags（不改变判决）：`half_flip`（IS 有效行按个数对半
 
 未被 DROP 的候选再算开发样本（DEV = IS ∪ OBS）上的带符号 `t_dev`，用于排序。
 
-### 3.7 第 3 步：去重与 shortlist 读数
+### 3.7 第 3 步：可交易性筛选（`pipeline.mine`）
 
-- **去重**：对未被 DROP 的候选按 `t_dev` 降序（NaN 排最后）贪心聚类。两两相关系数只用双方 DEV 行的交集，共同行少于 100 视为不相关；相关系数绝对值 ≥ `dedupe_corr` 的归入同一代表。各簇代表组成 shortlist，每个代表附 `cluster_size`。
+对象是第 2 步未被 DROP 的候选（`obs_status` 为 KEEP 或 INSUFFICIENT）。每个候选在自己的 DEV 行（IS ∪ OBS）上用 3.9 的回测算 `sharpe_gross`、`sharpe_net`、`turnover`，缓冲带与单边成本取自配置：
+
+- `trade_status`：`sharpe_net` 有限且 ≥ `min_net_sharpe`（默认 0.3）→ `KEEP`；否则（包括净 Sharpe 非有限）→ `DROP`。`min_net_sharpe` 可取任意有限实数，设成很小的负数（如 -1e9）等于关闭这道门槛。
+- 读数写入 `candidates.csv` 的 `sharpe_gross_dev`、`sharpe_net_dev`、`trade_status`；shortlist 的 `sharpe_gross / sharpe_net / turnover` 直接复用这里的结果，不重算。
+- **为什么放在去重之前**：去重按 `t_dev` 选代表，t 最高的往往是换手最高的快信号。如果先去重再筛，这个代表一旦被成本吃掉，整簇就一起消失；先筛后去，同簇里能交易的成员会顶上来当代表，而不是整簇丢掉。
+- 成本不再只是 shortlist 上的提示：净 Sharpe 不达标的候选直接淘汰。
+- 隔离原则不变：只用 DEV 行（行号 < `e2`）。
+
+### 3.8 第 4 步：去重与 shortlist 读数
+
+- **去重**：只在 `trade_status = KEEP` 的候选里，按 `t_dev` 降序（NaN 排最后）贪心聚类。两两相关系数只用双方 DEV 行的交集，共同行少于 100 视为不相关；相关系数绝对值 ≥ `dedupe_corr` 的归入同一代表。各簇代表组成 shortlist，每个代表附 `cluster_size`（只统计通过可交易性筛选的成员）。
 - **IC 衰减**：h ∈ (1, 2, 5, 10, 20, 60)，`ic_h = sign × corr(s_t, y[t+h−1])`，只用 s_t 有限且 t 与 t+h−1 都在 DEV 内的行对。h=1 就是 DEV 上的带符号 IC。
 - **信号自相关**：`ac_h = corr(s_t, s_{t−h})`（DEV 行），`signal_half_life = ln(0.5)/ln(ac_1)`（0 < ac_1 < 1；ac_1 ≤ 0 记 0；ac_1 ≥ 1 或非有限记 NaN）。
 - **逐年 IC**：DEV 行按自然年分组，某年有效行 ≥ 60 才计入；`year_hit` 是带符号 IC > 0 的年份占比，`n_years` 是计入的年数。`n_years ≥ 3` 且 `year_hit < year_hit_min`（默认 0.6）加 flag `unstable`。
-- **回测**：见 3.8。净 Sharpe ≤ 0 加 flag `cost_negative`。
+- **回测**：见 3.9，读数来自第 3 步。
 
-### 3.8 仓位与回测
+### 3.9 仓位与回测
 
-仓位是连续比例：`target_t = sign × s_t`（NaN 记 0）。缓冲带 `buffer`（`[position]`，默认 0.5）：`pos_0 = target_0`；若 `|target_t − pos_{t−1}| > buffer` 则 `pos_t = target_t`，否则 `pos_t = pos_{t−1}`。`buffer = 0` 时 pos 等于 target。回测评估区间从信号第一个有限值起：`gross = pos × y_fwd`；名义仓位 `pos / σ`，成本 `cost_per_side × |Δ名义仓位|`（首行用 |名义仓位₀|）；`net = gross − cost`。输出毛/净 Sharpe（均值÷标准差×√252）与 `turnover`（mean |Δpos|）。`mine` 在各自 DEV 行上算，`confirm` 在各自 OOS 行上算（从 OOS 首行重新起仓）。
+仓位是连续比例：`target_t = sign × s_t`（NaN 记 0）。缓冲带 `buffer`（`[position]`，默认 0.5）：`pos_0 = target_0`；若 `|target_t − pos_{t−1}| > buffer` 则 `pos_t = target_t`，否则 `pos_t = pos_{t−1}`。`buffer = 0` 时 pos 等于 target。回测评估区间从信号第一个有限值起：`gross = pos × y_fwd`；名义仓位 `pos / σ`，成本 `cost_per_side × |Δ名义仓位|`（首行用 |名义仓位₀|）；`net = gross − cost`。输出毛/净 Sharpe（均值÷标准差×√252）与 `turnover`（mean |Δpos|）。`mine` 在各自 DEV 行上算（第 3 步，对所有第 2 步存活的候选），`confirm` 在各自 OOS 行上算（从 OOS 首行重新起仓）。
 
-### 3.9 读 IC 衰减与信号自相关
+### 3.10 读 IC 衰减与信号自相关
 
 `ic_h1 … ic_h60` 看信息能持续多久：次日有效、之后迅速衰减到 0 的信号，应该快速调仓；长 h 上 IC 仍不低的，要同时看 `ac_h`。慢信号（如 `z_252`，`ac_1` 接近 1、`signal_half_life` 很长）的 IC 在长 h 上不低，部分只是因为信号本身变化慢，今天的信号与 h 天前几乎是同一个数，不等于信息持续。慢信号适合大的缓冲带、低换手；快信号换手高，要看净 Sharpe 与成本。
 
-### 3.10 样本外确认（`confirm.py`）
+### 3.11 样本外确认（`confirm.py`）
 
 shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对每个 shortlist 候选取它自己的 OOS 行（至少 60 个观测）：`t_signed = sign × t_oos`，`ic_oos_signed = sign × ic_oos`，`retention_oos = ic_oos_signed / |IS 的 IC|`，`p_one = norm_sf(t_signed)`。三档结论：
 
@@ -161,9 +172,9 @@ python -m pytest -q
 | 文件 | 内容 |
 |---|---|
 | `report.md` | 人类可读报告：结论、数据与样本、可得性输入、判定标准、shortlist、IC 衰减与信号自相关、提示与局限、下一步；confirm 之后追加样本外确认 |
-| `run.json` | 机器可读摘要：配置快照、`dates`、`n_rows`、`n_series`、`n_candidates`、`n_tested`、`n_skipped`、`n_is_summary`、`funnel`（tested / is_pass / is_weak / obs_keep / obs_insufficient / obs_drop / shortlist）、shortlist；不含任何 OOS 取值 |
+| `run.json` | 机器可读摘要：配置快照、`dates`、`n_rows`、`n_series`、`n_candidates`、`n_tested`、`n_skipped`、`n_is_summary`、`funnel`（tested / is_pass / is_weak / obs_keep / obs_insufficient / obs_drop / trade_keep / trade_drop / shortlist）、shortlist；不含任何 OOS 取值 |
 | `candidates.csv` | 第 1 步所有 t、null_sd 有效的候选，按 \|z\| 降序 |
-| `shortlist.csv` | 去重后的代表候选，另含 `cluster_size`、回测、IC 衰减、信号自相关、逐年稳定性与描述列；可为空表 |
+| `shortlist.csv` | 通过可交易性筛选并去重后的代表候选，另含 `cluster_size`、回测、IC 衰减、信号自相关、逐年稳定性与描述列；可为空表 |
 | `config.toml` | 本次运行所用配置的副本（`confirm` 从这里重建配置） |
 | `panel/` | 保存的 Panel：`panel.pkl`（主数据，pickle）、`meta.csv`（含 `lag_rule`）、`excluded.csv`、`info.json` |
 | `confirm.csv` / `confirm.json` | 样本外确认结果（`confirm` 之后才出现） |
@@ -187,9 +198,10 @@ python -m pytest -q
 | `verdict` | PASS / WEAK_PASS / REJECT |
 | `ic_obs_signed`, `retention`, `obs_status` | 观察期带符号 IC、retention、KEEP / DROP / INSUFFICIENT；第 1 步 REJECT 的候选留空 |
 | `t_dev` | DEV（IS+OBS）上的带符号 t，未被 DROP 的候选才有 |
+| `sharpe_gross_dev`, `sharpe_net_dev`, `trade_status` | DEV 上的毛 / 净年化 Sharpe 与可交易性结论（KEEP / DROP，净 Sharpe ≥ `min_net_sharpe` 为 KEEP）；只有第 2 步存活的候选有值，其余留空 |
 | `t_h1`, `t_h2`, `t_xlag` | IS 前半段 t、后半段 t、多滞后一天的 t |
-| `flags` | `half_flip` / `xlag_weak` / `obs_short`，shortlist 代表另有 `unstable` / `cost_negative`，分号分隔 |
-| `rep` | 未被淘汰候选所属簇的代表 id |
+| `flags` | `half_flip` / `xlag_weak` / `obs_short`，shortlist 代表另有 `unstable`，分号分隔 |
+| `rep` | 通过可交易性筛选的候选所属簇的代表 id；被前面任一步淘汰的候选留空 |
 
 `shortlist.csv` 在这些列之外还有 `cluster_size`、`sharpe_gross`、`sharpe_net`、`turnover`、`ic_h1`…`ic_h60`、`ac_1`…`ac_60`、`signal_half_life`、`year_hit`、`n_years` 与 `description`。
 
@@ -210,11 +222,12 @@ python -m pytest -q
 | `[[universe.select]]` | 候选池选择，每条恰为三种形式之一：`class_one` / `class_two` / `class_three`（仅 `class_three` 可为列表）；`family` + `attrs`（如 CFTC）；`tickers`（显式列表） |
 | `[[universe.spread]]` | `id`、`a`、`b`：生成 `spread:<id>` = a − b（level） |
 | `[lags]` `chain`, `class`, `ticker` | 可得性输入，见 3.2。`chain` 必填；`class` 的键形如 `"class_one/class_two"`；没有频率默认值，出现 `D` / `W` 报错 |
-| `[position]` `buffer` | 缓冲带宽度（默认 0.5，≥ 0），见 3.8 |
+| `[position]` `buffer` | 缓冲带宽度（默认 0.5，≥ 0），见 3.9 |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 IS 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |
 | `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0` |
 | `[verdict]` `dedupe_corr`, `extra_lag_t_min` | 去重的相关阈值（默认 0.7）；`xlag_weak` 的 \|t\| 阈值（默认 2.0） |
+| `[verdict]` `min_net_sharpe` | 开发样本（IS+OBS）上扣成本后的年化净 Sharpe 下限（默认 0.3），低于此值的候选在去重前被淘汰（第 3 步）；任意有限实数，设为很小的负数（如 -1e9）即关闭 |
 | `[verdict]` `obs_min_retention`, `year_hit_min` | 观察期保留与 `confirm` 的 CONSISTENT 用的 retention 下限（默认 0.5）；`unstable` 的逐年命中率下限（默认 0.6） |
 
 **候选池要按经济假设选。** 过门槛只代表单因子证据，候选越多，纯运气过门槛的候选也越多，最终靠观察期与样本外判定。选择必须在看数据之前做出。
@@ -226,7 +239,7 @@ python -m pytest -q
 - 近月连续合约（`MM_Future`、`Commodity_Future`）因换月跳空无法在现有数据上修正，未纳入候选池。
 - ACM 期限溢价被有意排除：它是全样本重估的模型序列，历史值含前视。
 - spot 标的（EURUSD）的收益是现货对数收益，不含 carry。
-- 回测是描述性的：成本是单边固定比例，缓冲带是固定参数，没有做 walk-forward。
+- 回测是描述性的：成本是单边固定比例，缓冲带是固定参数，没有做 walk-forward。可交易性门槛（`min_net_sharpe`）也建立在这个描述性回测上，且在 DEV 行上用过一次，OOS 不参与。
 - 门槛对所有候选一视同仁：短样本上同样的 z 需要更高的 IC，短样本候选的观察期与样本外也短，筛选与确认能力有限。
 - 只检验"次日收益"这一个目标；更慢的信息通过 `chg_20`、`chg_60`、`z_252` 这类平滑变换进入，IC 衰减只作描述。
 - 去重按其他候选的 DEV 状态排序，某候选的 `rep` / `cluster_size` 在极端情形下可能间接受到其他候选更晚数据的影响（与该候选自身的统计量无关）。
@@ -242,6 +255,7 @@ python -m pytest -q
 - **逐候选隔离**：`test_isolation_nothing_from_oos`（行号 ≥ `e2` 之后的 target 与该候选原始序列换成随机数，candidates.csv 与 shortlist.csv 的数值列逐值不变）、`test_isolation_is_stats_ignore_obs_and_oos`（行号 ≥ `e1` 之后换掉，IS 统计量逐值不变），长历史与短历史候选各验证一次。
 - **植入信号 / 观察期淘汰 / lock**：`test_planted_signal_survives_screens`、`test_planted_signal_confirmed`、`test_observation_period_drops_decayed_signal`、`test_lock_and_force`、`test_cli_locked_exit_code`、`test_nothing_to_confirm`。
 - **仓位与回测**：`test_positions_*`、`test_backtest*`。
+- **可交易性筛选**：`test_high_turnover_signal_fails_tradability`（IC 显著但换手高、成本高 → DROP、不进 shortlist、`rep` 为空）、`test_gate_is_the_reason_for_the_drop`（同一份数据把 `min_net_sharpe` 设为 -1e9 后回到 shortlist）、`test_dedupe_after_screen_promotes_tradable_member`（簇内 t 最高的成员净 Sharpe 不达标时，同簇能交易的成员顶上来当代表）、`test_net_sharpe_gate_boundary_and_nonfinite`、`test_load_config_min_net_sharpe`。
 - **IC 衰减 / 信号自相关 / 逐年命中**：`test_ic_decay_*`、`test_autocorr_and_half_life_of_random_walk_zscore`、`test_year_hit_*`。
 - **零分布标准差**：`test_null_sd_*`，以及 HAC t 的朴素对照与零假设校准。
 
@@ -262,7 +276,7 @@ python -m http.server -d site-out        # 本地打开 index.html
 |---|---|
 | `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个资产 `#<slug>`） |
 | `artifact.html` | 同一模板生成的片段版（无 doctype / html / head / body 标签），用于发布到托管环境 |
-| `data/<slug>.json` | 每个资产一份（slug = target 小写），页面按需 `fetch`：shortlist 因子的净值、分段统计、公式、方向、样本外结论 |
+| `data/<slug>.json` | 每个资产一份（slug = target 小写），页面按需 `fetch`：shortlist 因子的净值、分段统计、公式、方向、样本外结论，另有 `funnel` 与 `criteria`（入选条件：`z_weak`、`obs_min_retention`、`min_net_sharpe`，读自 run.json 的配置快照；没有这些键的旧 run 对应项不显示） |
 
 **净值定义。** 对每个 shortlist 因子，取其有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 

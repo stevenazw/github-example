@@ -74,6 +74,7 @@ def write_report(run_dir) -> None:
     L += ["## 结论", ""]
     head = (f"检验 {fn['tested']} 个 → 样本内通过 {n_is_ok} 个（PASS {fn['is_pass']}、WEAK_PASS {fn['is_weak']}）"
             f"→ 观察期保留 {fn['obs_keep'] + fn['obs_insufficient']} 个（其中观察期样本不足 {fn['obs_insufficient']} 个）"
+            f"→ 可交易（净 Sharpe ≥ {vd['min_net_sharpe']:g}）保留 {fn['trade_keep']} 个"
             f"→ 去重后 shortlist {fn['shortlist']} 个。")
     if fn["shortlist"] == 0:
         head += "没有候选留下。"
@@ -116,7 +117,9 @@ def write_report(run_dir) -> None:
           "z = HAC t ÷ 该候选自身循环平移零分布的标准差。",
           f"- 观察期：对样本内非 REJECT 的候选，要求方向与样本内一致且 retention（按样本内符号的观察期 IC ÷ |样本内 IC|）"
           f"≥ {_num(vd['obs_min_retention'], 2)}；观察期样本不足时不淘汰，保留并标注 obs_short。",
-          f"- 去重：对未被淘汰的候选按开发样本（样本内 + 观察期）上的 t_dev 从高到低贪心聚类，"
+          f"- 可交易性：对未被观察期淘汰的候选，要求开发样本（样本内 + 观察期）上扣成本后的年化净 Sharpe "
+          f"≥ {vd['min_net_sharpe']:g}（min_net_sharpe）；在去重之前筛选，不满足（或净 Sharpe 非有限）的候选被淘汰。",
+          f"- 去重：对通过可交易性筛选的候选按开发样本（样本内 + 观察期）上的 t_dev 从高到低贪心聚类，"
           f"相关系数绝对值 ≥ {_num(vd['dedupe_corr'], 2)} 归入同一代表。",
           f"- 仓位：连续比例，目标仓位 = 样本内符号 × 信号，按波动率缩放；缓冲带 buffer = {_num(ps['buffer'], 2)}，"
           "目标与当前仓位之差超过 buffer 才调仓。",

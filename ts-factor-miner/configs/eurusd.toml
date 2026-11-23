@@ -137,7 +137,8 @@ seed = 20261122
 #   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的样本内(IS)行。
 #   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
 #   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_is))。
-# 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按相关性去重, 代表组成 shortlist;
+# 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按开发样本净 Sharpe(min_net_sharpe)筛选可交易性,
+# 通过的再按相关性去重, 代表组成 shortlist;
 # 样本外(OOS)由 confirm 确认(只打开一次, 不据此再调整)。
 z_pass = 2.5
 z_weak = 2.0
@@ -145,3 +146,4 @@ dedupe_corr = 0.7        # 去重: 开发样本(IS+OBS)共同行上信号相关�
 extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)
 obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它
 year_hit_min = 0.6       # 逐年 IC 为正的年份占比低于此值(且计入年数 >= 3)则标 unstable
+min_net_sharpe = 0.3     # 开发样本(样本内+观察期)上扣成本后的年化净 Sharpe 下限, 低于此值的候选在去重前被淘汰

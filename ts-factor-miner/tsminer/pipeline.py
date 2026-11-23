@@ -25,11 +25,14 @@ HORIZONS = (1, 2, 5, 10, 20, 60)
 YEAR_MIN_ROWS = 60
 CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n_is", "is_start", "is_end", "n_obs",
                 "n_oos", "t", "null_sd", "z", "ic", "sign", "p", "verdict", "ic_obs_signed", "retention",
-                "obs_status", "t_dev", "t_h1", "t_h2", "t_xlag", "flags", "rep"]
+                "obs_status", "t_dev", "sharpe_gross_dev", "sharpe_net_dev", "trade_status", "t_h1", "t_h2",
+                "t_xlag", "flags", "rep"]
+TRADE_COLUMNS = ["sharpe_gross_dev", "sharpe_net_dev", "trade_status"]
+SHORT_CAND_COLUMNS = [c for c in CAND_COLUMNS if c not in TRADE_COLUMNS]
 BT_COLUMNS = ["sharpe_gross", "sharpe_net", "turnover"]
 IC_COLUMNS = [f"ic_h{h}" for h in HORIZONS]
 AC_COLUMNS = [f"ac_{h}" for h in HORIZONS]
-SHORT_COLUMNS = (CAND_COLUMNS + ["cluster_size"] + BT_COLUMNS + IC_COLUMNS + AC_COLUMNS +
+SHORT_COLUMNS = (SHORT_CAND_COLUMNS + ["cluster_size"] + BT_COLUMNS + IC_COLUMNS + AC_COLUMNS +
                  ["signal_half_life", "year_hit", "n_years", "description"])
 
 
@@ -111,6 +114,14 @@ def dedupe(ids, S_dev_df, thresh, min_overlap=100) -> dict:
         else:
             out[cid] = ids[hit]
     return out
+
+
+def dedupe_tradable(ids, trade_ok, S_dev_df, thresh, min_overlap=100) -> dict:
+    """De-redundancy after the tradability screen: only ids with ``trade_ok[id]`` true enter ``dedupe`` (order
+    kept, best first), so a cluster is represented by its best tradable member instead of vanishing when its
+    best-t member fails the net-Sharpe bar. Returns id -> representative id for the tradable ids only."""
+    kept = [i for i in ids if trade_ok.get(i, False)]
+    return dedupe(kept, S_dev_df, thresh, min_overlap)
 
 
 def _sharpe(x: np.ndarray) -> float:
@@ -326,6 +337,23 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         if len(alive):
             t_dev_all = hac_t(np.where(is_m | obs_m, S_rows, np.nan), y, st.hac_lags, st.min_obs)[0]
             t_dev[alive] = sign[alive] * t_dev_all[sel][alive]
+    alive = nr[obs_status[nr] != "DROP"]
+
+    # ---- step 3: tradability screen on DEV rows (IS + OBS) of every step-2 survivor; the backtest readings
+    # are kept and reused by the shortlist
+    sharpe_gross_dev = np.full(n_tested, np.nan)
+    sharpe_net_dev = np.full(n_tested, np.nan)
+    trade_status = np.array([""] * n_tested, dtype=object)
+    bt_of: dict = {}
+    for i in alive:
+        j = sel[i]
+        dev = is_m[:, j] | obs_m[:, j]
+        bt = backtest(S_rows[dev, j], y[dev], sig[dev], float(sign[i]), cfg.target.cost_per_side,
+                      cfg.position.buffer)
+        bt_of[ids[i]] = bt
+        sharpe_gross_dev[i], sharpe_net_dev[i] = bt["sharpe_gross"], bt["sharpe_net"]
+        trade_status[i] = "KEEP" if (np.isfinite(bt["sharpe_net"]) and bt["sharpe_net"] >= vd.min_net_sharpe) \
+            else "DROP"
 
     is_start, is_end = _edge_dates(is_m[:, sel], rows, cal)
     order = np.argsort(-np.abs(z), kind="stable")
@@ -335,19 +363,21 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         "freq": cm.loc[ids, "freq"].to_numpy(), "n_is": n_is, "is_start": is_start, "is_end": is_end,
         "n_obs": obs_m[:, sel].sum(axis=0), "n_oos": oos_m[:, sel].sum(axis=0), "t": t, "null_sd": null,
         "z": z, "ic": ic, "sign": sign, "p": p, "verdict": verdict, "ic_obs_signed": ic_obs_signed,
-        "retention": retention, "obs_status": obs_status, "t_dev": t_dev, "t_h1": t_h1, "t_h2": t_h2,
+        "retention": retention, "obs_status": obs_status, "t_dev": t_dev, "sharpe_gross_dev": sharpe_gross_dev,
+        "sharpe_net_dev": sharpe_net_dev, "trade_status": trade_status, "t_h1": t_h1, "t_h2": t_h2,
         "t_xlag": t_xlag, "flags": [";".join(f) for f in flags], "rep": "",
     }).iloc[order].reset_index(drop=True)
     flag_of = {cid: f for cid, f in zip(ids, flags)}
 
-    # ---- step 3: de-redundancy of the survivors on DEV rows, best t_dev first
-    survivors = cand[(cand["verdict"] != "REJECT") & (cand["obs_status"] != "DROP")]
+    # ---- step 4: de-redundancy of the tradable survivors on DEV rows, best t_dev first
+    survivors = cand[cand["obs_status"].isin(["KEEP", "INSUFFICIENT"])]
     surv_ids = survivors.sort_values("t_dev", ascending=False, na_position="last", kind="stable")["id"].tolist()
+    trade_ok = dict(zip(cand["id"], cand["trade_status"] == "KEEP"))
     S_dev_df = pd.DataFrame(np.where(is_m | obs_m, S_rows, np.nan), columns=S.columns)
-    rep_map = dedupe(surv_ids, S_dev_df, vd.dedupe_corr)
+    rep_map = dedupe_tradable(surv_ids, trade_ok, S_dev_df, vd.dedupe_corr)
     cand["rep"] = [rep_map.get(i, "") for i in cand["id"]]
     short_ids = list(dict.fromkeys(rep_map.values()))
-    cluster = pd.Series(list(rep_map.values())).value_counts()
+    cluster = pd.Series(list(rep_map.values()), dtype=object).value_counts()
 
     # ---- shortlist readings, DEV rows only
     col_of = {c: i for i, c in enumerate(S.columns)}
@@ -361,17 +391,15 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         sgn = float(r["sign"])
         dev = is_m[:, j] | obs_m[:, j]
         s_dev = np.where(dev, S_rows[:, j], np.nan)
-        bt = backtest(S_rows[dev, j], y[dev], sig[dev], sgn, cfg.target.cost_per_side, cfg.position.buffer)
+        bt = bt_of[cid]
         icd = ic_decay(s_dev, y, int(e2[j]), sgn)
         acs = signal_autocorr(s_dev)
         hit, n_years = yearly_hit(s_dev, y, years, sgn)
         f = list(flag_of[cid])
         if n_years >= 3 and hit < vd.year_hit_min:
             f.append("unstable")
-        if np.isfinite(bt["sharpe_net"]) and bt["sharpe_net"] <= 0:
-            f.append("cost_negative")
         flag_of[cid] = f
-        row = {**{c: r[c] for c in CAND_COLUMNS}, "cluster_size": int(cluster[cid]), **bt,
+        row = {**{c: r[c] for c in SHORT_CAND_COLUMNS}, "cluster_size": int(cluster[cid]), **bt,
                **dict(zip(IC_COLUMNS, icd)), **dict(zip(AC_COLUMNS, acs)),
                "signal_half_life": half_life(acs[0]), "year_hit": hit, "n_years": n_years,
                "description": desc.get(r["series"], "")}
@@ -387,7 +415,9 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
               "is_weak": int((verdict == "WEAK_PASS").sum()),
               "obs_keep": int((obs_status == "KEEP").sum()),
               "obs_insufficient": int((obs_status == "INSUFFICIENT").sum()),
-              "obs_drop": int((obs_status == "DROP").sum()), "shortlist": len(short_ids)}
+              "obs_drop": int((obs_status == "DROP").sum()),
+              "trade_keep": int((trade_status == "KEEP").sum()), "trade_drop": int((trade_status == "DROP").sum()),
+              "shortlist": len(short_ids)}
     run = {
         "target": cfg.target.name,
         "config": cfg.to_dict(),

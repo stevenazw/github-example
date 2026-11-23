@@ -13,7 +13,7 @@ from tsminer.config import load_config
 from tsminer.confirm import OosLockedError, confirm
 from tsminer.databank import META_COLUMNS, Panel
 from tsminer.pipeline import (AC_COLUMNS, CAND_COLUMNS, IC_COLUMNS, SHORT_COLUMNS, assign_verdict, backtest, dedupe,
-                              half_life, ic_decay, mine, positions, prepare, signal_autocorr, split_rows,
+                              dedupe_tradable, half_life, ic_decay, mine, positions, prepare, signal_autocorr, split_rows,
                               yearly_hit)
 from tsminer.transforms import make_signal
 
@@ -51,6 +51,8 @@ seed = 7
 """
 
 SHORT_LEN = 700
+OLD_FLAG = "cost" + "_negative"          # removed: replaced by the min_net_sharpe hard gate
+HIGH_COST = 0.001                        # sig|chg_1: gross Sharpe ~2.3, net ~ -0.9 at this cost
 
 
 def make_panel(seed, plant=False, short=False, dup=False, n=N, ic_sig=None, flip_at=None):
@@ -227,7 +229,8 @@ def test_isolation_nothing_from_oos(tmp_path, cfg, cfg_path, planted_panel, plan
             assert _same(a[k], b[k]), (k, a[k], b[k])
     num = [k for k in CAND_COLUMNS if k != "id" and isinstance(a[k], (int, float, np.number)) and not pd.isna(a[k])]
     assert {"t", "null_sd", "z", "ic", "n_is", "t_h1", "t_h2", "t_xlag", "n_obs", "n_oos", "ic_obs_signed",
-            "retention", "t_dev"} <= set(num)
+            "retention", "t_dev", "sharpe_gross_dev", "sharpe_net_dev"} <= set(num)
+    assert a["trade_status"] == "KEEP"
     rep = a["rep"]
     assert rep == cid or rep in set(pd.read_csv(planted_run / "shortlist.csv")["id"])
     sa = pd.read_csv(planted_run / "shortlist.csv").set_index("id")
@@ -309,14 +312,17 @@ def test_output_files_and_columns(planted_run):
     run = json.loads((d / "run.json").read_text())
     assert set(run) == {"target", "config", "panel_info", "dates", "n_rows", "n_series", "n_candidates",
                         "n_tested", "n_skipped", "n_is_summary", "funnel", "shortlist", "created_at"}
-    assert set(run["funnel"]) == {"tested", "is_pass", "is_weak", "obs_keep", "obs_insufficient", "obs_drop",
-                                  "shortlist"}
+    assert list(run["funnel"]) == ["tested", "is_pass", "is_weak", "obs_keep", "obs_insufficient", "obs_drop",
+                                   "trade_keep", "trade_drop", "shortlist"]
     assert set(run["dates"]) == {"sample_start", "sample_end"}
     cand = pd.read_csv(d / "candidates.csv")
     f = run["funnel"]
     assert run["n_tested"] == len(cand) == f["tested"] and run["n_candidates"] == run["n_tested"] + run["n_skipped"]
     assert f["is_pass"] == (cand["verdict"] == "PASS").sum() and f["is_weak"] == (cand["verdict"] == "WEAK_PASS").sum()
     assert f["obs_keep"] + f["obs_insufficient"] + f["obs_drop"] == f["is_pass"] + f["is_weak"]
+    assert f["trade_keep"] + f["trade_drop"] == f["obs_keep"] + f["obs_insufficient"]
+    assert f["trade_keep"] == (cand["trade_status"] == "KEEP").sum() and f["trade_drop"] == (cand["trade_status"] == "DROP").sum()
+    assert f["shortlist"] <= f["trade_keep"]
     assert f["shortlist"] == len(run["shortlist"]) == len(pd.read_csv(d / "shortlist.csv"))
     assert (cand["z"].abs().diff().dropna() <= 1e-12).all()         # sorted by |z| descending
     assert run["n_is_summary"]["min"] == cand["n_is"].min()
@@ -325,7 +331,23 @@ def test_output_files_and_columns(planted_run):
     assert (rej["n_obs"] > 0).all()
     drop = cand[cand["obs_status"] == "DROP"]
     assert drop["t_dev"].isna().all() and (drop["rep"].isna() | (drop["rep"] == "")).all()
+    # the tradability columns exist only for the step-2 survivors, right after t_dev
+    cols = list(cand.columns)
+    assert cols[cols.index("t_dev") + 1:cols.index("t_dev") + 4] == ["sharpe_gross_dev", "sharpe_net_dev", "trade_status"]
+    nonalive = cand[(cand["verdict"] == "REJECT") | (cand["obs_status"] == "DROP")]
+    assert nonalive[["sharpe_gross_dev", "sharpe_net_dev", "trade_status"]].isna().all().all()
+    alive = cand.drop(nonalive.index)
+    assert alive["trade_status"].isin(["KEEP", "DROP"]).all() and np.isfinite(alive["sharpe_net_dev"]).all()
+    keep = alive["trade_status"] == "KEEP"
+    assert (alive.loc[keep, "sharpe_net_dev"] >= cfg_min_net_sharpe(d)).all()
+    assert (alive.loc[~keep, "sharpe_net_dev"] < cfg_min_net_sharpe(d)).all()
+    assert (alive.loc[~keep, "rep"].isna() | (alive.loc[~keep, "rep"] == "")).all()
+    assert alive.loc[keep, "rep"].isin(set(alive.loc[keep, "id"])).all()
     assert (d / "panel").is_dir() and (d / "config.toml").exists()
+
+
+def cfg_min_net_sharpe(d):
+    return json.loads((Path(d) / "run.json").read_text())["config"]["verdict"]["min_net_sharpe"]
 
 
 def test_too_short_candidates_are_skipped(tmp_path, cfg, cfg_path):
@@ -365,8 +387,8 @@ def test_cluster_size_and_single_representative(planted_run):
     rep = cand.loc["sig|chg_1", "rep"]
     assert cand.loc["sig2|chg_1", "rep"] == rep
     assert short.loc[rep, "cluster_size"] == 2
-    alive = cand[(cand["verdict"] != "REJECT") & (cand["obs_status"] != "DROP")]
-    assert short["cluster_size"].sum() == len(alive)
+    tradable = cand[cand["trade_status"] == "KEEP"]
+    assert short["cluster_size"].sum() == len(tradable)
     assert (short["rep"] == short.index).all()
 
 
@@ -416,6 +438,9 @@ def test_report_content(planted_run, noise_run, confirmed_run):
     assert "5000" in rep and "短样本候选的观察期与样本外也短" in rep and "近月连续合约" in rep
     assert "chain" in rep and "no_availability_rule" not in rep.split("## 可得性输入")[0]
     assert "检验 " in rep and "→ 去重后 shortlist" in rep
+    assert "→ 可交易（净 Sharpe ≥ 0.3）保留 " in rep and "可交易性：" in rep and "min_net_sharpe" in rep
+    assert rep.index("→ 观察期保留") < rep.index("→ 可交易") < rep.index("→ 去重后 shortlist")
+    assert OLD_FLAG not in rep
     full = (confirmed_run[0] / "report.md").read_text(encoding="utf-8")
     assert "holdout" not in full.lower()
 
@@ -624,6 +649,7 @@ def test_observation_period_drops_decayed_signal(tmp_path, cfg, cfg_path):
     assert r["obs_status"] == "DROP" and r["retention"] < 0
     assert "sig|chg_1" not in set(short["id"]) and (pd.isna(r["rep"]) or r["rep"] == "")
     assert pd.isna(r["t_dev"])
+    assert r[["sharpe_gross_dev", "sharpe_net_dev"]].isna().all() and pd.isna(r["trade_status"])
 
 
 def test_observation_period_insufficient_is_kept(tmp_path, cfg_path):
@@ -644,6 +670,126 @@ def test_observation_period_insufficient_is_kept(tmp_path, cfg_path):
     assert not np.isnan(r["t_dev"]) and r["rep"] in set(short["id"])
     run = json.loads((tmp_path / "r" / "run.json").read_text())
     assert run["funnel"]["obs_insufficient"] >= 1
+
+
+# ------------------------------------------------------------- tradability screen
+def _cfg_text(cost=None, min_net_sharpe=None):
+    txt = TOML if cost is None else TOML.replace("cost_per_side = 0.00005", f"cost_per_side = {cost}")
+    if min_net_sharpe is not None:
+        txt += f"\n[verdict]\nmin_net_sharpe = {min_net_sharpe}\n"
+    return txt
+
+
+@pytest.fixture(scope="module")
+def costly_run(tmp_path_factory, planted_panel):
+    d = tmp_path_factory.mktemp("costly")
+    p = _write_cfg(d, _cfg_text(HIGH_COST))
+    mine(load_config(p), d / "run", panel=planted_panel, config_path=p)
+    return d / "run"
+
+
+@pytest.fixture(scope="module")
+def costly_off_run(tmp_path_factory, planted_panel):
+    d = tmp_path_factory.mktemp("costly_off")
+    p = _write_cfg(d, _cfg_text(HIGH_COST, "-1e9"))
+    mine(load_config(p), d / "run", panel=planted_panel, config_path=p)
+    return d / "run"
+
+
+def test_high_turnover_signal_fails_tradability(costly_run):
+    cand = pd.read_csv(costly_run / "candidates.csv").set_index("id")
+    short = pd.read_csv(costly_run / "shortlist.csv")
+    for cid in ("sig|chg_1", "sig2|chg_1", "short|chg_1"):
+        r = cand.loc[cid]
+        print("costly", cid, {k: r[k] for k in ("z", "t_dev", "sharpe_gross_dev", "sharpe_net_dev", "trade_status")})
+        assert r["verdict"] == "PASS" and r["obs_status"] == "KEEP"          # the IC evidence is intact
+        assert r["sharpe_gross_dev"] > 1.0 and r["sharpe_net_dev"] < 0.1
+        assert r["trade_status"] == "DROP"
+        assert cid not in set(short["id"]) and (pd.isna(r["rep"]) or r["rep"] == "")
+    run = json.loads((costly_run / "run.json").read_text())
+    f = run["funnel"]
+    assert f["trade_drop"] >= 3 and f["trade_keep"] + f["trade_drop"] == f["obs_keep"] + f["obs_insufficient"]
+    assert f["shortlist"] <= f["trade_keep"]
+    assert "cluster_size" in short.columns and "sharpe_net" in short.columns
+    assert (short["sharpe_net"] >= 0.3).all()                                # every shortlist member passes the bar
+
+
+def test_gate_is_the_reason_for_the_drop(costly_run, costly_off_run):
+    a = pd.read_csv(costly_run / "candidates.csv").set_index("id")
+    b = pd.read_csv(costly_off_run / "candidates.csv").set_index("id")
+    short = pd.read_csv(costly_off_run / "shortlist.csv").set_index("id")
+    # same data, same cost: only the threshold differs, so the readings are identical ...
+    for cid in ("sig|chg_1", "sig2|chg_1", "short|chg_1"):
+        assert a.loc[cid, "sharpe_net_dev"] == b.loc[cid, "sharpe_net_dev"]
+        assert a.loc[cid, "t_dev"] == b.loc[cid, "t_dev"]
+        # ... but the gate is open now
+        assert b.loc[cid, "trade_status"] == "KEEP" and b.loc[cid, "rep"] in set(short.index)
+    print("gate off: sig|chg_1 rep =", b.loc["sig|chg_1", "rep"], "short:", sorted(short.index)[:6],
+          "net", b.loc["sig|chg_1", "sharpe_net_dev"])
+    assert len({"sig|chg_1", "sig2|chg_1"} & set(short.index)) == 1
+    assert (b.loc[np.isfinite(b["sharpe_net_dev"]), "trade_status"] == "KEEP").all()
+    fa = json.loads((costly_run / "run.json").read_text())["funnel"]
+    fb = json.loads((costly_off_run / "run.json").read_text())["funnel"]
+    assert fa["obs_keep"] == fb["obs_keep"] and fa["obs_insufficient"] == fb["obs_insufficient"]
+    assert fb["trade_drop"] == 0 and fb["trade_keep"] == fb["obs_keep"] + fb["obs_insufficient"]
+    assert fa["trade_drop"] > 0 and fa["shortlist"] < fb["shortlist"]
+
+
+def test_dedupe_after_screen_promotes_tradable_member():
+    """Cluster {A, B} (corr > 0.7); A has the higher t_dev but fails the net-Sharpe bar: B represents the
+    cluster instead of the whole cluster vanishing. Screening happens before clustering."""
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=500)
+    df = pd.DataFrame({"A": a, "B": a + 0.4 * rng.normal(size=500), "C": rng.normal(size=500)})
+    assert abs(np.corrcoef(df["A"], df["B"])[0, 1]) > 0.7
+    order = ["A", "B", "C"]                                            # A has the best t_dev
+    assert dedupe_tradable(order, {"A": True, "B": True, "C": True}, df, 0.7) == {"A": "A", "B": "A", "C": "C"}
+    out = dedupe_tradable(order, {"A": False, "B": True, "C": True}, df, 0.7)
+    assert out == {"B": "B", "C": "C"} and "A" not in out
+    assert set(out.values()) == {"B", "C"}                             # the cluster survives, represented by B
+    # a failing candidate does not count towards cluster_size either
+    assert list(out.values()).count("B") == 1
+    assert dedupe_tradable(order, {}, df, 0.7) == {}
+
+
+def test_net_sharpe_gate_boundary_and_nonfinite(tmp_path, planted_panel, planted_run):
+    """sharpe_net >= min_net_sharpe keeps; setting the bar just above a candidate's own net Sharpe drops it."""
+    cand = pd.read_csv(planted_run / "candidates.csv").set_index("id")
+    net = cand.loc["sig|chg_1", "sharpe_net_dev"]
+    p = _write_cfg(tmp_path, _cfg_text(None, repr(float(net) + 1e-6)))
+    mine(load_config(p), tmp_path / "hi", panel=planted_panel, config_path=p)
+    c2 = pd.read_csv(tmp_path / "hi" / "candidates.csv").set_index("id")
+    assert c2.loc["sig|chg_1", "sharpe_net_dev"] == net and c2.loc["sig|chg_1", "trade_status"] == "DROP"
+    p = _write_cfg(tmp_path, _cfg_text(None, repr(float(net))))
+    mine(load_config(p), tmp_path / "eq", panel=planted_panel, config_path=p)
+    c3 = pd.read_csv(tmp_path / "eq" / "candidates.csv").set_index("id")
+    assert c3.loc["sig|chg_1", "trade_status"] == "KEEP"                # equality passes
+
+
+def test_load_config_min_net_sharpe(tmp_path):
+    assert load_config(_write_cfg(tmp_path, TOML)).verdict.min_net_sharpe == 0.3
+    for v, want in (("0.8", 0.8), ("-1e9", -1e9), ("2", 2)):
+        assert load_config(_write_cfg(tmp_path, TOML + f"\n[verdict]\nmin_net_sharpe = {v}\n")).verdict.min_net_sharpe == want
+    for bad in ('"abc"', "true", "[0.3]", "inf", "nan", "-inf"):
+        with pytest.raises(ValueError):
+            load_config(_write_cfg(tmp_path, TOML + f"\n[verdict]\nmin_net_sharpe = {bad}\n"))
+    for name in ("ty", "eurusd"):
+        c = load_config(ROOT / "configs" / f"{name}.toml")
+        assert c.verdict.min_net_sharpe == 0.3
+        assert "min_net_sharpe = 0.3" in (ROOT / "configs" / f"{name}.toml").read_text(encoding="utf-8")
+    assert load_config(_write_cfg(tmp_path, TOML)).to_dict()["verdict"]["min_net_sharpe"] == 0.3
+
+
+def test_old_flag_is_gone_from_the_repository():
+    hits = []
+    for f in ROOT.rglob("*"):
+        rel = f.relative_to(ROOT).parts
+        if (not f.is_file() or rel[0] in ("runs", ".git") or "__pycache__" in rel or ".pytest_cache" in rel
+                or f.suffix in (".pyc", ".pkl")):
+            continue
+        if OLD_FLAG in f.read_text(encoding="utf-8", errors="ignore"):
+            hits.append(str(f.relative_to(ROOT)))
+    assert hits == []
 
 
 def _write_cfg(tmp_path, text):
