@@ -15,7 +15,8 @@ cache_dir = "/home/user/databank-work/databank-cache"
 
 [sample]
 start = ""                  # 可选 ISO 日期; 空 = 标的全部历史
-holdout_frac = 0.2          # 每个候选在自己与标的重叠的样本上独立检验, 并各自把最后 holdout_frac 的有效行留作 holdout
+is_frac = 0.70              # 每个候选在自己与标的重叠的有效行内切成: 样本内 IS 70% / 观察期 OBS 15% / 样本外 OOS 15%
+obs_frac = 0.15
 
 [universe]
 fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: 每个 ticker 取它拥有的第一个
@@ -29,7 +30,8 @@ class_three = ["Yield", "Bill", "Govt_Spread"]
 
 [[universe.select]]
 class_two = "Money_Market"
-class_three = ["MM_Future", "Benchmark_Rate", "Implied_Yield", "MM_Spread", "Repo"]
+# MM_Future (近月连续合约) 已移出候选池: 换月跳空无法在现有数据上修正
+class_three = ["Benchmark_Rate", "Implied_Yield", "MM_Spread", "Repo"]
 
 [[universe.select]]
 class_two = "Swap_OIS"
@@ -39,7 +41,9 @@ class_three = ["SOFR_OIS", "Swap_Spread", "Forward_Swap"]
 class_two = "VOL"
 
 [[universe.select]]
+# 不含 Commodity_Future (近月连续合约): 换月跳空无法在现有数据上修正, 先移出候选池
 class_two = "Commodity"
+class_three = ["Commodity_Index", "Spot"]
 
 [[universe.select]]
 class_two = "Equity"
@@ -92,15 +96,35 @@ a = "USGG10YR Index"
 b = "USGG3M Index"
 
 [lags]
-D = 1          # 日频默认: t 日收盘的信号只用 <= t-1 日的 x (保守: 不假设 x 的取值时刻早于标的收盘)
-W = 6          # 周频默认: 保守覆盖"下周才发布"的情形
+# 可得性(availability)是【输入】, 由研究者确认, 系统不猜测、不套默认值: 没有规则的序列会被拒收(no_availability_rule)。
+# 数值含义: t 日收盘的信号只能用日期 <= t-lag 的观测。
+# 优先级: [lags.ticker] 精确 ticker > [lags.class] 的 "class_one/class_two"。
+chain = 1      # 期货链 chain:* 与 carry:* 的滞后
 
-[lags.class]   # 键为 "class_one/class_two", 优先于频率默认
+[lags.class]
+"Market_Data/Government_Bond" = 1
+"Market_Data/Money_Market" = 1
+"Market_Data/Swap_OIS" = 1
+"Market_Data/VOL" = 1
+"Market_Data/Commodity" = 1
+"Market_Data/Equity" = 1
+"Market_Data/Inflation_Linked" = 1
+"Market_Data/Credit" = 1
+"Market_Data/MBS" = 1
+"Market_Data/FX" = 1
+"Macro/Global" = 1
+"Macro/US" = 1
 "Positioning/CFTC_COT" = 4     # 周二数据、周五 15:30 ET 发布 -> 下周一可用
 "FED/Balance_Sheet" = 2        # 周三数据、周四 16:30 ET 发布 -> 周五可用
 "FED/Primary_Dealer" = 8       # 周三数据、下周四发布 -> 保守取 8
 
-[lags.ticker]  # 可选: 按 ticker 精确覆盖, 优先级最高 (默认空)
+[lags.ticker]
+"NFCIINDX Index" = 6
+
+[position]
+# 连续仓位 = sign * 信号(按波动率缩放的 y 单位); 缓冲带: 目标与当前仓位之差的绝对值 > buffer 才调仓,
+# 否则维持原仓位。buffer = 0 即每天跟随目标; 慢信号不必每天调仓。
+buffer = 0.5
 
 [signals]
 std_window = 252
@@ -109,18 +133,21 @@ vol_halflife = 20
 
 [stats]
 hac_lags = 5
-min_obs = 250    # 每个候选在 train 段至少需要的有效观测数, 不足者不检验
+min_obs = 250    # 每个候选在样本内(IS)至少需要的有效观测数, 不足者不检验
 n_boot = 1000
 min_shift = 60
 seed = 20261122
 
 [verdict]
-# 每个候选都是独立的单因子检验(没有"同批"概念, 不做族错误率 / FDR 校正):
-#   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的 train 行。
+# 每个候选都是独立的单因子检验:
+#   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的样本内(IS)行。
 #   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
-#   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_train))。
-# 通过门槛的候选再按相关性去重, 代表组成 shortlist; 成立与否由 holdout 确认(只打开一次)。
+#   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_is))。
+# 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按相关性去重, 代表组成 shortlist;
+# 样本外(OOS)由 confirm 确认(只打开一次, 不据此再调整)。
 z_pass = 2.5
 z_weak = 2.0
-dedupe_corr = 0.7        # 去重: train 共同行上信号相关系数绝对值 >= 此值归入同一代表
+dedupe_corr = 0.7        # 去重: 开发样本(IS+OBS)共同行上信号相关系数绝对值 >= 此值归入同一代表
 extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)
+obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它
+year_hit_min = 0.6       # 逐年 IC 为正的年份占比低于此值(且计入年数 >= 3)则标 unstable

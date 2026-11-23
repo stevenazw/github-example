@@ -1,7 +1,8 @@
 """Data adapter: turns the market databank into an aligned, lag-safe ``Panel``.
 
 Look-ahead protection lives entirely in ``align_to_calendar`` + ``resolve_lag``:
-the databank's ``release_date`` is NOT used (it is unreliable for history).
+the databank's ``release_date`` is NOT used (it is unreliable for history). Availability (the lag of each
+series) is an INPUT from the config: a series without a rule is rejected, never given a default.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ STALE_LIMIT = {"D": 5, "W": 10}     # calendar rows an observation may be carrie
 MIN_FINITE_OBS = 250                # series with fewer finite aligned values are excluded
 BATCH_SIZE = 200
 
-META_COLUMNS = ["ticker", "field", "kind", "freq", "group", "lag", "description", "first_obs", "n_obs"]
+META_COLUMNS = ["ticker", "field", "kind", "freq", "group", "lag", "lag_rule", "description", "first_obs", "n_obs"]
 FREQ_RANK = {"D": 0, "W": 1, "other": 2}
 
 
@@ -72,24 +73,26 @@ def infer_kind(unit: str, data_type: str) -> str:
     return "level"
 
 
-def resolve_lag(ticker: str, class_one: str, class_two: str, freq: str, lags_cfg) -> int:
-    """Lag in calendar rows: ticker override > 'class_one/class_two' > frequency default."""
+def resolve_lag_rule(ticker: str, class_one: str, class_two: str, lags_cfg) -> tuple[int, str] | None:
+    """(lag, rule key) with priority ticker exact > 'class_one/class_two'; None when no rule applies."""
     by_ticker = _lags_attr(lags_cfg, "ticker")
     if ticker in by_ticker:
-        return int(by_ticker[ticker])
+        return int(by_ticker[ticker]), f"ticker:{ticker}"
     by_class = _lags_attr(lags_cfg, "class")
     key = f"{class_one}/{class_two}"
     if key in by_class:
-        return int(by_class[key])
-    if freq == "D":
-        return int(_lags_attr(lags_cfg, "D"))
-    if freq == "W":
-        return int(_lags_attr(lags_cfg, "W"))
-    raise ValueError(f"no default lag for freq {freq!r} (ticker {ticker})")
+        return int(by_class[key]), f"class:{key}"
+    return None
+
+
+def resolve_lag(ticker: str, class_one: str, class_two: str, lags_cfg) -> int | None:
+    """Lag in calendar rows: ticker override > 'class_one/class_two'; None if neither is given."""
+    hit = resolve_lag_rule(ticker, class_one, class_two, lags_cfg)
+    return None if hit is None else hit[0]
 
 
 def _lags_attr(lags_cfg, name: str):
-    """Accept a LagsConfig or a plain dict (keys 'D','W','class','ticker')."""
+    """Accept a LagsConfig or a plain dict (keys 'chain','class','ticker')."""
     if isinstance(lags_cfg, dict):
         return lags_cfg.get(name, {} if name in ("class", "ticker") else None)
     return getattr(lags_cfg, "class_" if name == "class" else name)
@@ -237,17 +240,22 @@ def build_panel(cfg) -> Panel:
         rows[sid] = m
 
     def process(ticker: str, s: pd.Series, field: str, unit: str, dtype: str) -> dict | None:
-        """Align one databank series; returns the info needed for meta, or None if excluded."""
+        """Align one databank series; returns the info needed for meta, or None if excluded
+        (the exclusion is appended to ``excluded``)."""
         freq = infer_freq(s.index)
         if freq == "other":
             excluded.append({"ticker": ticker, "reason": "freq_not_daily_or_weekly"})
             return None
         info = sec_info.get(ticker, {})
         c1, c2 = info.get("class_one", ""), info.get("class_two", "")
-        lag = resolve_lag(ticker, c1, c2, freq, lags)
+        hit = resolve_lag_rule(ticker, c1, c2, lags)
+        if hit is None:
+            excluded.append({"ticker": ticker, "reason": "no_availability_rule"})
+            return None
+        lag, rule = hit
         return dict(aligned=align_to_calendar(s, calendar, lag, STALE_LIMIT[freq]),
                     ticker=ticker, field=field, kind=infer_kind(unit, dtype), freq=freq,
-                    group=c2, lag=lag, description=info.get("description", ""))
+                    group=c2, lag=lag, lag_rule=rule, description=info.get("description", ""))
 
     # 3. candidate pool and field choice
     pool = _select_tickers(q, cfg)
@@ -277,13 +285,13 @@ def build_panel(cfg) -> Panel:
 
     # 5. futures chains and carry
     for root in cfg.universe.chains:
-        add_series(f"chain:{root}", _chain_series(q, root, calendar, lags.D, "index"),
+        add_series(f"chain:{root}", _chain_series(q, root, calendar, lags.chain, "index"),
                    ticker=f"chain:{root}", field="return_index", kind="price", freq="D",
-                   group="Chain", lag=lags.D, description=f"{root} futures chain return index")
+                   group="Chain", lag=lags.chain, lag_rule="chain", description=f"{root} futures chain return index")
     for root in cfg.universe.carry_chains:
-        add_series(f"carry:{root}", _chain_series(q, root, calendar, lags.D, "carry"),
+        add_series(f"carry:{root}", _chain_series(q, root, calendar, lags.chain, "carry"),
                    ticker=f"carry:{root}", field="calendar_spread/px_active", kind="level", freq="D",
-                   group="Carry", lag=lags.D, description=f"{root} calendar spread / active price")
+                   group="Carry", lag=lags.chain, lag_rule="chain", description=f"{root} calendar spread / active price")
 
     # 6. spreads: legs aligned and lagged on their own, then differenced
     for sp in cfg.universe.spread:
@@ -305,7 +313,9 @@ def build_panel(cfg) -> Panel:
             res = process(tk, s, f, unit, dtype)
             if res is None:
                 # process() logged an exclusion; for a spread leg that is a config error
-                excluded.pop()
+                reason = excluded.pop()["reason"]
+                if reason == "no_availability_rule":
+                    raise ValueError(f"spread {sp['id']}: leg {tk!r} has no availability rule in [lags]")
                 raise ValueError(f"spread {sp['id']}: leg {tk!r} is not daily/weekly")
             legs[leg] = res
         a, b = legs["a"], legs["b"]
@@ -313,7 +323,8 @@ def build_panel(cfg) -> Panel:
         freq = max(a["freq"], b["freq"], key=lambda z: FREQ_RANK[z])
         add_series(f"spread:{sp['id']}", diff, ticker=f"spread:{sp['id']}",
                    field=f"{a['ticker']}-{b['ticker']}", kind="level", freq=freq, group="Spread",
-                   lag=max(a["lag"], b["lag"]), description=f"{sp['a']} minus {sp['b']}")
+                   lag=max(a["lag"], b["lag"]), lag_rule=f"{a['lag_rule']}+{b['lag_rule']}",
+                   description=f"{sp['a']} minus {sp['b']}")
 
     # 7. minimum observations, then assemble
     keep = []

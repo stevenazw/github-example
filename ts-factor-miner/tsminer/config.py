@@ -14,7 +14,7 @@ from typing import Any
 ENV_TOOLKIT = "DATABANK_TOOLKIT"
 ENV_CACHE = "DATABANK_CACHE"
 
-TOP_SECTIONS = {"target", "databank", "sample", "universe", "lags", "signals", "stats", "verdict"}
+TOP_SECTIONS = {"target", "databank", "sample", "universe", "lags", "position", "signals", "stats", "verdict"}
 TARGET_KINDS = {"futures_chain", "spot"}
 CLASS_KEYS = {"class_one", "class_two", "class_three"}
 
@@ -38,7 +38,8 @@ class DatabankConfig:
 @dataclass
 class SampleConfig:
     start: str = ""
-    holdout_frac: float = 0.2
+    is_frac: float = 0.70      # in-sample share of each candidate's own valid rows
+    obs_frac: float = 0.15     # observation-period share; the rest (1 - is_frac - obs_frac) is out-of-sample
 
 
 @dataclass
@@ -53,10 +54,15 @@ class UniverseConfig:
 
 @dataclass
 class LagsConfig:
-    D: int = 1
-    W: int = 6
-    class_: dict[str, int] = field(default_factory=dict)   # TOML key: "class"
+    """Availability INPUT: a signal at the close of day t may only use observations dated <= t - lag."""
+    chain: int                                              # futures chains ``chain:*`` and ``carry:*``
+    class_: dict[str, int] = field(default_factory=dict)   # TOML key: "class"; keys "class_one/class_two"
     ticker: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class PositionConfig:
+    buffer: float = 0.5
 
 
 @dataclass
@@ -81,15 +87,18 @@ class VerdictConfig:
     z_weak: float = 2.0
     dedupe_corr: float = 0.7
     extra_lag_t_min: float = 2.0
+    obs_min_retention: float = 0.5
+    year_hit_min: float = 0.6
 
 
 @dataclass
 class Config:
     target: TargetConfig
+    lags: LagsConfig
     databank: DatabankConfig = field(default_factory=DatabankConfig)
     sample: SampleConfig = field(default_factory=SampleConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
-    lags: LagsConfig = field(default_factory=LagsConfig)
+    position: PositionConfig = field(default_factory=PositionConfig)
     signals: SignalsConfig = field(default_factory=SignalsConfig)
     stats: StatsConfig = field(default_factory=StatsConfig)
     verdict: VerdictConfig = field(default_factory=VerdictConfig)
@@ -234,10 +243,11 @@ def load_config(path: str | os.PathLike) -> Config:
         databank.cache_dir = os.environ[ENV_CACHE]
 
     # sample
-    sec = _section(raw, "sample", {"start", "holdout_frac"})
-    sample = _fill(SampleConfig, sec, "sample", {"start": (str,), "holdout_frac": (int, float)})
-    if not 0 < sample.holdout_frac < 1:
-        raise ValueError("sample.holdout_frac must be in (0, 1)")
+    sec = _section(raw, "sample", {"start", "is_frac", "obs_frac"})
+    sample = _fill(SampleConfig, sec, "sample",
+                   {"start": (str,), "is_frac": (int, float), "obs_frac": (int, float)})
+    if not (sample.is_frac > 0 and sample.obs_frac > 0 and sample.is_frac + sample.obs_frac < 1):
+        raise ValueError("sample requires is_frac > 0, obs_frac > 0 and is_frac + obs_frac < 1")
 
     # universe
     sec = _section(raw, "universe", {"fields", "chains", "carry_chains", "exclude_tickers", "select", "spread"})
@@ -253,15 +263,12 @@ def load_config(path: str | os.PathLike) -> Config:
     if not universe.fields:
         raise ValueError("universe.fields must not be empty")
 
-    # lags
-    sec = _section(raw, "lags", {"D", "W", "class", "ticker"})
-    lags_kwargs: dict[str, Any] = {}
-    for k in ("D", "W"):
-        if k in sec:
-            _check_type(sec[k], (int,), f"lags.{k}")
-            if sec[k] < 0:
-                raise ValueError(f"lags.{k} must be >= 0")
-            lags_kwargs[k] = sec[k]
+    # lags (availability input: required, no frequency defaults)
+    sec = _section(raw, "lags", {"chain", "class", "ticker"}, {"chain"})
+    _check_type(sec["chain"], (int,), "lags.chain")
+    if sec["chain"] < 0:
+        raise ValueError("lags.chain must be >= 0")
+    lags_kwargs: dict[str, Any] = {"chain": sec["chain"]}
     if "class" in sec:
         lags_kwargs["class_"] = _int_map(sec["class"], "lags.class")
         for key in lags_kwargs["class_"]:
@@ -271,16 +278,23 @@ def load_config(path: str | os.PathLike) -> Config:
         lags_kwargs["ticker"] = _int_map(sec["ticker"], "lags.ticker")
     lags = LagsConfig(**lags_kwargs)
 
+    # position
+    sec = _section(raw, "position", {"buffer"})
+    position = _fill(PositionConfig, sec, "position", {"buffer": (int, float)})
+    if position.buffer < 0:
+        raise ValueError("position.buffer must be >= 0")
+
     # signals / stats / verdict
     sec = _section(raw, "signals", {"std_window", "clip", "vol_halflife"})
     signals = _fill(SignalsConfig, sec, "signals",
                     {"std_window": (int,), "clip": (int, float), "vol_halflife": (int,)})
     sec = _section(raw, "stats", {"hac_lags", "min_obs", "n_boot", "min_shift", "seed"})
     stats = _fill(StatsConfig, sec, "stats", {k: (int,) for k in sec})
-    sec = _section(raw, "verdict", {"z_pass", "z_weak", "dedupe_corr", "extra_lag_t_min"})
+    sec = _section(raw, "verdict", {"z_pass", "z_weak", "dedupe_corr", "extra_lag_t_min", "obs_min_retention",
+                                    "year_hit_min"})
     verdict = _fill(VerdictConfig, sec, "verdict", {k: (int, float) for k in sec})
     if not verdict.z_pass > verdict.z_weak > 0:
         raise ValueError("verdict requires z_pass > z_weak > 0")
 
     return Config(target=target, databank=databank, sample=sample, universe=universe,
-                  lags=lags, signals=signals, stats=stats, verdict=verdict)
+                  lags=lags, position=position, signals=signals, stats=stats, verdict=verdict)

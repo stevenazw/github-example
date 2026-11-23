@@ -12,8 +12,8 @@ import pandas as pd
 import pytest
 
 from tsminer.config import LagsConfig, load_config
-from tsminer.databank import (STALE_LIMIT, align_to_calendar, infer_freq, infer_kind,
-                              resolve_lag)
+from tsminer.databank import (META_COLUMNS, STALE_LIMIT, align_to_calendar, infer_freq, infer_kind,
+                              resolve_lag, resolve_lag_rule)
 
 CONFIGS = ROOT / "configs"
 
@@ -127,12 +127,18 @@ def test_infer_kind():
     assert infer_kind("contracts", "index_level") == "price"
 
 
-def test_resolve_lag_priority():
-    lags = LagsConfig(D=1, W=6, class_={"Positioning/CFTC_COT": 4}, ticker={"ABC Index": 9})
-    assert resolve_lag("ABC Index", "Positioning", "CFTC_COT", "W", lags) == 9     # ticker wins
-    assert resolve_lag("XYZ Index", "Positioning", "CFTC_COT", "W", lags) == 4     # then class
-    assert resolve_lag("XYZ Index", "Market_Data", "VOL", "W", lags) == 6          # then freq default
-    assert resolve_lag("XYZ Index", "Market_Data", "VOL", "D", lags) == 1
+def test_resolve_lag_priority_and_none():
+    lags = LagsConfig(chain=1, class_={"Positioning/CFTC_COT": 4}, ticker={"ABC Index": 9})
+    assert resolve_lag("ABC Index", "Positioning", "CFTC_COT", lags) == 9     # ticker wins
+    assert resolve_lag("XYZ Index", "Positioning", "CFTC_COT", lags) == 4     # then class
+    assert resolve_lag("XYZ Index", "Market_Data", "VOL", lags) is None       # no rule -> None, no default
+    assert resolve_lag("XYZ Index", "Positioning", "Other", lags) is None
+    assert resolve_lag_rule("ABC Index", "Positioning", "CFTC_COT", lags) == (9, "ticker:ABC Index")
+    assert resolve_lag_rule("XYZ Index", "Positioning", "CFTC_COT", lags) == (4, "class:Positioning/CFTC_COT")
+    assert resolve_lag_rule("XYZ Index", "Market_Data", "VOL", lags) is None
+    # a plain dict is accepted as well
+    assert resolve_lag("T", "A", "B", {"chain": 1, "class": {"A/B": 3}, "ticker": {}}) == 3
+    assert resolve_lag("T", "A", "C", {"chain": 1}) is None
 
 
 # ------------------------------------------------------------------ load_config
@@ -148,6 +154,9 @@ name = "T"
 kind = "futures_chain"
 root = "TY"
 cost_per_side = 0.0001
+
+[lags]
+chain = 1
 """
 
 
@@ -156,16 +165,75 @@ def test_load_shipped_configs(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     assert cfg.target.name.lower() == name
     assert cfg.universe.select and cfg.universe.spread
+    assert cfg.lags.chain == 1
     assert cfg.lags.class_["Positioning/CFTC_COT"] == 4
+    assert cfg.lags.ticker["NFCIINDX Index"] == 6
     d = cfg.to_dict()
-    assert d["lags"]["class"]["FED/Primary_Dealer"] == 8
+    assert d["lags"]["class"]["FED/Primary_Dealer"] == 8 and d["lags"]["chain"] == 1
     json.dumps(d)                                       # must be JSON serialisable
-    assert load_config(CONFIGS / "eurusd.toml").sample.holdout_frac == 0.3
+    assert (cfg.sample.is_frac, cfg.sample.obs_frac) == (0.70, 0.15)
+    assert cfg.position.buffer == 0.5
+    assert (cfg.verdict.obs_min_retention, cfg.verdict.year_hit_min) == (0.5, 0.6)
+
+
+@pytest.mark.parametrize("name", ["ty", "eurusd"])
+def test_shipped_configs_availability_table_and_universe(name):
+    cfg = load_config(CONFIGS / f"{name}.toml")
+    assert cfg.lags.class_["Market_Data/Government_Bond"] == 1 and cfg.lags.class_["Macro/US"] == 1
+    assert cfg.lags.class_["FED/Balance_Sheet"] == 2
+    sel = {(e.get("class_two"), str(e.get("class_three"))): e for e in cfg.universe.select}
+    for e in cfg.universe.select:
+        assert "MM_Future" not in e.get("class_three", []) and "Commodity_Future" not in e.get("class_three", [])
+        if e.get("class_two") == "Commodity":
+            assert e["class_three"] == ["Commodity_Index", "Spot"]
+    assert any(e.get("class_two") == "Commodity" for e in cfg.universe.select)
 
 
 def test_minimal_config_defaults(tmp_path):
     cfg = load_config(_write(tmp_path, MINIMAL))
-    assert cfg.stats.seed == 20261122 and cfg.lags.W == 6 and cfg.verdict.dedupe_corr == 0.7 and cfg.stats.min_obs == 250
+    assert cfg.stats.seed == 20261122 and cfg.verdict.dedupe_corr == 0.7 and cfg.stats.min_obs == 250
+    assert cfg.lags.chain == 1 and cfg.lags.class_ == {} and cfg.lags.ticker == {}
+    assert (cfg.sample.is_frac, cfg.sample.obs_frac) == (0.70, 0.15) and cfg.position.buffer == 0.5
+    assert (cfg.verdict.obs_min_retention, cfg.verdict.year_hit_min) == (0.5, 0.6)
+
+
+def test_lags_section_is_an_input(tmp_path):
+    base = MINIMAL.split("[lags]")[0]
+    for bad in ("D = 1", "W = 6", "frequency_default = 1"):       # frequency defaults no longer exist
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, base + f"[lags]\nchain = 1\n{bad}\n"))
+    with pytest.raises(ValueError):
+        load_config(_write(tmp_path, base + "[lags]\n[lags.class]\n\"A/B\" = 1\n"))    # chain missing
+    with pytest.raises(ValueError):
+        load_config(_write(tmp_path, base))                                                  # no [lags] at all
+    with pytest.raises(ValueError):
+        load_config(_write(tmp_path, base + "[lags]\nchain = -1\n"))
+    with pytest.raises(ValueError):
+        load_config(_write(tmp_path, base + '[lags]\nchain = 1\n[lags.class]\n"bad" = 1\n'))
+    ok = load_config(_write(tmp_path, base + '[lags]\nchain = 2\n[lags.class]\n"A/B" = 3\n[lags.ticker]\n"X" = 0\n'))
+    assert ok.lags.chain == 2 and ok.lags.class_ == {"A/B": 3} and ok.lags.ticker == {"X": 0}
+
+
+OLD_KEY = "hold" + "out_frac"        # the removed two-segment key must now be rejected as unknown
+
+
+def test_sample_fractions(tmp_path):
+    s = lambda body: load_config(_write(tmp_path, MINIMAL + f"\n[sample]\n{body}\n"))
+    assert s("is_frac = 0.6\nobs_frac = 0.2").sample.obs_frac == 0.2
+    for bad in ("is_frac = 0.8\nobs_frac = 0.2", "is_frac = 0.9\nobs_frac = 0.3", "is_frac = 0\nobs_frac = 0.2",
+                "is_frac = 0.7\nobs_frac = 0", "is_frac = -0.1", OLD_KEY + " = 0.2", "is_frac = 0.7\n" + OLD_KEY + " = 0.2",
+                'is_frac = "x"'):
+        with pytest.raises(ValueError):
+            s(bad)
+
+
+def test_position_and_verdict_new_keys(tmp_path):
+    assert load_config(_write(tmp_path, MINIMAL + "\n[position]\nbuffer = 0\n")).position.buffer == 0
+    for bad in ("buffer = -0.1", 'buffer = "x"', "size = 1"):
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, MINIMAL + f"\n[position]\n{bad}\n"))
+    v = load_config(_write(tmp_path, MINIMAL + "\n[verdict]\nobs_min_retention = 0.3\nyear_hit_min = 0.5\n")).verdict
+    assert (v.obs_min_retention, v.year_hit_min) == (0.3, 0.5)
 
 
 def test_verdict_fields(tmp_path):
@@ -189,13 +257,13 @@ def test_shipped_configs_verdict_fields(name):
 
 def test_missing_required(tmp_path):
     with pytest.raises(ValueError):
-        load_config(_write(tmp_path, '[sample]\nholdout_frac = 0.2\n'))            # no [target]
+        load_config(_write(tmp_path, '[sample]\nis_frac = 0.7\n'))                # no [target]
     with pytest.raises(ValueError):
-        load_config(_write(tmp_path, '[target]\nname = "T"\nkind = "spot"\n'))     # no cost_per_side
+        load_config(_write(tmp_path, '[target]\nname = "T"\nkind = "spot"\n[lags]\nchain = 1\n'))     # no cost_per_side
     with pytest.raises(ValueError):
-        load_config(_write(tmp_path, '[target]\nname="T"\nkind="futures_chain"\ncost_per_side=0.1\n'))  # no root
+        load_config(_write(tmp_path, '[target]\nname="T"\nkind="futures_chain"\ncost_per_side=0.1\n[lags]\nchain=1\n'))  # no root
     with pytest.raises(ValueError):
-        load_config(_write(tmp_path, '[target]\nname="T"\nkind="spot"\ncost_per_side=0.1\n'))  # no ticker/field
+        load_config(_write(tmp_path, '[target]\nname="T"\nkind="spot"\ncost_per_side=0.1\n[lags]\nchain=1\n'))  # no ticker/field
 
 
 def test_unknown_section_and_key(tmp_path):
@@ -236,7 +304,7 @@ def test_env_override(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------ integration
-def test_build_panel_ty_integration():
+def _db_cfg():
     cfg = load_config(CONFIGS / "ty.toml")
     cur = Path(cfg.databank.cache_dir) / "current.json"
     if not cur.exists() or not Path(cfg.databank.toolkit_dir).exists():
@@ -244,14 +312,35 @@ def test_build_panel_ty_integration():
     db = json.loads(cur.read_text()).get("database_path", "")
     if not os.path.exists(db):
         pytest.skip("databank file not available")
+    return cfg, db
+
+
+def test_build_panel_ty_integration():
+    cfg, db = _db_cfg()
     from tsminer.databank import build_panel
 
     panel = build_panel(cfg)
     assert panel.X.index.equals(panel.target.index)
     assert list(panel.meta.index) == list(panel.X.columns)
+    assert list(panel.meta.columns) == META_COLUMNS and "lag_rule" in panel.meta.columns
     assert "chain:TY" in panel.X.columns
     assert panel.X.columns.is_unique
     assert set(panel.meta["lag"]) <= {1, 2, 4, 6, 8}
+    assert panel.meta["lag_rule"].notna().all() and (panel.meta["lag_rule"] != "").all()
+    assert panel.meta.loc["chain:TY", "lag_rule"] == "chain"
+    # every non-chain, non-spread series reports the rule it actually hit, consistent with its lag
+    for sid, r in panel.meta.iterrows():
+        if r["group"] in ("Chain", "Carry"):
+            assert r["lag_rule"] == "chain" and r["lag"] == cfg.lags.chain
+        elif r["group"] == "Spread":
+            legs = r["lag_rule"].split("+")
+            assert len(legs) == 2
+        elif r["lag_rule"].startswith("ticker:"):
+            assert r["lag"] == cfg.lags.ticker[r["lag_rule"][len("ticker:"):]]
+        else:
+            assert r["lag_rule"].startswith("class:") and r["lag"] == cfg.lags.class_[r["lag_rule"][len("class:"):]]
+    # near-month continuous contracts are out of the pool
+    assert not any(isinstance(t, str) and "MM_Future" in t for t in panel.meta["group"])
 
     # lag semantics on real data: X["chain:TY"][t] == TY return_index at calendar row t-1
     sys.path.insert(0, cfg.databank.toolkit_dir)
@@ -264,3 +353,41 @@ def test_build_panel_ty_integration():
     for t in [1, 2, 50, 1000, 3000, len(x) - 1]:
         assert x.iloc[t] == pytest.approx(ri.loc[panel.X.index[t - 1]])
     assert np.isnan(x.iloc[0])
+
+
+def test_build_panel_rejects_series_without_availability_rule():
+    """Remove the class rule of VOL: no VOL series may enter X; they are listed as no_availability_rule."""
+    import dataclasses
+
+    cfg, db = _db_cfg()
+    from tsminer.databank import build_panel
+
+    sys.path.insert(0, cfg.databank.toolkit_dir)
+    from data_query import DataQuery
+    q = DataQuery(db_path=db)
+    vol = {s["ticker"] for s in q.list_securities(class_one="Market_Data", class_two="VOL")}
+    assert vol
+
+    class_ = {k: v for k, v in cfg.lags.class_.items() if k != "Market_Data/VOL"}
+    assert len(class_) == len(cfg.lags.class_) - 1
+    cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_))
+    panel = build_panel(cfg2)
+    assert not (vol & set(panel.X.columns))
+    assert not (panel.meta["group"] == "VOL").any()
+    rej = panel.excluded[panel.excluded["reason"] == "no_availability_rule"]
+    assert len(rej) > 0 and set(rej["ticker"]) & vol
+    assert not (set(rej["ticker"]) & set(panel.X.columns))        # rejected series are not in X
+    assert not any(r.startswith("class:Market_Data/VOL") for r in panel.meta["lag_rule"])
+    assert panel.excluded.groupby("ticker").size().max() == 1
+
+
+def test_build_panel_spread_leg_without_rule_raises():
+    import dataclasses
+
+    cfg, db = _db_cfg()
+    from tsminer.databank import build_panel
+
+    class_ = {k: v for k, v in cfg.lags.class_.items() if k != "Market_Data/Government_Bond"}
+    cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_))
+    with pytest.raises(ValueError, match="availability"):
+        build_panel(cfg2)

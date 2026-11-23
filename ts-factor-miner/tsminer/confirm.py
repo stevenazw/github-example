@@ -1,4 +1,4 @@
-"""One-shot holdout confirmation. The only code path that opens the holdout segment."""
+"""One-shot out-of-sample confirmation. The only code path that opens the OOS segment."""
 from __future__ import annotations
 
 import json
@@ -14,17 +14,22 @@ from .pipeline import _jsonable, backtest, prepare
 from .report import append_confirm
 from .stats import hac_t, norm_sf
 
-HOLDOUT_MIN_OBS = 60
+OOS_MIN_OBS = 60
+P_CONFIRMED = 0.10
 
 
-class HoldoutLockedError(RuntimeError):
-    """The holdout of this run was already opened."""
+class OosLockedError(RuntimeError):
+    """The OOS of this run was already opened."""
 
 
-def _verdict(p, p_ok=0.05, p_weak=0.10) -> str:
-    if not np.isfinite(p):
+def _verdict(t_signed, p_one, ic_oos_signed, retention_oos, min_retention) -> str:
+    if not np.isfinite(t_signed):
         return "INSUFFICIENT"
-    return "CONFIRMED" if p <= p_ok else "WEAK" if p <= p_weak else "NOT_CONFIRMED"
+    if p_one <= P_CONFIRMED:
+        return "CONFIRMED"
+    if ic_oos_signed > 0 and retention_oos >= min_retention:
+        return "CONSISTENT"
+    return "FAILED"
 
 
 def confirm(run_dir, force_reason=None) -> dict:
@@ -32,7 +37,7 @@ def confirm(run_dir, force_reason=None) -> dict:
     lock = d / "confirm.lock"
     locked = lock.exists()
     if locked and not force_reason:
-        raise HoldoutLockedError(f"holdout already opened for {d} (see {lock}); use --force REASON to override")
+        raise OosLockedError(f"OOS already opened for {d} (see {lock}); use --force REASON to override")
     if force_reason:
         with open(d / "confirm_log.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "reason": force_reason},
@@ -46,7 +51,7 @@ def confirm(run_dir, force_reason=None) -> dict:
     panel = Panel.load(d / "panel")
     prep = prepare(panel, cfg)
     S, y_fwd, sigma, rows = prep["S"], prep["y_fwd"], prep["sigma"], prep["rows"]
-    ho_mask = prep["holdout_mask"]
+    oos_mask = prep["oos_mask"]
     cal = panel.target.index
     y = y_fwd.to_numpy(dtype=float)[rows]
     sig = sigma.to_numpy(dtype=float)[rows]
@@ -54,29 +59,36 @@ def confirm(run_dir, force_reason=None) -> dict:
     col_of = {c: i for i, c in enumerate(S.columns)}
     hl = cfg.stats.hac_lags
     cost = cfg.target.cost_per_side
+    buf = cfg.position.buffer
+    min_ret = cfg.verdict.obs_min_retention
 
     out_rows = []
     for _, r in short.iterrows():
         j = col_of[r["id"]]
-        m = ho_mask[:, j]
-        s, yh = S_np[m, j], y[m]
-        t_hold, ic, n = hac_t(s[:, None], yh, hl, HOLDOUT_MIN_OBS)
+        m = oos_mask[:, j]
+        s, yo = S_np[m, j], y[m]
+        t_oos, ic_oos, n = hac_t(s[:, None], yo, hl, OOS_MIN_OBS)
         sign = float(r["sign"])
-        t_signed = sign * t_hold[0]
+        t_signed = sign * t_oos[0]
+        ic_signed = sign * ic_oos[0]
+        retention = ic_signed / abs(float(r["ic"]))
         p_one = float(norm_sf(t_signed))
-        bt = backtest(s, yh, sig[m], sign, cost)
+        bt = backtest(s, yo, sig[m], sign, cost, buf)
         pos = rows[np.flatnonzero(m)]
-        out_rows.append({"id": r["id"], "sign_train": int(sign),
-                         "holdout_start": str(cal[pos[0]].date()) if len(pos) else "",
-                         "holdout_end": str(cal[pos[-1]].date()) if len(pos) else "",
-                         "n": int(n[0]), "t_hold": t_hold[0], "t_signed": t_signed, "ic": ic[0], "p_one": p_one,
-                         "verdict": _verdict(p_one), "sharpe_gross": bt["sharpe_gross"],
-                         "sharpe_net": bt["sharpe_net"]})
+        out_rows.append({"id": r["id"], "sign": int(sign), "n": int(n[0]),
+                         "oos_start": str(cal[pos[0]].date()) if len(pos) else "",
+                         "oos_end": str(cal[pos[-1]].date()) if len(pos) else "",
+                         "t_signed": t_signed, "ic_oos_signed": ic_signed, "retention_oos": retention,
+                         "p_one": p_one, "verdict": _verdict(t_signed, p_one, ic_signed, retention, min_ret),
+                         "sharpe_gross": bt["sharpe_gross"], "sharpe_net": bt["sharpe_net"]})
     df = pd.DataFrame(out_rows)
 
+    vc = df["verdict"].value_counts()
     out = _jsonable({
         "status": "DONE", "forced": bool(locked and force_reason), "force_reason": force_reason,
-        "n_tested": int(np.isfinite(df["t_signed"]).sum()), "n_confirmed": int((df["verdict"] == "CONFIRMED").sum()),
+        "n_tested": int(np.isfinite(df["t_signed"]).sum()), "n_confirmed": int(vc.get("CONFIRMED", 0)),
+        "n_consistent": int(vc.get("CONSISTENT", 0)), "n_failed": int(vc.get("FAILED", 0)),
+        "n_insufficient": int(vc.get("INSUFFICIENT", 0)),
         "candidates": df.to_dict(orient="records"), "opened_at": datetime.now(timezone.utc).isoformat(),
     })
     df.to_csv(d / "confirm.csv", index=False)
