@@ -89,21 +89,23 @@ b = "CESIEUR Index"
 
 [lags]
 # 可得性(availability)是【输入】, 由研究者确认, 系统不猜测、不套默认值: 没有规则的序列会被拒收(no_availability_rule)。
+# 这些规则由研究者于 2026-11-23 确认: 行情数据与期货连续合约不滞后; 隐含波动率滞后 1 天;
+# ETF 资金流应滞后 1 天(当前候选池未包含资金流字段, 加入时需为其单独设规则); 其余类别沿用起草值。
 # 数值含义: t 日收盘的信号只能用日期 <= t-lag 的观测。
 # 优先级: [lags.ticker] 精确 ticker > [lags.class] 的 "class_one/class_two"。
-chain = 1      # 期货链 chain:* 与 carry:* 的滞后
+chain = 0      # 期货连续合约: 不滞后
 
 [lags.class]
-"Market_Data/Government_Bond" = 1
-"Market_Data/Money_Market" = 1
-"Market_Data/Swap_OIS" = 1
+"Market_Data/Government_Bond" = 0
+"Market_Data/Money_Market" = 0
+"Market_Data/Swap_OIS" = 0
 "Market_Data/VOL" = 1
-"Market_Data/Commodity" = 1
-"Market_Data/Equity" = 1
-"Market_Data/Inflation_Linked" = 1
-"Market_Data/Credit" = 1
-"Market_Data/MBS" = 1
-"Market_Data/FX" = 1
+"Market_Data/Commodity" = 0
+"Market_Data/Equity" = 0
+"Market_Data/Inflation_Linked" = 0
+"Market_Data/Credit" = 0
+"Market_Data/MBS" = 0
+"Market_Data/FX" = 0
 "Macro/Global" = 1
 "Macro/US" = 1
 "Positioning/CFTC_COT" = 4     # 周二数据、周五 15:30 ET 发布 -> 下周一可用

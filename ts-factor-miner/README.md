@@ -51,17 +51,18 @@ databank.py        transforms.py      stats.py            pipeline.py           
 - 利差序列的两条腿各自对齐、滞后后再相减，滞后取两腿较大者；任一条腿没有可得性规则则 `build_panel` 直接报错（配置错误显性失败）。
 - `Panel.meta` 的 `lag_rule` 列记录每条序列实际命中的规则键（`ticker:<ticker>`、`class:<class_one/class_two>`、`chain`；利差写两条腿的规则并用 `+` 连接）。
 
-`configs/ty.toml` 的取值：
+`configs/ty.toml` 的取值（`configs/eurusd.toml` 相同）。这些数值是研究者于 2026-11-23 确认的输入，不是系统推断：行情数据与期货连续合约不滞后，隐含波动率滞后 1 天；ETF 资金流应滞后 1 天（当前候选池未包含资金流字段，加入时需为其单独设规则）；其余类别沿用起草值。
 
 | 序列类型 | lag | 依据 |
 |---|---|---|
-| `Market_Data/*`（债券、货币市场、互换/OIS、波动率、商品、股票、通胀挂钩、信用、MBS、外汇） | 1 | 日频，保守：不假设 x 的取值时刻早于标的收盘 |
-| `Macro/Global`、`Macro/US` | 1 | 同上 |
+| `Market_Data/*`（债券、货币市场、互换/OIS、商品、股票、通胀挂钩、信用、MBS、外汇） | 0 | 行情数据，研究者确认不滞后 |
+| `Market_Data/VOL`（衍生品隐含波动率） | 1 | 研究者确认滞后 1 天 |
+| `Macro/Global`、`Macro/US` | 1 | 宏观日频指数，保持 1（研究者未改） |
 | CFTC 持仓 (`Positioning/CFTC_COT`) | 4 | 周二数据，周五盘后发布，下周一可用 |
 | Fed 资产负债表 (`FED/Balance_Sheet`) | 2 | 周三数据，周四发布，周五可用 |
 | 一级交易商 (`FED/Primary_Dealer`) | 8 | 周三数据，下周四发布，保守取 8 |
 | `NFCIINDX Index`（ticker 规则） | 6 | 周频发布 |
-| 期货链 `chain`、`carry` | 1 | 同日频 |
+| 期货连续合约 `chain`、`carry` | 0 | 研究者确认不滞后 |
 
 另外：不是日频也不是周频的序列被剔除（原因 `freq_not_daily_or_weekly`）；对齐后有限值少于 250 个的序列被剔除（`too_few_obs`）。`kind` 由数据库的 unit/data_type 推断：price 类取对数差，其余（level）取差分。近月连续合约（`MM_Future`、`Commodity_Future`）的换月跳空无法在现有数据上修正，已移出候选池。
 

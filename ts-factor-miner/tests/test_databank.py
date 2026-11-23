@@ -165,11 +165,11 @@ def test_load_shipped_configs(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     assert cfg.target.name.lower() == name
     assert cfg.universe.select and cfg.universe.spread
-    assert cfg.lags.chain == 1
+    assert cfg.lags.chain >= 0
     assert cfg.lags.class_["Positioning/CFTC_COT"] == 4
     assert cfg.lags.ticker["NFCIINDX Index"] == 6
     d = cfg.to_dict()
-    assert d["lags"]["class"]["FED/Primary_Dealer"] == 8 and d["lags"]["chain"] == 1
+    assert d["lags"]["class"]["FED/Primary_Dealer"] == 8 and d["lags"]["chain"] == cfg.lags.chain
     json.dumps(d)                                       # must be JSON serialisable
     assert (cfg.sample.is_frac, cfg.sample.obs_frac) == (0.70, 0.15)
     assert cfg.position.buffer == 0.5
@@ -179,7 +179,8 @@ def test_load_shipped_configs(name):
 @pytest.mark.parametrize("name", ["ty", "eurusd"])
 def test_shipped_configs_availability_table_and_universe(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
-    assert cfg.lags.class_["Market_Data/Government_Bond"] == 1 and cfg.lags.class_["Macro/US"] == 1
+    assert cfg.lags.class_["Market_Data/Government_Bond"] == 0 and cfg.lags.class_["Market_Data/VOL"] == 1
+    assert cfg.lags.class_["Macro/US"] == 1
     assert cfg.lags.class_["FED/Balance_Sheet"] == 2
     sel = {(e.get("class_two"), str(e.get("class_three"))): e for e in cfg.universe.select}
     for e in cfg.universe.select:
@@ -325,7 +326,8 @@ def test_build_panel_ty_integration():
     assert list(panel.meta.columns) == META_COLUMNS and "lag_rule" in panel.meta.columns
     assert "chain:TY" in panel.X.columns
     assert panel.X.columns.is_unique
-    assert set(panel.meta["lag"]) <= {1, 2, 4, 6, 8}
+    allowed = {cfg.lags.chain, *cfg.lags.class_.values(), *cfg.lags.ticker.values()}
+    assert set(panel.meta["lag"]) <= allowed
     assert panel.meta["lag_rule"].notna().all() and (panel.meta["lag_rule"] != "").all()
     assert panel.meta.loc["chain:TY", "lag_rule"] == "chain"
     # every non-chain, non-spread series reports the rule it actually hit, consistent with its lag
@@ -342,7 +344,8 @@ def test_build_panel_ty_integration():
     # near-month continuous contracts are out of the pool
     assert not any(isinstance(t, str) and "MM_Future" in t for t in panel.meta["group"])
 
-    # lag semantics on real data: X["chain:TY"][t] == TY return_index at calendar row t-1
+    # lag semantics on real data: X["chain:TY"][t] == TY return_index at calendar row t-lag (lag from the config)
+    lag = cfg.lags.chain
     sys.path.insert(0, cfg.databank.toolkit_dir)
     from data_query import DataQuery
     q = DataQuery(db_path=db)
@@ -350,9 +353,9 @@ def test_build_panel_ty_integration():
     ch = ch[ch["return_valid"] == 1]
     ri = pd.Series(ch["return_index"].to_numpy(), index=pd.to_datetime(ch["trade_date"]))
     x = panel.X["chain:TY"]
-    for t in [1, 2, 50, 1000, 3000, len(x) - 1]:
-        assert x.iloc[t] == pytest.approx(ri.loc[panel.X.index[t - 1]])
-    assert np.isnan(x.iloc[0])
+    for t in [lag, lag + 1, lag + 2, 50, 1000, 3000, len(x) - 1]:
+        assert x.iloc[t] == pytest.approx(ri.loc[panel.X.index[t - lag]])
+    assert x.iloc[:lag].isna().all()
 
 
 def test_build_panel_rejects_series_without_availability_rule():
