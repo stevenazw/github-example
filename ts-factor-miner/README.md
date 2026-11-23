@@ -246,3 +246,25 @@ python -m pytest -q
 - **零分布标准差**：`test_null_sd_*`，以及 HAC t 的朴素对照与零假设校准。
 
 集成测试 `test_build_panel_ty_integration` 等需要本地数据库，数据库不存在时会 skip。
+
+## 9. 因子跟踪看板（`site`）
+
+```bash
+python -m tsminer site runs/ty-v5 runs/eurusd-v5 --out site-out
+python -m http.server -d site-out        # 本地打开 index.html
+```
+
+每个 run 目录对应一个资产（两个 run 的 target 同名则报错退出，退出码 1）。该命令只读 run 目录，不运行 `mine` 或 `confirm`。
+
+输出文件：
+
+| 文件 | 内容 |
+|---|---|
+| `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个资产 `#<slug>`） |
+| `artifact.html` | 同一模板生成的片段版（无 doctype / html / head / body 标签），用于发布到托管环境 |
+| `data/<slug>.json` | 每个资产一份（slug = target 小写），页面按需 `fetch`：shortlist 因子的净值、分段统计、公式、方向、样本外结论 |
+
+**净值定义。** 对每个 shortlist 因子，取其有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
+
+**样本外何时显示。** 只有 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值并附 `confirm.csv` 的样本外结论。否则不读取、不计算、不输出任何样本外行，净值只到观察期末，页面标为"样本外未打开"。
+
