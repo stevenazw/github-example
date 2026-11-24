@@ -120,9 +120,14 @@ def mining_rows(dates: pd.DatetimeIndex, i: int, window_years: int) -> tuple[int
 
 
 # ------------------------------------------------------------- window stats
+def entry_threshold(rcfg: RollingConfig, vd) -> float:
+    """|z| a NEW factor needs: ``rolling.entry_z``, by default the run configs' ``verdict.z_weak``."""
+    return vd.z_weak if rcfg.entry_z is None else rcfg.entry_z
+
+
 def window_stats(pool, lo, hi, rcfg: RollingConfig, prefilter=False) -> dict:
     """``mine`` step 1 on mining rows lo..hi: eligibility, t, ic, null sd, z, sign and the window net Sharpe of
-    every eligible candidate with |z| >= z_weak. Arrays over the pool's N columns; NaN where not available."""
+    every eligible candidate with |z| >= min(z_weak, entry threshold). Arrays over the pool's N columns; NaN where not available."""
     cfg = pool["cfg"]
     st, vd = cfg.stats, cfg.verdict
     Sw, yw, sg = pool["S"][lo:hi + 1], pool["y"][lo:hi + 1], pool["sig"][lo:hi + 1]
@@ -146,7 +151,8 @@ def window_stats(pool, lo, hi, rcfg: RollingConfig, prefilter=False) -> dict:
         ok = np.isfinite(out["t"]) & np.isfinite(out["null_sd"]) & (out["null_sd"] > 0)
         out["z"][ok] = out["t"][ok] / out["null_sd"][ok]
         out["sign"][ok] = np.sign(out["ic"][ok])
-        for j in np.flatnonzero(ok & (np.abs(out["z"]) >= vd.z_weak)):
+        # the net Sharpe is needed wherever the entry rule can pass: |z| >= entry threshold (z_weak by default)
+        for j in np.flatnonzero(ok & (np.abs(out["z"]) >= min(vd.z_weak, entry_threshold(rcfg, vd)))):
             m = fin[:, j]
             out["sharpe_net"][j] = backtest(Sw[m, j], yw[m], sg[m], float(out["sign"][j]), cfg.target.cost_per_side,
                                             cfg.position.buffer)["sharpe_net"]
@@ -210,13 +216,37 @@ def group_weights(groups, cap) -> np.ndarray:
     return (gw / cnt)[inv]
 
 
-def select(stat, prev: dict, Sw, ids, rcfg: RollingConfig, vd) -> dict:
+def entry_mask(stat, rcfg: RollingConfig, vd) -> np.ndarray:
+    """The raw entry rule of one date: |z| >= entry threshold and window net Sharpe > is_min_net_sharpe (before
+    seasoning, de-duplication and incumbency)."""
+    az = np.abs(stat["z"])
+    return (np.isfinite(az) & (az >= entry_threshold(rcfg, vd)) & np.isfinite(stat["sharpe_net"]) &
+            (stat["sharpe_net"] > vd.is_min_net_sharpe))
+
+
+def seasoned_mask(stat, entry, history: list, confirm: int) -> np.ndarray:
+    """Candidates whose entry rule passed at each of the previous ``confirm - 1`` consecutive re-mining dates with
+    the sign they have now. ``history`` = the raw signed entry vectors (sign where the entry rule passed, else 0)
+    of the earlier dates of the same spec, oldest first. Fewer than ``confirm - 1`` earlier dates: nobody."""
+    if confirm <= 1:
+        return np.ones(len(entry), dtype=bool)
+    if len(history) < confirm - 1:
+        return np.zeros(len(entry), dtype=bool)
+    ok = entry.copy()
+    for h in history[len(history) - (confirm - 1):]:
+        ok &= (h == stat["sign"])          # h is 0 where the rule failed, sign is +-1 where it passed
+    return ok
+
+
+def select(stat, prev: dict, Sw, ids, rcfg: RollingConfig, vd, history: list | None = None) -> dict:
     """The held set at one re-mining date. ``prev`` = {column: sign} of the previous holding; ``Sw`` the mining
-    rows of the pool. Returns held {column: status "new" | "stay"} (cluster representatives only) and the
-    bookkeeping of the step: exits (column -> reason, detail), counts."""
+    rows of the pool; ``history`` the raw signed entry vectors of the earlier dates (seasoning, see
+    ``seasoned_mask``; only used when ``rcfg.confirm_periods > 1``). Returns held {column: status "new" | "stay"}
+    (cluster representatives only) and the bookkeeping of the step: exits (column -> reason, detail), counts."""
     z, sign, az = stat["z"], stat["sign"], np.abs(stat["z"])
     tested = np.isfinite(z)
-    entry = tested & (az >= vd.z_weak) & np.isfinite(stat["sharpe_net"]) & (stat["sharpe_net"] > vd.is_min_net_sharpe)
+    entry = entry_mask(stat, rcfg, vd)
+    seasoned = seasoned_mask(stat, entry, history or [], rcfg.confirm_periods)
     exits, stay = {}, []
     for j, s in prev.items():
         if not tested[j]:
@@ -228,7 +258,8 @@ def select(stat, prev: dict, Sw, ids, rcfg: RollingConfig, vd) -> dict:
         else:
             stay.append(j)
     # a failed incumbent is not a new entrant at this date: it may re-enter only at a LATER date, via the entry rule
-    new = [j for j in np.flatnonzero(entry) if j not in prev]
+    new = [j for j in np.flatnonzero(entry & seasoned) if j not in prev]
+    n_unseasoned = sum(1 for j in np.flatnonzero(entry & ~seasoned) if j not in prev)
     by_z = lambda js: sorted(js, key=lambda j: (-az[j], j))
     order = by_z(stay) + by_z(new)
     held = {}
@@ -241,7 +272,7 @@ def select(stat, prev: dict, Sw, ids, rcfg: RollingConfig, vd) -> dict:
             elif j in prev:
                 exits[j] = ("dedupe", f"absorbed_by={rep[ids[j]]}")
     return {"held": held, "exits": exits, "n_tested": int(tested.sum()), "n_entry": int(entry.sum()),
-            "n_stay": len(stay), "n_new_cand": len(new)}
+            "n_stay": len(stay), "n_new_cand": len(new), "n_unseasoned": n_unseasoned}
 
 
 # ---------------------------------------------------------------- one spec
@@ -264,6 +295,9 @@ def roll_spec(pool, rcfg: RollingConfig, window_years, step_months, cache, prefi
     Ds = remine_rows(dates, rcfg.first_date, step_months, last)
     if not Ds:
         raise ValueError("no re-mining date before the cutoff")
+    f = rcfg.confirm_periods - 1                # nothing can be held before period f (seasoning needs f earlier dates)
+    if f >= len(Ds):
+        raise ValueError(f"confirm_periods={rcfg.confirm_periods} needs more than {len(Ds)} re-mining dates")
     win = [mining_rows(dates, i, window_years) for i in Ds]
     compute_stats(pool, win, rcfg, prefilter, cache=cache)
     pos_cache: dict = {}
@@ -272,12 +306,15 @@ def roll_spec(pool, rcfg: RollingConfig, window_years, step_months, cache, prefi
     periods, members, exits, comp = [], [], [], []
     prev: dict = {}
     spell: dict = {}
+    history: list = []                          # raw signed entry vectors of the earlier dates (seasoning)
     for k, i in enumerate(Ds):
         lo, hi = win[k]
         end = min(Ds[k + 1], last) if k + 1 < len(Ds) else last
         h = slice(i + 1, end + 1)
         stat = cache[(lo, hi)]
-        res = select(stat, prev, S[lo:hi + 1], ids, rcfg, cfg.verdict)
+        res = select(stat, prev, S[lo:hi + 1], ids, rcfg, cfg.verdict, history)
+        history.append(np.where(entry_mask(stat, rcfg, cfg.verdict), stat["sign"], 0.0))
+        del history[:-max(f, 1)]                # only the last confirm_periods - 1 dates are ever read
         held = res["held"]
         js = sorted(held, key=lambda j: (-abs(stat["z"][j]), j))
         sgn = np.array([stat["sign"][j] for j in js])
@@ -302,6 +339,7 @@ def roll_spec(pool, rcfg: RollingConfig, window_years, step_months, cache, prefi
         gw = pd.Series(w).groupby(meta["group"].to_numpy()[js]).sum() if js else pd.Series(dtype=float)
         periods.append({"spec": spec, "period": k, "date": dates[i], "hold_start": dates[i + 1], "hold_end": dates[end],
                         "n_hold_rows": end - i, "n_tested": res["n_tested"], "n_entry_pass": res["n_entry"],
+                        "n_unseasoned": res["n_unseasoned"],
                         "n_incumbents": len(prev), "n_stayed": res["n_stay"], "n_exited": len(res["exits"]),
                         "n_new": sum(v == "new" for v in held.values()), "n_held": len(js), "n_groups": len(gw),
                         "group_weights": json.dumps({g: round(float(v), 4) for g, v in gw.items()}),
@@ -318,14 +356,22 @@ def roll_spec(pool, rcfg: RollingConfig, window_years, step_months, cache, prefi
     per = pd.DataFrame(periods)
     off = 0
     sh = []
-    for n_ in per["n_hold_rows"]:
-        sh.append(_sharpe(net[off:off + n_]))
+    for k, n_ in enumerate(per["n_hold_rows"]):
+        sh.append(_sharpe(net[off:off + n_]) if k >= f else np.nan)      # NaN: structurally flat seasoning period
         off += n_
     per["net_sharpe"] = sh
     per = per.drop(columns="n_hold_rows")
     mem, ex = pd.DataFrame(members), pd.DataFrame(exits)
+    # evaluated span: from the first date at which holding is possible, D_f + 1 (f = confirm_periods - 1). The
+    # seasoning periods 0..f-1 are flat by construction (all-zero position, no costs): they are left out of pnl.csv
+    # and of every summary statistic instead of being averaged in as zeros.
+    n0 = int(sum(len(c) for c in comp[:f]))
+    pnl, hold_rows = pnl.iloc[n0:].reset_index(drop=True), hold_rows[n0:]
+    summ = summarise(pool, per.iloc[f:], mem, pnl, hold_rows, y)
+    summ.update({"confirm_periods": rcfg.confirm_periods, "eval_start_period": f,
+                 "eval_start_date": str(dates[hold_rows[0]].date()), "n_seasoning_periods_excluded": f})
     return {"spec": spec, "window_years": window_years, "step_months": step_months, "periods": per, "members": mem,
-            "exits": ex, "pnl": pnl, "summary": summarise(pool, per, mem, pnl, hold_rows, y)}
+            "exits": ex, "pnl": pnl, "summary": summ}
 
 
 def spells(mem: pd.DataFrame) -> list[tuple[int, bool]]:
@@ -409,11 +455,15 @@ def write_roll_report(out: Path, info: dict, res: list) -> None:
     yr = pd.DataFrame({"年": list(ps["net_sharpe_by_year"]), "净Sharpe": list(ps["net_sharpe_by_year"].values())})
     gw = pd.DataFrame({"group": list(ps["avg_group_weight"]), "平均权重": list(ps["avg_group_weight"].values())})
     pf = info["prefilter_t"]
+    seasoning = (f"确认期(seasoning): 前 {P['confirm_periods'] - 1} 个重挖期不可能持仓, 汇总统计从 {ps['eval_start_date']} 起算"
+                 f"(主规格; 这些空仓期不计入 Sharpe / HAC t / 回撤 / 期均值, 也不写入 pnl.csv)。\n"
+                 if P["confirm_periods"] > 1 else "")
     txt = f"""# 滚动挖掘报告
 
 参数: 窗口 {P['window_years']} 年 / 每 {P['step_months']} 个月重挖 / 首个重挖日 {P['first_date']} / 封存最后 {P['holdout_years']} 年
-(评估截止 {info['cutoff']}) / stay_z={P['stay_z']} / group_cap={P['group_cap']} / coverage={P['coverage']}。
-候选 {info['n_candidates']} 个; 主规格 `{info['primary']}`; 网格里的规格全部列出, 不挑选。
+(评估截止 {info['cutoff']}) / stay_z={P['stay_z']} / group_cap={P['group_cap']} / coverage={P['coverage']} /
+entry_z={'z_weak(取自 run 配置)' if P['entry_z'] is None else P['entry_z']} / confirm_periods={P['confirm_periods']}。
+{seasoning}候选 {info['n_candidates']} 个; 主规格 `{info['primary']}`; 网格里的规格全部列出, 不挑选。
 null_sd 预过滤 (|t| >= {pf['min_t']}): {'启用' if pf['used'] else '未启用'}。
 
 ## 各规格汇总

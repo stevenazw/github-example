@@ -473,3 +473,243 @@ def test_cli_roll_writes_every_output_and_the_grid(cfg_path, tmp_path, capsys):
     assert set(pd.read_csv(out / "pnl.csv")["spec"]) == {"2y6m", "2y12m"}
     assert "滚动挖掘报告" in (out / "report.md").read_text(encoding="utf-8")
     assert main(["roll", str(rc), str(tmp_path / "nope"), "--out", str(out)]) == 1
+
+
+# ------------------------------------------------------------------ 8. entry_z and seasoning (confirm_periods)
+def rc_with(**kw):
+    return RollingConfig(**{**RC.__dict__, **kw})
+
+
+def scripted(pool, script, rcfg):
+    """window_stats replacement: ``script[k]`` = {column: (z, sign, sharpe)} for the k-th re-mining date of the
+    spec (identified by the end of its mining window); every other candidate is untested."""
+    dates = pool["dates"]
+    Ds = remine_rows(dates, rcfg.first_date, 6, len(dates) - 1)
+    by_hi = {mining_rows(dates, i, 2)[1]: k for k, i in enumerate(Ds)}
+    n = pool["S"].shape[1]
+
+    def fake(pool_, lo, hi, rc, prefilter=False):
+        z, sg, sh = (np.full(n, np.nan) for _ in range(3))
+        for j, (zz, ss, hh) in script[by_hi[hi]].items():
+            z[j], sg[j], sh[j] = zz, ss, hh
+        return _stat(z, sg, sh, n)
+    return fake
+
+
+def test_entry_z_raises_the_bar_for_new_factors_only(cfg):
+    rc = rc_with(entry_z=2.5)
+    vd = cfg.verdict
+    assert vd.z_weak <= 2.0 < 2.5                              # the premise of this test
+    Sw = np.random.default_rng(0).normal(size=(300, 5))        # independent columns: no de-duplication
+    ids = [f"c{j}" for j in range(5)]
+    # 0: new, z_weak <= |z| < entry_z, sharpe fine -> not admitted      1: new, |z| >= entry_z -> admitted
+    # 2: new, |z| >= entry_z but sharpe too low -> not admitted          3: incumbent with stay_z <= |z| < entry_z -> stays
+    # 4: incumbent with z_weak <= |z| < entry_z -> stays
+    st = _stat([2.0, -2.6, 3.0, 1.2, 2.2], [1, -1, 1, 1, 1], [0.9, 0.9, 0.1, np.nan, 0.9], 5)
+    r = select(st, {3: 1, 4: 1}, Sw, ids, rc, vd)
+    assert r["held"] == {3: "stay", 4: "stay", 1: "new"}
+    assert r["n_entry"] == 1 and r["n_new_cand"] == 1 and r["n_stay"] == 2
+    ctrl = select(st, {3: 1, 4: 1}, Sw, ids, RC, vd)           # entry_z unset: z_weak decides, as before
+    assert set(ctrl["held"]) == {0, 1, 3, 4} and ctrl["held"][0] == "new"
+
+
+def test_window_sharpe_follows_the_entry_threshold(cfg, regime_pool):
+    pool = regime_pool
+    lo, hi = 700, 1300
+    base = window_stats(pool, lo, hi, RC)
+    hi_rc = window_stats(pool, lo, hi, rc_with(entry_z=2.5))
+    low_rc = window_stats(pool, lo, hi, rc_with(entry_z=1.0))
+    z = np.abs(base["z"])
+    zw = cfg.verdict.z_weak
+    np.testing.assert_array_equal(base["z"], hi_rc["z"])
+    # entry_z >= z_weak: the Sharpe is still computed from z_weak up, so nothing is missing
+    np.testing.assert_array_equal(base["sharpe_net"], hi_rc["sharpe_net"])
+    # entry_z < z_weak: the Sharpe follows it down (entry_z is allowed to be below z_weak)
+    assert (np.isfinite(low_rc["sharpe_net"]) == (z >= min(1.0, zw))).all()
+    assert np.isfinite(low_rc["sharpe_net"]).sum() >= np.isfinite(base["sharpe_net"]).sum()
+
+
+def test_seasoning_mask_needs_consecutive_same_sign_raw_entries():
+    st = {"sign": np.array([1.0, 1.0, -1.0, 1.0, np.nan])}
+    entry = np.array([True, True, True, False, False])
+    h1 = [np.array([1.0, 0.0, 1.0, 1.0, 0.0])]                 # previous date: 0 passed (+), 1 failed, 2 passed (+)
+    np.testing.assert_array_equal(rolling.seasoned_mask(st, entry, h1, 2), [True, False, False, False, False])
+    assert not rolling.seasoned_mask(st, entry, [], 2).any()   # no earlier date: nobody
+    assert rolling.seasoned_mask(st, entry, [], 1).all()
+    h2 = [np.array([1.0, 1.0, -1.0, 1.0, 0.0]), np.array([1.0, 0.0, -1.0, 1.0, 0.0])]
+    np.testing.assert_array_equal(rolling.seasoned_mask(st, entry, h2, 3), [True, False, True, False, False])
+    h2b = [np.array([-1.0, 1.0, -1.0, 1.0, 0.0])] + h2[1:]      # only the last confirm - 1 dates count
+    np.testing.assert_array_equal(rolling.seasoned_mask(st, entry, h2b, 3), [False, False, True, False, False])
+
+
+def test_seasoning_holds_from_the_second_consecutive_pass_and_the_first_period_is_flat(cfg, monkeypatch):
+    p = make_panel(8, n_noise=6)
+    pool = pool_of(cfg, p, p.target.index[N - 260])
+    rc = rc_with(confirm_periods=2)
+    dates = pool["dates"]
+    Ds = remine_rows(dates, rc.first_date, 6, len(dates) - 1)
+    ok = lambda s: (3.0, s, 1.0)
+    bad = (0.3, 1.0, 0.0)
+    # columns (distinct groups so weights are simple):
+    # 0 passes at k0 and k1 (+)  -> held from k1 (new), stays while |z| >= stay_z
+    # 1 passes at k0 only        -> never held
+    # 2 passes at k0 (+), k1 (-) -> sign differs: not held at k1
+    # 3 passes k0, fails k1, passes k2 -> a gap: not held at k2
+    # 4 passes at k2 and k3      -> held from k3
+    script = [{0: ok(1.0), 1: ok(1.0), 2: ok(1.0), 3: ok(1.0)},
+              {0: ok(1.0), 1: bad, 2: ok(-1.0), 3: bad},
+              {0: (2.0, 1.0, np.nan), 3: ok(1.0), 4: ok(1.0)},
+              {0: (2.0, 1.0, np.nan), 3: bad, 4: ok(1.0)}]
+    script += [{} for _ in Ds[len(script):]]
+    monkeypatch.setattr(rolling, "window_stats", scripted(pool, script, rc))
+    monkeypatch.setattr(rolling, "dedupe", lambda ids, df, th: {i: i for i in ids})
+    res = roll_spec(pool, rc, 2, 6, {})
+    per, mem, pnl, summ = res["periods"], res["members"], res["pnl"], res["summary"]
+    held = {k: dict(zip(g["id"], g["status"])) for k, g in mem.groupby("period")}
+    c = lambda j: pool["ids"][j]
+    assert 0 not in held                                       # nothing can be held at D_0
+    assert held[1] == {c(0): "new"}                            # 0 seasoned; 1 (once), 2 (sign), 3 (failed at k1) not
+    assert held[2] == {c(0): "stay"}                           # 3 passed at k2 but not at k1: the gap restarts it
+    assert held[3] == {c(0): "stay", c(4): "new"}              # 4 passed at k2 and k3
+    assert per["n_held"].tolist()[:4] == [0, 1, 1, 2]
+    assert per["n_unseasoned"].tolist()[:4] == [4, 1, 2, 0]    # k0: 0-3; k1: 2 (sign flip); k2: 3, 4; k3: none
+    assert per["net_sharpe"].iloc[0] != per["net_sharpe"].iloc[0]       # flat seasoning period: NaN, not 0
+    # evaluated span: from D_1 + 1; the flat period is neither in pnl nor in the summary
+    assert pnl["date"].iloc[0] == dates[Ds[1] + 1] and len(pnl) == len(dates) - 1 - Ds[1]
+    assert summ["eval_start_date"] == str(dates[Ds[1] + 1].date()) == summ["date_from"]
+    assert summ["eval_start_period"] == 1 and summ["n_periods"] == len(per) - 1 and summ["n_rows"] == len(pnl)
+    assert summ["net_sharpe"] == pytest.approx(rolling._sharpe(pnl["net"].to_numpy()))
+    assert summ["hac_t_net"] == pytest.approx(mean_hac_t(pnl["net"].to_numpy(), cfg.stats.hac_lags))
+    assert summ["avg_held"] == pytest.approx(per["n_held"].iloc[1:].mean())
+    # the same composite simulated over the evaluated rows alone (position is 0 before: nothing is lost by cutting)
+    rows = np.arange(Ds[1] + 1, len(dates))
+    g, n_ = simulate(pnl["position"].to_numpy(), pool["y"][rows], pool["sig"][rows], COST)
+    np.testing.assert_allclose(pnl["net"], n_, atol=1e-12)
+    assert (res["pnl"]["position"] != 0).any() and res["exits"]["period"].min() >= 1
+
+
+def test_seasoning_keeps_the_flat_period_out_of_the_summary(cfg, monkeypatch):
+    p = make_panel(8, n_noise=6)
+    pool = pool_of(cfg, p, p.target.index[N - 260])
+    dates = pool["dates"]
+    ok = (3.0, 1.0, 1.0)
+    out = {}
+    for conf in (1, 2):
+        rc = rc_with(confirm_periods=conf)
+        Ds = remine_rows(dates, rc.first_date, 6, len(dates) - 1)
+        monkeypatch.setattr(rolling, "window_stats", scripted(pool, [{0: ok, 1: ok} for _ in Ds], rc))
+        monkeypatch.setattr(rolling, "dedupe", lambda ids, df, th: {i: i for i in ids})
+        out[conf] = roll_spec(pool, rc, 2, 6, {})
+    a, b = out[1], out[2]
+    assert (a["periods"]["n_held"] > 0).all()                  # without seasoning the first period is held ...
+    assert (b["periods"]["n_held"].iloc[0] == 0) and (b["periods"]["n_held"].iloc[1:] > 0).all()
+    assert b["summary"]["n_flat_periods"] == 0 and b["summary"]["n_periods"] == a["summary"]["n_periods"] - 1
+    # ... and the positions from D_1 + 1 on are the same, so the statistics of the shared span agree with a cut
+    n = len(b["pnl"])
+    np.testing.assert_allclose(b["pnl"]["position"], a["pnl"]["position"].iloc[-n:])
+
+
+def test_seasoning_counts_the_raw_entry_rule_not_the_deduplicated_one(cfg):
+    rng = np.random.default_rng(4)
+    a = rng.normal(size=400)
+    Sw = np.column_stack([a, a + 0.1 * rng.normal(size=400)])           # corr ~ 0.995: one cluster
+    ids = ["a", "b"]
+    rc = rc_with(confirm_periods=2)
+    st0 = _stat([4.0, 3.0], [1, 1], [1.0, 1.0], 2)
+    h0 = []
+    r0 = select(st0, {}, Sw, ids, rc, cfg.verdict, h0)
+    assert r0["held"] == {}                                             # nothing at the first date
+    h0.append(np.where(rolling.entry_mask(st0, rc, cfg.verdict), st0["sign"], 0.0))
+    # at the next date a is stronger again and b is absorbed by it (de-duplication) ...
+    st1 = _stat([4.0, 3.0], [1, 1], [1.0, 1.0], 2)
+    r1 = select(st1, {}, Sw, ids, rc, cfg.verdict, h0)
+    assert r1["held"] == {0: "new"} and r1["n_unseasoned"] == 0
+    # ... but when a fails, b (which passed the raw rule at both dates, though never eligible to be held) is held
+    h1 = [np.where(rolling.entry_mask(st0, rc, cfg.verdict), st0["sign"], 0.0)]
+    st2 = _stat([0.5, 3.0], [1, 1], [1.0, 1.0], 2)
+    r2 = select(st2, {0: 1}, Sw, ids, rc, cfg.verdict, h1)
+    assert r2["held"] == {1: "new"} and r2["exits"][0] == ("stay_rule", "low_z")
+
+
+def test_failed_incumbent_needs_a_fresh_seasoning_to_re_enter(cfg):
+    Sw = np.random.default_rng(1).normal(size=(300, 1))
+    rc = rc_with(confirm_periods=2)
+    prev_pass = [np.array([1.0])]
+    flip = _stat([-3.0], [-1], [1.0], 1)                      # incumbent (+) flips to a strong (-): exits, no re-entry
+    r = select(flip, {0: 1}, Sw, ["a"], rc, cfg.verdict, [np.array([1.0])])
+    assert r["held"] == {} and r["exits"][0] == ("stay_rule", "sign_flip")
+    r = select(flip, {}, Sw, ["a"], rc, cfg.verdict, [np.array([-1.0])])      # later: passed (-) before and now
+    assert r["held"] == {0: "new"}
+
+
+def test_defaults_reproduce_the_previous_selection(cfg, regime_pool, regime_res):
+    # old entry rule, written out: |z| >= z_weak and window net Sharpe > is_min_net_sharpe
+    rng = np.random.default_rng(11)
+    n = 40
+    z = rng.normal(0, 2, n)
+    z[::7] = np.nan
+    sh = rng.normal(0.3, 0.6, n)
+    sh[::5] = np.nan
+    st = _stat(z, np.where(rng.random(n) < 0.5, -1.0, 1.0), sh, n)
+    vd = cfg.verdict
+    old = np.isfinite(z) & (np.abs(np.nan_to_num(z)) >= vd.z_weak) & np.isfinite(sh) & (np.nan_to_num(sh) > vd.is_min_net_sharpe)
+    np.testing.assert_array_equal(rolling.entry_mask(st, RC, vd), old)
+    assert RC.entry_z is None and RC.confirm_periods == 1
+    Sw = rng.normal(size=(300, n))
+    ids = [f"c{j}" for j in range(n)]
+    prev = {j: int(st["sign"][j]) for j in range(0, n, 9)}
+    a = select(st, prev, Sw, ids, RC, vd)
+    b = select(st, prev, Sw, ids, rc_with(entry_z=vd.z_weak), vd, [np.zeros(n)])   # explicit equal threshold
+    assert a == b and a["n_unseasoned"] == 0
+    # the whole spec: explicit entry_z = z_weak and confirm_periods = 1 give the very same outputs
+    other = run_spec(regime_pool, rc_with(entry_z=vd.z_weak))
+    for key in ("members", "periods", "exits", "pnl"):
+        pd.testing.assert_frame_equal(regime_res[key], other[key])
+    assert regime_res["summary"]["eval_start_period"] == 0 and (regime_res["periods"]["n_unseasoned"] == 0).all()
+    assert regime_res["summary"]["date_from"] == regime_res["summary"]["eval_start_date"] == str(
+        regime_pool["dates"][remine_rows(regime_pool["dates"], RC.first_date, 6, len(regime_pool["dates"]) - 1)[0] + 1].date())
+
+
+def test_no_lookahead_with_entry_z_and_seasoning(cfg, regime_panel):
+    rc = rc_with(entry_z=2.0, confirm_periods=2)
+    base = pool_of(cfg, regime_panel, regime_panel.target.index[-1])
+    full = run_spec(base, rc)
+    dates = base["dates"]
+    first = int(full["members"]["period"].min())
+    k = first + 1
+    assert k < len(full["periods"]) - 1, "scenario needs later periods to compare"
+    Dk = dates[remine_rows(dates, rc.first_date, 6, len(dates) - 1)[k]]
+    p = regime_panel
+    rng = np.random.default_rng(99)
+    after = p.target.index > Dk
+    X2, r2 = p.X.copy(), p.target.copy()
+    X2[after] = np.cumsum(rng.normal(0, 3, (after.sum(), X2.shape[1])), axis=0) + 50.0
+    r2[after] = rng.normal(0, 0.02, after.sum())
+    alt = run_spec(pool_of(cfg, Panel(r2, X2, p.meta, p.excluded, p.info)), rc)
+    cols = ["period", "id", "sign", "weight", "z", "status"]
+    a = full["members"].query("period <= @k")[cols].reset_index(drop=True)
+    b = alt["members"].query("period <= @k")[cols].reset_index(drop=True)
+    assert len(a) > 0
+    pd.testing.assert_frame_equal(a, b)
+    pc = ["period", "n_tested", "n_entry_pass", "n_unseasoned", "n_new", "n_held"]
+    pd.testing.assert_frame_equal(full["periods"].query("period <= @k")[pc], alt["periods"].query("period <= @k")[pc])
+    assert full["members"].query("period > @k")["z"].tolist() != alt["members"].query("period > @k")["z"].tolist()
+
+
+def test_rolling_config_entry_z_and_confirm_periods(tmp_path):
+    rc = load_rolling_config(ROOT / "configs" / "ty_roll.toml")
+    assert rc.entry_z is None and rc.confirm_periods == 1
+    v2 = load_rolling_config(ROOT / "configs" / "ty_roll_v2.toml")
+    v1 = load_rolling_config(ROOT / "configs" / "ty_roll.toml")
+    assert (v2.entry_z, v2.confirm_periods, v2.grid) == (2.5, 2, {})
+    assert (v2.window_years, v2.step_months, v2.first_date, v2.holdout_years, v2.stay_z, v2.group_cap, v2.coverage) == (
+        v1.window_years, v1.step_months, v1.first_date, v1.holdout_years, v1.stay_z, v1.group_cap, v1.coverage)
+    good = (ROOT / "configs" / "ty_roll_v2.toml").read_text()
+    for bad, msg in [("\nentry_z = 2.5", "\nentry_z = 0.5"), ("\nentry_z = 2.5", '\nentry_z = "x"'),
+                     ("\nconfirm_periods = 2", "\nconfirm_periods = 0"),
+                     ("\nconfirm_periods = 2", "\nconfirm_periods = 1.5"),
+                     ("\nconfirm_periods = 2", "\nconfirm_periods = true")]:
+        p = tmp_path / "bad.toml"
+        p.write_text(good.replace(bad, msg, 1))
+        with pytest.raises(ValueError):
+            load_rolling_config(p)

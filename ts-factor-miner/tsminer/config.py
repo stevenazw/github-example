@@ -138,6 +138,8 @@ class RollingConfig:
     stay_z: float = 1.0          # incumbents stay while the sign is unchanged and |z| >= stay_z
     group_cap: float = 0.3334    # max total weight of one group
     coverage: float = 0.8        # a candidate needs >= this share of the window's rows
+    entry_z: float | None = None  # entry threshold on |z| of NEW factors; None = the run configs' verdict.z_weak
+    confirm_periods: int = 1     # seasoning: entry rule must hold at this many consecutive re-mining dates
     grid: dict[str, list[int]] = field(default_factory=dict)   # pre-declared robustness grid: key -> values
 
 
@@ -420,12 +422,14 @@ def load_rolling_config(path: str | os.PathLike) -> RollingConfig:
     unknown = set(raw) - {"rolling"}
     if unknown:
         raise ValueError(f"unknown top-level section(s) in a rolling config: {sorted(unknown)}")
-    keys = {"window_years", "step_months", "first_date", "holdout_years", "stay_z", "group_cap", "coverage", "grid"}
-    sec = _section(raw, "rolling", keys, keys - {"grid"})
+    keys = {"window_years", "step_months", "first_date", "holdout_years", "stay_z", "group_cap", "coverage", "grid",
+            "entry_z", "confirm_periods"}
+    sec = _section(raw, "rolling", keys, keys - {"grid", "entry_z", "confirm_periods"})
     grid = sec.pop("grid", {})
     rc = _fill(RollingConfig, sec, "rolling", {
         "window_years": (int,), "step_months": (int,), "first_date": (str,), "holdout_years": (int,),
-        "stay_z": (int, float), "group_cap": (int, float), "coverage": (int, float)})
+        "stay_z": (int, float), "group_cap": (int, float), "coverage": (int, float),
+        "entry_z": (int, float), "confirm_periods": (int,)})
     if not isinstance(grid, dict) or set(grid) - set(ROLLING_GRID_KEYS):
         raise ValueError(f"[rolling.grid] must be a table with keys in {list(ROLLING_GRID_KEYS)}")
     for k, v in grid.items():
@@ -442,6 +446,10 @@ def load_rolling_config(path: str | os.PathLike) -> RollingConfig:
         raise ValueError("rolling.holdout_years must be >= 0")
     if rc.stay_z <= 0:
         raise ValueError("rolling.stay_z must be > 0")
+    if rc.entry_z is not None and rc.entry_z < rc.stay_z:
+        raise ValueError("rolling.entry_z must be >= rolling.stay_z (entering must be harder than staying)")
+    if rc.confirm_periods < 1:
+        raise ValueError("rolling.confirm_periods must be >= 1")
     if not 0 < rc.group_cap <= 1:
         raise ValueError("rolling.group_cap must be in (0, 1]")
     if not 0 < rc.coverage <= 1:

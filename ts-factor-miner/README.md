@@ -364,7 +364,11 @@ python -m tsminer roll configs/ty_roll.toml RUN_DIR... --out DIR [--grid] [--job
 #   --prefilter  只对 |t| >= 0.7 的候选算 null_sd（仅当 null_sd 都 >= 0.75 才成立，否则报错；默认关闭）
 ```
 
-**配置**：`configs/ty_roll.toml` 的 `[rolling]`（`window_years`、`step_months`、`first_date`、`holdout_years`、`stay_z`、`group_cap`、`coverage`）与 `[rolling.grid]`，由 `config.load_rolling_config` 严格校验。入口门槛（`z_weak`、`is_min_net_sharpe`、`dedupe_corr`）、统计设置、缓冲带与成本取自各 run 的 `config.toml`；各 run 的 `[target]`、`[signals]`、`[stats]`、`[verdict]`、`[position]` 与标的序列必须相同，否则直接报错。池内候选 id 加来源前缀 `<run>/<id>`；跨 run 的完全重复由去重合并。
+**配置**：`configs/ty_roll.toml` 的 `[rolling]`（`window_years`、`step_months`、`first_date`、`holdout_years`、`stay_z`、`group_cap`、`coverage`，可选 `entry_z`、`confirm_periods`）与 `[rolling.grid]`，由 `config.load_rolling_config` 严格校验。入口门槛（`z_weak`、`is_min_net_sharpe`、`dedupe_corr`）、统计设置、缓冲带与成本取自各 run 的 `config.toml`；各 run 的 `[target]`、`[signals]`、`[stats]`、`[verdict]`、`[position]` 与标的序列必须相同，否则直接报错。池内候选 id 加来源前缀 `<run>/<id>`；跨 run 的完全重复由去重合并。
+
+**可选参数（默认值与旧行为完全一致）**：
+- `entry_z`（默认不设 = 取 run 配置的 `verdict.z_weak`）：新因子入选的 |z| 门槛，要求 ≥ `stay_z`；窗口净 Sharpe 对 |z| ≥ min(`z_weak`, 入选门槛) 的候选计算，所以 `entry_z` 低于 `z_weak` 也成立。净 Sharpe 条件与留任规则不变。
+- `confirm_periods`（默认 1）：确认期（seasoning）。非在持者只有在本重挖日通过入选规则、且此前连续 `confirm_periods - 1` 个重挖日（同一规格）也都以同一符号通过入选规则，才会被持有。"通过"按原始入选规则判断（|z| ≥ 入选门槛且窗口净 Sharpe > `is_min_net_sharpe`），不看当时是否被去重吸收；中间断一次就重新计。因此前 `confirm_periods - 1` 期必然空仓：这些期仍是重挖日（统计量要用），但不写入 `pnl.csv`，也不计入 `summary` 的任何统计（Sharpe、HAC t、回撤、期均值、名称换手、寿命等），`summary.eval_start_date` 给出实际评估起点（D_{confirm_periods-1} 之后第一个持有日），`periods.csv` 里这些期的 `net_sharpe` 为空。`periods.csv` 的 `n_unseasoned` = 通过入选规则但尚未满足确认期的非在持候选数。
 
 **时间约定（严格 T+1）**：D_k 的选择在 D_k 收盘后算出，下一个收盘生效。
 - 重挖日 D_0 = `first_date` 当天或之后的第一个标的交易日（行 = `prepare` 里 y_fwd 有限的行），之后每 `step_months` 个自然月取当天或之后的第一个交易日。
