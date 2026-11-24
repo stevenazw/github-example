@@ -28,29 +28,7 @@ def main(argv=None) -> int:
                          "registered runs, and the same factor tested twice appears once")
     ps.add_argument("--out", required=True, metavar="DIR", help="output directory of the site")
     ps.add_argument("--reset", action="store_true", help="ignore the existing registry; use only the given RUN_DIRs")
-    pr = sub.add_parser("roll", help="walk-forward (rolling) mining on the pooled candidates of finished runs")
-    pr.add_argument("config", help="rolling config (configs/ty_roll.toml)")
-    pr.add_argument("run_dirs", nargs="+", metavar="RUN_DIR", help="finished mine runs (their panel/ and config.toml); "
-                    "the pool is exactly these runs, so a subset of sources = a subset of RUN_DIRs")
-    pr.add_argument("--out", required=True, metavar="DIR")
-    pr.add_argument("--grid", action="store_true", help="also run every combination of [rolling.grid]")
-    pr.add_argument("--holdout-years", type=int, help="override [rolling].holdout_years")
-    pr.add_argument("--truncate", metavar="DATE", help="cut every panel at this date before anything is computed "
-                    "(look-ahead acceptance check)")
-    pr.add_argument("--prefilter", action="store_true", help="null_sd only for |t| >= 0.7 (fails loud if any null_sd "
-                    "< 0.75)")
-    pr.add_argument("--jobs", type=int, default=1, help="processes for the per-window statistics")
     a = ap.parse_args(argv)
-
-    if a.cmd == "roll":
-        from .rolling import roll_cli
-        try:
-            roll_cli(a.config, a.run_dirs, a.out, grid=a.grid, holdout_years=a.holdout_years, truncate=a.truncate,
-                     prefilter=a.prefilter, jobs=a.jobs)
-        except (ValueError, FileNotFoundError) as e:
-            print(f"roll: {e}", file=sys.stderr)
-            return 1
-        return 0
 
     if a.cmd == "site":
         from .site import build_site

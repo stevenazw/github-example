@@ -128,24 +128,6 @@ class Config:
         return d
 
 
-@dataclass
-class RollingConfig:
-    """Walk-forward ("rolling mining") parameters; loaded from a rolling config file (``[rolling]``)."""
-    window_years: int = 3        # trailing mining window
-    step_months: int = 6         # re-mining frequency
-    first_date: str = "2005-01-01"
-    holdout_years: int = 3       # last calendar years of the target: sealed, never evaluated
-    stay_z: float = 1.0          # incumbents stay while the sign is unchanged and |z| >= stay_z
-    group_cap: float = 0.3334    # max total weight of one group
-    coverage: float = 0.8        # a candidate needs >= this share of the window's rows
-    entry_z: float | None = None  # entry threshold on |z| of NEW factors; None = the run configs' verdict.z_weak
-    confirm_periods: int = 1     # seasoning: entry rule must hold at this many consecutive re-mining dates
-    grid: dict[str, list[int]] = field(default_factory=dict)   # pre-declared robustness grid: key -> values
-
-
-ROLLING_GRID_KEYS = ("window_years", "step_months")
-
-
 # ----------------------------------------------------------------- helpers
 def _section(raw: dict, name: str, allowed: set[str], required: set[str] = frozenset()) -> dict:
     sec = raw.get(name, {})
@@ -408,54 +390,3 @@ def load_run_config(run_dir: str | os.PathLike) -> Config:
     if "execution_delay" not in snap.get("config", {}).get("position", {}):
         cfg.position.execution_delay = 0
     return cfg
-
-
-def load_rolling_config(path: str | os.PathLike) -> RollingConfig:
-    """Load and validate a rolling config (``[rolling]`` and ``[rolling.grid]``); raise ``ValueError`` on errors."""
-    import pandas as pd
-
-    with open(path, "rb") as fh:
-        try:
-            raw = tomllib.load(fh)
-        except tomllib.TOMLDecodeError as e:
-            raise ValueError(f"invalid TOML in {path}: {e}") from e
-    unknown = set(raw) - {"rolling"}
-    if unknown:
-        raise ValueError(f"unknown top-level section(s) in a rolling config: {sorted(unknown)}")
-    keys = {"window_years", "step_months", "first_date", "holdout_years", "stay_z", "group_cap", "coverage", "grid",
-            "entry_z", "confirm_periods"}
-    sec = _section(raw, "rolling", keys, keys - {"grid", "entry_z", "confirm_periods"})
-    grid = sec.pop("grid", {})
-    rc = _fill(RollingConfig, sec, "rolling", {
-        "window_years": (int,), "step_months": (int,), "first_date": (str,), "holdout_years": (int,),
-        "stay_z": (int, float), "group_cap": (int, float), "coverage": (int, float),
-        "entry_z": (int, float), "confirm_periods": (int,)})
-    if not isinstance(grid, dict) or set(grid) - set(ROLLING_GRID_KEYS):
-        raise ValueError(f"[rolling.grid] must be a table with keys in {list(ROLLING_GRID_KEYS)}")
-    for k, v in grid.items():
-        if not isinstance(v, list) or not v:
-            raise ValueError(f"rolling.grid.{k}: expected a non-empty list of integers")
-        for x in v:
-            _check_type(x, (int,), f"rolling.grid.{k}")
-            if x < 1:
-                raise ValueError(f"rolling.grid.{k}: values must be >= 1")
-    rc.grid = {k: list(v) for k, v in grid.items()}
-    if rc.window_years < 1 or rc.step_months < 1:
-        raise ValueError("rolling.window_years and rolling.step_months must be >= 1")
-    if rc.holdout_years < 0:
-        raise ValueError("rolling.holdout_years must be >= 0")
-    if rc.stay_z <= 0:
-        raise ValueError("rolling.stay_z must be > 0")
-    if rc.entry_z is not None and rc.entry_z < rc.stay_z:
-        raise ValueError("rolling.entry_z must be >= rolling.stay_z (entering must be harder than staying)")
-    if rc.confirm_periods < 1:
-        raise ValueError("rolling.confirm_periods must be >= 1")
-    if not 0 < rc.group_cap <= 1:
-        raise ValueError("rolling.group_cap must be in (0, 1]")
-    if not 0 < rc.coverage <= 1:
-        raise ValueError("rolling.coverage must be in (0, 1]")
-    try:
-        pd.Timestamp(rc.first_date)
-    except ValueError as e:
-        raise ValueError(f"rolling.first_date: {e}") from e
-    return rc

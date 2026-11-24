@@ -196,9 +196,6 @@ python -m tsminer confirm runs/<run_dir>
 # 已打开过则退出码为 2；确需重跑时必须给出理由，理由会记入 confirm_log.jsonl
 python -m tsminer confirm runs/<run_dir> --force "理由"
 
-# 滚动挖掘(walk-forward), 见第 10 节; 输入是已完成的 mine run 目录(用到其中的 panel/ 与 config.toml)
-python -m tsminer roll configs/ty_roll.toml runs/ty-v11 runs/ty-vars-v6 runs/ty-recipes-v4 --out runs/roll-ty-v1/pooled --grid --jobs 4
-
 # 测试
 python -m pytest -q
 ```
@@ -308,8 +305,6 @@ python -m pytest -q
 
 `rsum` / `vmean` / `vmax` / `vmin` / `pos` 的语义与因果性见 `tests/test_variables.py`，`configs/ty_recipes.toml` 的加载与连库核对见 `test_ty_recipes_config_loads`、`test_build_panel_ty_recipes_integration`。
 
-- **滚动挖掘**（`tests/test_rolling.py`）：无前视（重挖日之后的信号与收益被打乱，该日及之前各期的成员、方向、权重逐位不变；封存期内放入荒谬数值，所有输出不变）、时间约定（挖掘行止于 D−1、持有行始于 D+1 且各期不重不漏地铺满 (D₀, C]）、植入的阶段性因子在滞后后入选并在失效后退出、纯噪声池无净 Sharpe、滞后带（在持者保留、同 z 的新者不入、翻号强制退出）、权重（和为 1、group 上限、不足 3 个 group）、组合仓位等于单因子缓冲仓位的加权和与镜像恒等式、成本按净额后的组合仓位计、去重时在持者优先。
-
 集成测试 `test_build_panel_ty_integration` 等需要本地数据库，数据库不存在时会 skip。
 
 ## 9. 因子跟踪看板（`site`）
@@ -350,51 +345,3 @@ python -m http.server -d site-out        # 本地打开 index.html
 **净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值用的信号是已含成交延迟的持有信号（见 3.1）；看板数据的 `criteria` 带 `execution_delay`（旧 run 缺省则不显示），资产页"净值定义"附近写"成交：信号形成后第 d 个收盘"，公式里的仓位行为 `pos[t] = ±1 × s[t−d] ÷ σ[t]`。净值点的日期取收益实现日（行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 
 **样本外何时显示。** 只有因子所在的 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值；否则不读取、不计算、不输出该 run 的任何样本外行，净值只到观察期末，页面标为"样本外未打开"。一个 run 已 confirm 不影响同一标的另一个 run。
-
-## 10. 滚动挖掘（`roll`）
-
-因子不会永远有效。`mine` + `confirm` 在固定的 70/15/15 切分上回答"这个因子是否永久真实"；`roll` 验证的是**选择规则**：每个重挖日只用此前一段窗口选因子，持有到下一个重挖日，再看被选中的集合在之后的表现。每个持有日相对选出它的那次选择都是样本外。
-
-```bash
-python -m tsminer roll configs/ty_roll.toml RUN_DIR... --out DIR [--grid] [--jobs N]
-#   RUN_DIR      已完成的 mine run（读 panel/ 与 config.toml）；候选池就是这些 run 的并集，要子集就只给部分 run
-#   --grid       除主规格外，再跑 [rolling.grid] 的全部组合（全部报告，不挑选）
-#   --jobs N     并行进程数，只并行各窗口的统计量（互相独立），结果与 N 无关
-#   --holdout-years N / --truncate DATE   覆盖封存年数 / 在算任何东西之前把所有 panel 截到该日（前视验收用）
-#   --prefilter  只对 |t| >= 0.7 的候选算 null_sd（仅当 null_sd 都 >= 0.75 才成立，否则报错；默认关闭）
-```
-
-**配置**：`configs/ty_roll.toml` 的 `[rolling]`（`window_years`、`step_months`、`first_date`、`holdout_years`、`stay_z`、`group_cap`、`coverage`，可选 `entry_z`、`confirm_periods`）与 `[rolling.grid]`，由 `config.load_rolling_config` 严格校验。入口门槛（`z_weak`、`is_min_net_sharpe`、`dedupe_corr`）、统计设置、缓冲带与成本取自各 run 的 `config.toml`；各 run 的 `[target]`、`[signals]`、`[stats]`、`[verdict]`、`[position]` 与标的序列必须相同，否则直接报错。池内候选 id 加来源前缀 `<run>/<id>`；跨 run 的完全重复由去重合并。
-
-**可选参数（默认值与旧行为完全一致）**：
-- `entry_z`（默认不设 = 取 run 配置的 `verdict.z_weak`）：新因子入选的 |z| 门槛，要求 ≥ `stay_z`；窗口净 Sharpe 对 |z| ≥ min(`z_weak`, 入选门槛) 的候选计算，所以 `entry_z` 低于 `z_weak` 也成立。净 Sharpe 条件与留任规则不变。
-- `confirm_periods`（默认 1）：确认期（seasoning）。非在持者只有在本重挖日通过入选规则、且此前连续 `confirm_periods - 1` 个重挖日（同一规格）也都以同一符号通过入选规则，才会被持有。"通过"按原始入选规则判断（|z| ≥ 入选门槛且窗口净 Sharpe > `is_min_net_sharpe`），不看当时是否被去重吸收；中间断一次就重新计。因此前 `confirm_periods - 1` 期必然空仓：这些期仍是重挖日（统计量要用），但不写入 `pnl.csv`，也不计入 `summary` 的任何统计（Sharpe、HAC t、回撤、期均值、名称换手、寿命等），`summary.eval_start_date` 给出实际评估起点（D_{confirm_periods-1} 之后第一个持有日），`periods.csv` 里这些期的 `net_sharpe` 为空。`periods.csv` 的 `n_unseasoned` = 通过入选规则但尚未满足确认期的非在持候选数。
-
-**时间约定（严格 T+1）**：D_k 的选择在 D_k 收盘后算出，下一个收盘生效。
-- 重挖日 D_0 = `first_date` 当天或之后的第一个标的交易日（行 = `prepare` 里 y_fwd 有限的行），之后每 `step_months` 个自然月取当天或之后的第一个交易日。
-- 挖掘行：日期 ≥ D_k − `window_years` 年、且行号 ≤ D_k − 1（行 t 的 y_fwd 需要 t+1 的收益，D_k 收盘时只有 t ≤ D_k − 1 已知）。持有行：D_k < 日期 ≤ D_{k+1}（D_k 这一行仍属上一次选择）；各期持有行不重不漏地铺满 (D_0, C]。
-- 封存：C = 标的最后日期减 `holdout_years` 个自然年。所有 panel 在 `prepare` 之前先截到 C，封存期的数据从不被读取；最后一个持有行是下一日收益日期仍 ≤ C 的最后一行；C 之后的重挖日不用。
-
-**每个重挖日**：
-1. 可检验：窗口内有限值 ≥ `coverage` × 窗口行数且 ≥ `stats.min_obs`，最后 5 个挖掘行里至少一个有限。
-2. 统计量与 `mine` 第 1 步相同（`hac_t`、`null_sd` 同设置同种子、z = t / null_sd、sign = sign(IC)），只在挖掘行上算；窗口净 Sharpe 用 `backtest`（vectorbt）在挖掘行上算，只对 |z| ≥ `z_weak` 的候选算。
-3. 入选规则（新因子）：|z| ≥ `z_weak` 且窗口净 Sharpe > `is_min_net_sharpe`。留任规则（上期在持者）：符号不变且 |z| ≥ `stay_z`，没有 Sharpe 条件。没通过留任的在持者当期退出，且当期不能经入选规则立即回来（只能在以后的重挖日经入选规则再入）。
-4. 去重：挖掘行上用 `pipeline.dedupe`，优先级 = 留任者按 |z| 降序，再是新入选者按 |z| 降序，所以在持者只要不失败就保住它所在簇的代表位置。只持有簇代表；被在持者吸收掉的在持者记为"去重吸收"退出。
-5. 权重：因子等权，每个 group 的总权重 ≤ `group_cap`，超出的部分在其他 group 之间按因子等权再分配（迭代到可行；group 内等权）。group 数 < 3 时上限不可行，改为 group 间等权、group 内等权。权重和为 1；无因子则空仓。
-6. 持有行的组合仓位 = Σ w_i × sign_i × p_i[t]，p_i = `positions(s_i, +1, buffer)` 在候选全部行历史上因果地算一次（sign = −1 的缓冲路径恰是镜像，符号事后乘上，测试里验证）；信号非有限贡献 0。
-7. 组合损益：把所有持有行的组合仓位拼起来，`engine.simulate` 只跑**一次**，所以重挖日的换仓按净额后的组合仓位收费。
-
-**输出**（`--out DIR`；`spec` 列形如 `3y6m`，主规格是 `[rolling]` 里的那个）：
-
-| 文件 | 内容 |
-|---|---|
-| `roll.json` | 参数、封存截止日、各 run 的数据指纹（`panel.pkl` 与 `config.toml` 的 sha256、db_version）、各规格汇总（`summary`） |
-| `periods.csv` | 每期一行：重挖日、持有起止、可检验数、通过入选数、在持数 / 留任数 / 退出数 / 新入数、去重后持有数、group 数、`group_weights`、持有行上持有因子的 sign×IC 均值与为正占比、期内组合净 Sharpe |
-| `members.csv` | 每期每个持有因子一行：id、来源、series、transform、group、sign、z、ic、窗口净 Sharpe（未计算为空）、状态（new / stay）、权重、下一期（持有行）带符号 IC |
-| `exits.csv` | 每期的退出：原因（`stay_rule` 含 `sign_flip` / `low_z` / `not_tested`，或 `dedupe`）、持有了几期 |
-| `pnl.csv` | 日期、spec、组合仓位、毛损益、净损益（引擎单位） |
-| `report.md` | 简短中文报告 |
-
-`summary` 里的读数：组合净 / 毛 Sharpe（`pipeline._sharpe` 口径）、净损益均值的 HAC t（`stats.hac_lags`）、平均绝对仓位换手、分年净 Sharpe、与多头标的（仓位 ≡ +1）日损益的相关系数与多头自身 Sharpe（判断组合是不是只是久期 beta）、持有因子名称换手（新入占比）与持有区间长度（连续持有的期数；区间被截止日截断的单列计数）、下一期带符号 IC 的均值与跨期 t、为正期占比。回撤和累计损益按"单利净值事后缩放到年化 10% 波动率"计算，**仅供展示**，不是可交易的杠杆。
-
-**局限**：原因同 `mine`：每个重挖日是对全池的一次多重检验，没有跨候选校正，滞后带只是让持仓更稳定而不是更显著；窗口统计量不依赖在持集合，所以 `null_sd` 与 HAC 对每个 (重挖日, 窗口) 只算一次并在各规格间共用。
