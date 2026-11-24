@@ -1,0 +1,1078 @@
+# TY 配方源列配置（由《Duration Trading 底层因子配方与 EOD 可用时间》第 4 节的 135 条配方程序化生成，2026-11-24）。
+# - 只取每条配方的“日频源列”（输入 -> 日频源列这一段），按表达式去重后得到 93 个公式变量；
+#   文档里的周度变换、156 锚点标准化、C/B/T 映射、样本起点、OOS 起点都【不】进入本配置:
+#   变量走系统现有的 6 个固定变换和 70/15/15 切分, 每个变量的注释里列出文档中用到它的 factor_id。
+# - 滞后单位是标的交易日(文档第 1 节写作“自然日”, 此处按本项目规则解释); 规则见 [lags], 均为文档第 3 节已验证的取值。
+# - OPEN_INT 用近月连续合约(XX1 Comdty)的字段, 与文档一致, 不是 futures_oi() (换月日会有持仓量断崖, 照文档不改)。
+# - FF 政策利率 policy 只用 (FDTR + FDTRFTRL) / 2: 配方样本自 2010 年起, 两条上下限序列自 2005 年起都有,
+#   文档中缺失时改用 FEDL01 的备用分支在此不会触发, 因而未实现。
+# - 本文件的 [target] / [databank] / [sample] / [signals] / [stats] / [verdict] / [position] 与 configs/ty_vars.toml 相同。
+
+[target]
+name = "TY"
+kind = "futures_chain"      # "futures_chain" | "spot"
+root = "TY"                 # used by futures_chain
+# ticker / field             # used by spot: log difference of PX_LAST is the daily return
+cost_per_side = 0.00014     # 单边成本(收益率单位): TY 半个 tick 1/64 点 ÷ 价格约 110
+
+[databank]
+toolkit_dir = "/home/user/databank-work/entry"
+cache_dir = "/home/user/databank-work/databank-cache"
+
+[sample]
+start = ""                  # 可选 ISO 日期; 空 = 标的全部历史
+is_frac = 0.70              # 每个候选在自己与标的重叠的有效行内切成: 样本内 IS 70% / 观察期 OBS 15% / 样本外 OOS 15%
+obs_frac = 0.15
+
+[universe]
+fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: ts(ticker) 省略字段时取该 ticker 拥有的第一个
+
+[lags]
+# 可得性(availability)是【输入】, 不是系统推断的结果: 没有规则的序列会被拒收(no_availability_rule)。
+# 单位是【标的交易日】(标的日历的行): 每条序列先 as-of 对齐到标的日历(取日期 <= 当天的最近观测), 再向后移 lag 行,
+# 即 t 日收盘的信号只能用日期 <= t-lag 的观测。信号在 t 日收盘后形成, 在其后第 execution_delay 个标的收盘成交
+# (见 [position]), 新仓从成交后才承担收益。
+# 规则出处分三档, 由本段的 verified / confirmed 两个列表登记(元素是规则键, 格式同 meta.lag_rule):
+#   verified  = 已验证: 来自 factor_bank《Duration Trading 底层因子配方与 EOD 可用时间》(2026-11-24);
+#   confirmed = 研究者确认: 研究者口头确认, 文档未覆盖;
+#   不在两个列表里的规则 = 起草, 待确认。
+# 优先级: 一个 ticker 有多个不同滞后的字段时(如 TY1 Comdty)不写 ticker 规则, 靠字段规则。
+#   ts / flow 叶子: [lags.ticker] 精确 ticker > [lags.field] 字段名 > [lags.class] 的 "class_one/class_two";
+#   chain 叶子: [lags.field] 里键 "chain:<column>" > chain; curve 叶子: [lags.curve] 的曲线名。
+chain = 0
+verified = [
+  "field:FUND_FLOW", "field:1M_CALL_IMP_VOL_25DELTA_DFLT", "field:1M_PUT_IMP_VOL_25DELTA_DFLT",
+  "field:OPEN_INT", "curve:USD_SOFR_OIS", "ticker:CESIUSD Index",
+  "ticker:CESIG10 Index", "ticker:FDTR Index", "ticker:FDTRFTRL Index",
+  "ticker:FEDL01 Index", "ticker:FF1 Comdty", "ticker:FF2 Comdty",
+  "ticker:FF3 Comdty", "ticker:FF4 Comdty", "ticker:FF5 Comdty",
+  "ticker:FF6 Comdty", "ticker:FF7 Comdty", "ticker:FF8 Comdty",
+  "ticker:FF9 Comdty", "ticker:FF10 Comdty", "ticker:FF11 Comdty",
+  "ticker:FF12 Comdty", "ticker:FF13 Comdty", "ticker:FF14 Comdty",
+  "ticker:FF15 Comdty", "ticker:FF16 Comdty", "ticker:FF17 Comdty",
+  "ticker:FF18 Comdty", "ticker:FF19 Comdty", "ticker:FF20 Comdty",
+  "ticker:FF21 Comdty", "ticker:FF22 Comdty", "ticker:FF23 Comdty",
+  "ticker:FF24 Comdty", "ticker:SPGSAGTR Index", "ticker:SPGSALTR Index",
+  "ticker:SPGSCITR Index", "ticker:SPGSCLTR Index", "ticker:SPGSCRTR Index",
+  "ticker:SPGSENTR Index", "ticker:SPGSINTR Index", "ticker:SPGSNETR Index",
+  "ticker:SPGSPMTR Index", "ticker:SPGSRETR Index", "ticker:SPGSUETR Index",
+  "ticker:SPGSXNTR Index", "ticker:SPGSXPTR Index", "ticker:GSPRHIMO Index",
+  "ticker:GSPRHVMS Index", "ticker:GSXUCYCL Index", "ticker:GSXUDEFS Index",
+  "ticker:GSXUMFML Index", "ticker:GSXUMFMS Index",
+]
+confirmed = [
+  "chain", "class:Market_Data/Government_Bond", "class:Market_Data/Money_Market",
+  "class:Market_Data/Swap_OIS", "class:Market_Data/Commodity", "class:Market_Data/Equity",
+  "class:Market_Data/Inflation_Linked", "class:Market_Data/Credit", "class:Market_Data/MBS",
+  "class:Market_Data/FX", "class:Market_Data/VOL",
+]
+
+[lags.class]
+"Market_Data/Government_Bond" = 0
+"Market_Data/Money_Market" = 0
+"Market_Data/Swap_OIS" = 0
+"Market_Data/Commodity" = 0
+"Market_Data/Equity" = 0
+"Market_Data/Inflation_Linked" = 0
+"Market_Data/Credit" = 0
+"Market_Data/MBS" = 0
+"Market_Data/FX" = 0
+"Market_Data/VOL" = 1
+"Macro/Global" = 1
+"Macro/US" = 1
+"Positioning/CFTC_COT" = 4
+"FED/Balance_Sheet" = 2
+"FED/Primary_Dealer" = 8
+
+[lags.ticker]
+"NFCIINDX Index" = 6
+# —— 以下为文档已验证的逐 ticker 条目 ——
+"CESIUSD Index" = 1
+"CESIG10 Index" = 1
+"FEDL01 Index" = 1          # 文档目录记为 0, 但其证据显示纽约联储在下一营业日约 09:00 才发布; 按发布时间取 1
+"FDTR Index" = 0
+"FDTRFTRL Index" = 0
+# FF1 Comdty ... FF24 Comdty, 均为 0
+"FF1 Comdty" = 0
+"FF2 Comdty" = 0
+"FF3 Comdty" = 0
+"FF4 Comdty" = 0
+"FF5 Comdty" = 0
+"FF6 Comdty" = 0
+"FF7 Comdty" = 0
+"FF8 Comdty" = 0
+"FF9 Comdty" = 0
+"FF10 Comdty" = 0
+"FF11 Comdty" = 0
+"FF12 Comdty" = 0
+"FF13 Comdty" = 0
+"FF14 Comdty" = 0
+"FF15 Comdty" = 0
+"FF16 Comdty" = 0
+"FF17 Comdty" = 0
+"FF18 Comdty" = 0
+"FF19 Comdty" = 0
+"FF20 Comdty" = 0
+"FF21 Comdty" = 0
+"FF22 Comdty" = 0
+"FF23 Comdty" = 0
+"FF24 Comdty" = 0
+# 13 条商品总回报指数, 均为 0
+"SPGSAGTR Index" = 0
+"SPGSALTR Index" = 0
+"SPGSCITR Index" = 0
+"SPGSCLTR Index" = 0
+"SPGSCRTR Index" = 0
+"SPGSENTR Index" = 0
+"SPGSINTR Index" = 0
+"SPGSNETR Index" = 0
+"SPGSPMTR Index" = 0
+"SPGSRETR Index" = 0
+"SPGSUETR Index" = 0
+"SPGSXNTR Index" = 0
+"SPGSXPTR Index" = 0
+# 6 条高盛股票风格指数, 均为 0
+"GSPRHIMO Index" = 0
+"GSPRHVMS Index" = 0
+"GSXUCYCL Index" = 0
+"GSXUDEFS Index" = 0
+"GSXUMFML Index" = 0
+"GSXUMFMS Index" = 0
+
+[lags.field]
+"FUND_FLOW" = 1
+"EQY_SH_OUT" = 1
+"FUND_NET_ASSET_VAL" = 1
+"1M_CALL_IMP_VOL_25DELTA_DFLT" = 1
+"1M_PUT_IMP_VOL_25DELTA_DFLT" = 1
+"CONVENTIONAL_CTD_FORWARD_FRSK" = 1
+"VOLUME" = 0
+"OPEN_INT" = 1
+
+[lags.curve]
+"USD_SOFR_OIS" = 0
+
+# ---------------------------------------------------------------- helper（只供 ref() 引用）
+# fl_*: ETF 资金流 (flow 叶子, 对应文档 *_fund_flow)
+[[universe.helper]]
+id = "fl_bil"
+expr = "flow('BIL US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_govt"
+expr = "flow('GOVT US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_ief"
+expr = "flow('IEF US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_iei"
+expr = "flow('IEI US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_shy"
+expr = "flow('SHY US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tip"
+expr = "flow('TIP US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tlh"
+expr = "flow('TLH US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tlt"
+expr = "flow('TLT US Equity','FUND_FLOW')"
+
+# ---------------------------------------------------------------- variable（序列 id 为 var:<id>）
+# ---- ETF_Flow（文档家族：资金流）
+
+# 文档源列：bil_fund_flow
+# 文档配方：bil_fund_flow__chg4, bil_fund_flow__chg52
+[[universe.variable]]
+id = "bil_fund_flow"
+group = "ETF_Flow"
+kind = "level"
+expr = "ref('fl_bil')"
+description = "BIL 日资金流入"
+
+# 文档源列：sum21(bil_fund_flow)
+# 文档配方：bil_fund_flow_acc_1m__chg52
+[[universe.variable]]
+id = "bil_fund_flow_acc_1m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_bil'), 21)"
+description = "BIL 资金流 1月累计（21 日）"
+
+# 文档源列：sum5(bil_fund_flow)
+# 文档配方：bil_fund_flow_acc_1w__chg52
+[[universe.variable]]
+id = "bil_fund_flow_acc_1w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_bil'), 5)"
+description = "BIL 资金流 1周累计（5 日）"
+
+# 文档源列：sum10(bil_fund_flow)
+# 文档配方：bil_fund_flow_acc_2w__chg13, bil_fund_flow_acc_2w__chg52
+[[universe.variable]]
+id = "bil_fund_flow_acc_2w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_bil'), 10)"
+description = "BIL 资金流 2周累计（10 日）"
+
+# 文档源列：sum63(bil_fund_flow)
+# 文档配方：bil_fund_flow_acc_3m__chg13, bil_fund_flow_acc_3m__chg52, bil_fund_flow_acc_3m__level
+[[universe.variable]]
+id = "bil_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_bil'), 63)"
+description = "BIL 资金流 3月累计（63 日）"
+
+# 文档源列：sum15(bil_fund_flow)
+# 文档配方：bil_fund_flow_acc_3w__chg52
+[[universe.variable]]
+id = "bil_fund_flow_acc_3w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_bil'), 15)"
+description = "BIL 资金流 3周累计（15 日）"
+
+# 文档源列：govt_fund_flow
+# 文档配方：govt_fund_flow__chg13, govt_fund_flow__level
+[[universe.variable]]
+id = "govt_fund_flow"
+group = "ETF_Flow"
+kind = "level"
+expr = "ref('fl_govt')"
+description = "GOVT 日资金流入"
+
+# 文档源列：sum63(govt_fund_flow)
+# 文档配方：govt_fund_flow_acc_3m__chg26
+[[universe.variable]]
+id = "govt_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_govt'), 63)"
+description = "GOVT 资金流 3月累计（63 日）"
+
+# 文档源列：sum126(govt_fund_flow)
+# 文档配方：govt_fund_flow_acc_6m__chg13
+[[universe.variable]]
+id = "govt_fund_flow_acc_6m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_govt'), 126)"
+description = "GOVT 资金流 6月累计（126 日）"
+
+# 文档源列：sum10(ief_fund_flow)
+# 文档配方：ief_fund_flow_acc_2w__chg52, ief_fund_flow_acc_2w__level
+[[universe.variable]]
+id = "ief_fund_flow_acc_2w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_ief'), 10)"
+description = "IEF 资金流 2周累计（10 日）"
+
+# 文档源列：sum15(ief_fund_flow)
+# 文档配方：ief_fund_flow_acc_3w__chg13
+[[universe.variable]]
+id = "ief_fund_flow_acc_3w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_ief'), 15)"
+description = "IEF 资金流 3周累计（15 日）"
+
+# 文档源列：sum126(ief_fund_flow)
+# 文档配方：ief_fund_flow_acc_6m__chg13
+[[universe.variable]]
+id = "ief_fund_flow_acc_6m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_ief'), 126)"
+description = "IEF 资金流 6月累计（126 日）"
+
+# 文档源列：iei_fund_flow
+# 文档配方：iei_fund_flow__chg52
+[[universe.variable]]
+id = "iei_fund_flow"
+group = "ETF_Flow"
+kind = "level"
+expr = "ref('fl_iei')"
+description = "IEI 日资金流入"
+
+# 文档源列：sum21(iei_fund_flow)
+# 文档配方：iei_fund_flow_acc_1m__chg1, iei_fund_flow_acc_1m__chg52
+[[universe.variable]]
+id = "iei_fund_flow_acc_1m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_iei'), 21)"
+description = "IEI 资金流 1月累计（21 日）"
+
+# 文档源列：sum5(iei_fund_flow)
+# 文档配方：iei_fund_flow_acc_1w__chg1, iei_fund_flow_acc_1w__chg13, iei_fund_flow_acc_1w__chg52
+[[universe.variable]]
+id = "iei_fund_flow_acc_1w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_iei'), 5)"
+description = "IEI 资金流 1周累计（5 日）"
+
+# 文档源列：sum10(iei_fund_flow)
+# 文档配方：iei_fund_flow_acc_2w__chg1
+[[universe.variable]]
+id = "iei_fund_flow_acc_2w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_iei'), 10)"
+description = "IEI 资金流 2周累计（10 日）"
+
+# 文档源列：sum63(iei_fund_flow)
+# 文档配方：iei_fund_flow_acc_3m__chg1, iei_fund_flow_acc_3m__chg4
+[[universe.variable]]
+id = "iei_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_iei'), 63)"
+description = "IEI 资金流 3月累计（63 日）"
+
+# 文档源列：sum15(iei_fund_flow)
+# 文档配方：iei_fund_flow_acc_3w__chg1
+[[universe.variable]]
+id = "iei_fund_flow_acc_3w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_iei'), 15)"
+description = "IEI 资金流 3周累计（15 日）"
+
+# 文档源列：sum21(shy_fund_flow)
+# 文档配方：shy_fund_flow_acc_1m__chg52
+[[universe.variable]]
+id = "shy_fund_flow_acc_1m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_shy'), 21)"
+description = "SHY 资金流 1月累计（21 日）"
+
+# 文档源列：sum5(shy_fund_flow)
+# 文档配方：shy_fund_flow_acc_1w__chg52
+[[universe.variable]]
+id = "shy_fund_flow_acc_1w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_shy'), 5)"
+description = "SHY 资金流 1周累计（5 日）"
+
+# 文档源列：sum10(shy_fund_flow)
+# 文档配方：shy_fund_flow_acc_2w__chg52
+[[universe.variable]]
+id = "shy_fund_flow_acc_2w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_shy'), 10)"
+description = "SHY 资金流 2周累计（10 日）"
+
+# 文档源列：sum63(shy_fund_flow)
+# 文档配方：shy_fund_flow_acc_3m__chg13, shy_fund_flow_acc_3m__level
+[[universe.variable]]
+id = "shy_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_shy'), 63)"
+description = "SHY 资金流 3月累计（63 日）"
+
+# 文档源列：sum10(tip_fund_flow)
+# 文档配方：tip_fund_flow_acc_2w__chg26
+[[universe.variable]]
+id = "tip_fund_flow_acc_2w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tip'), 10)"
+description = "TIP 资金流 2周累计（10 日）"
+
+# 文档源列：sum63(tip_fund_flow)
+# 文档配方：tip_fund_flow_acc_3m__chg1
+[[universe.variable]]
+id = "tip_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tip'), 63)"
+description = "TIP 资金流 3月累计（63 日）"
+
+# 文档源列：sum15(tip_fund_flow)
+# 文档配方：tip_fund_flow_acc_3w__chg1, tip_fund_flow_acc_3w__chg26
+[[universe.variable]]
+id = "tip_fund_flow_acc_3w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tip'), 15)"
+description = "TIP 资金流 3周累计（15 日）"
+
+# 文档源列：sum21(tlh_fund_flow)
+# 文档配方：tlh_fund_flow_acc_1m__chg13, tlh_fund_flow_acc_1m__chg26, tlh_fund_flow_acc_1m__chg4
+[[universe.variable]]
+id = "tlh_fund_flow_acc_1m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlh'), 21)"
+description = "TLH 资金流 1月累计（21 日）"
+
+# 文档源列：sum63(tlh_fund_flow)
+# 文档配方：tlh_fund_flow_acc_3m__chg4
+[[universe.variable]]
+id = "tlh_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlh'), 63)"
+description = "TLH 资金流 3月累计（63 日）"
+
+# 文档源列：sum126(tlh_fund_flow)
+# 文档配方：tlh_fund_flow_acc_6m__chg4
+[[universe.variable]]
+id = "tlh_fund_flow_acc_6m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlh'), 126)"
+description = "TLH 资金流 6月累计（126 日）"
+
+# 文档源列：sum63(tlt_fund_flow)
+# 文档配方：tlt_fund_flow_acc_3m__chg26, tlt_fund_flow_acc_3m__level
+[[universe.variable]]
+id = "tlt_fund_flow_acc_3m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlt'), 63)"
+description = "TLT 资金流 3月累计（63 日）"
+
+# 文档源列：sum15(tlt_fund_flow)
+# 文档配方：tlt_fund_flow_acc_3w__chg52
+[[universe.variable]]
+id = "tlt_fund_flow_acc_3w"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlt'), 15)"
+description = "TLT 资金流 3周累计（15 日）"
+
+# 文档源列：sum126(tlt_fund_flow)
+# 文档配方：tlt_fund_flow_acc_6m__chg13, tlt_fund_flow_acc_6m__chg26, tlt_fund_flow_acc_6m__level
+[[universe.variable]]
+id = "tlt_fund_flow_acc_6m"
+group = "ETF_Flow"
+kind = "level"
+expr = "rsum(ref('fl_tlt'), 126)"
+description = "TLT 资金流 6月累计（126 日）"
+
+# ---- Rates_Vol（文档家族：利率波动率）
+
+# 文档源列：fv_iv_call
+# 文档配方：fv_iv_call__chg13, fv_iv_call__chg26, fv_iv_call__level
+[[universe.variable]]
+id = "fv_iv_call"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('FV1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "FV 期货 1M 25Δ call 隐含波动率"
+
+# 文档源列：fv_iv_put
+# 文档配方：fv_iv_put__chg13
+[[universe.variable]]
+id = "fv_iv_put"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('FV1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')"
+description = "FV 期货 1M 25Δ put 隐含波动率"
+
+# 文档源列：fv_iv_put − fv_iv_call
+# 文档配方：fv_iv_skew__chg1, fv_iv_skew__chg4, fv_iv_skew__level
+[[universe.variable]]
+id = "fv_iv_skew"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('FV1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('FV1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "FV 期货 1M 25Δ put-call 隐含波动率偏斜"
+
+# 文档源列：(tu_iv_call + tu_iv_put) / 2
+# 文档配方：tu_iv_avg__chg26, tu_iv_avg__chg52
+[[universe.variable]]
+id = "tu_iv_avg"
+group = "Rates_Vol"
+kind = "level"
+expr = "(ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT') + ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')) / 2"
+description = "TU 期货 1M 25Δ call/put 平均隐含波动率"
+
+# 文档源列：tu_iv_call
+# 文档配方：tu_iv_call__chg52
+[[universe.variable]]
+id = "tu_iv_call"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "TU 期货 1M 25Δ call 隐含波动率"
+
+# 文档源列：tu_iv_put
+# 文档配方：tu_iv_put__chg13
+[[universe.variable]]
+id = "tu_iv_put"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')"
+description = "TU 期货 1M 25Δ put 隐含波动率"
+
+# 文档源列：tu_iv_put − tu_iv_call
+# 文档配方：tu_iv_skew__chg4
+[[universe.variable]]
+id = "tu_iv_skew"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "TU 期货 1M 25Δ put-call 隐含波动率偏斜"
+
+# 文档源列：ty_iv_call
+# 文档配方：ty_iv_call__chg4
+[[universe.variable]]
+id = "ty_iv_call"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('TY1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "TY 期货 1M 25Δ call 隐含波动率"
+
+# 文档源列：(us_iv_call + us_iv_put) / 2
+# 文档配方：us_iv_avg__chg13, us_iv_avg__chg52
+[[universe.variable]]
+id = "us_iv_avg"
+group = "Rates_Vol"
+kind = "level"
+expr = "(ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT') + ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')) / 2"
+description = "US 期货 1M 25Δ call/put 平均隐含波动率"
+
+# 文档源列：us_iv_call
+# 文档配方：us_iv_call__chg52
+[[universe.variable]]
+id = "us_iv_call"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "US 期货 1M 25Δ call 隐含波动率"
+
+# 文档源列：us_iv_put
+# 文档配方：us_iv_put__chg52
+[[universe.variable]]
+id = "us_iv_put"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')"
+description = "US 期货 1M 25Δ put 隐含波动率"
+
+# 文档源列：(wn_iv_call + wn_iv_put) / 2
+# 文档配方：wn_iv_avg__chg52
+[[universe.variable]]
+id = "wn_iv_avg"
+group = "Rates_Vol"
+kind = "level"
+expr = "(ts('WN1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT') + ts('WN1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')) / 2"
+description = "WN 期货 1M 25Δ call/put 平均隐含波动率"
+
+# 文档源列：wn_iv_call
+# 文档配方：wn_iv_call__chg52
+[[universe.variable]]
+id = "wn_iv_call"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('WN1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "WN 期货 1M 25Δ call 隐含波动率"
+
+# 文档源列：wn_iv_put
+# 文档配方：wn_iv_put__chg52
+[[universe.variable]]
+id = "wn_iv_put"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('WN1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT')"
+description = "WN 期货 1M 25Δ put 隐含波动率"
+
+# 文档源列：wn_iv_put − wn_iv_call
+# 文档配方：wn_iv_skew__chg26
+[[universe.variable]]
+id = "wn_iv_skew"
+group = "Rates_Vol"
+kind = "level"
+expr = "ts('WN1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('WN1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+description = "WN 期货 1M 25Δ put-call 隐含波动率偏斜"
+
+# ---- Futures_OI（文档家族：期货OI）
+
+# 文档源列：oi_wn
+# 文档配方：oi_wn__level
+[[universe.variable]]
+id = "oi_wn"
+group = "Futures_OI"
+kind = "price"
+expr = "ts('WN1 Comdty','OPEN_INT')"
+description = "WN 近月连续合约持仓量"
+
+# 文档源列：oi_tu / oi_fv
+# 文档配方：ratio_oi_tu_over_oi_fv__chg1
+[[universe.variable]]
+id = "ratio_oi_tu_over_oi_fv"
+group = "Futures_OI"
+kind = "price"
+expr = "ts('TU1 Comdty','OPEN_INT') / pos(ts('FV1 Comdty','OPEN_INT'))"
+description = "持仓量比 TU / FV（近月连续合约）"
+
+# 文档源列：oi_tu / oi_ty
+# 文档配方：ratio_oi_tu_over_oi_ty__chg13, ratio_oi_tu_over_oi_ty__chg52, ratio_oi_tu_over_oi_ty__level
+[[universe.variable]]
+id = "ratio_oi_tu_over_oi_ty"
+group = "Futures_OI"
+kind = "price"
+expr = "ts('TU1 Comdty','OPEN_INT') / pos(ts('TY1 Comdty','OPEN_INT'))"
+description = "持仓量比 TU / TY（近月连续合约）"
+
+# 文档源列：oi_tu / oi_wn
+# 文档配方：ratio_oi_tu_over_oi_wn__chg4
+[[universe.variable]]
+id = "ratio_oi_tu_over_oi_wn"
+group = "Futures_OI"
+kind = "price"
+expr = "ts('TU1 Comdty','OPEN_INT') / pos(ts('WN1 Comdty','OPEN_INT'))"
+description = "持仓量比 TU / WN（近月连续合约）"
+
+# ---- Econ_Surprise（文档家族：经济惊喜）
+
+# 文档源列：cesig10_index
+# 文档配方：cesig10_index__chg52, cesig10_index__level
+[[universe.variable]]
+id = "cesig10_index"
+group = "Econ_Surprise"
+kind = "level"
+expr = "ts('CESIG10 Index','PX_LAST')"
+description = "花旗经济惊喜指数 G10"
+
+# 文档源列：cesiusd_index
+# 文档配方：cesiusd_index__chg1, cesiusd_index__chg4
+[[universe.variable]]
+id = "cesiusd_index"
+group = "Econ_Surprise"
+kind = "level"
+expr = "ts('CESIUSD Index','PX_LAST')"
+description = "花旗经济惊喜指数 美国"
+
+# ---- Commodity（文档家族：商品动量）
+
+# 文档源列：spgsagtr_index
+# 文档配方：spgsagtr_index__mom4
+[[universe.variable]]
+id = "spgsagtr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSAGTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSAGTR"
+
+# 文档源列：spgsaltr_index
+# 文档配方：spgsaltr_index__mom4
+[[universe.variable]]
+id = "spgsaltr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSALTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSALTR"
+
+# 文档源列：spgscitr_index
+# 文档配方：spgscitr_index__mom4
+[[universe.variable]]
+id = "spgscitr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSCITR Index','PX_LAST')"
+description = "商品总回报指数 SPGSCITR"
+
+# 文档源列：spgscltr_index
+# 文档配方：spgscltr_index__mom4
+[[universe.variable]]
+id = "spgscltr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSCLTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSCLTR"
+
+# 文档源列：spgscrtr_index
+# 文档配方：spgscrtr_index__mom4
+[[universe.variable]]
+id = "spgscrtr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSCRTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSCRTR"
+
+# 文档源列：spgsentr_index
+# 文档配方：spgsentr_index__mom4
+[[universe.variable]]
+id = "spgsentr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSENTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSENTR"
+
+# 文档源列：spgsintr_index
+# 文档配方：spgsintr_index__mom13, spgsintr_index__mom4, spgsintr_index__mom52
+[[universe.variable]]
+id = "spgsintr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSINTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSINTR"
+
+# 文档源列：spgsnetr_index
+# 文档配方：spgsnetr_index__mom4
+[[universe.variable]]
+id = "spgsnetr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSNETR Index','PX_LAST')"
+description = "商品总回报指数 SPGSNETR"
+
+# 文档源列：spgspmtr_index
+# 文档配方：spgspmtr_index__mom4
+[[universe.variable]]
+id = "spgspmtr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSPMTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSPMTR"
+
+# 文档源列：spgsretr_index
+# 文档配方：spgsretr_index__mom4
+[[universe.variable]]
+id = "spgsretr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSRETR Index','PX_LAST')"
+description = "商品总回报指数 SPGSRETR"
+
+# 文档源列：spgsuetr_index
+# 文档配方：spgsuetr_index__mom4
+[[universe.variable]]
+id = "spgsuetr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSUETR Index','PX_LAST')"
+description = "商品总回报指数 SPGSUETR"
+
+# 文档源列：spgsxntr_index
+# 文档配方：spgsxntr_index__mom4
+[[universe.variable]]
+id = "spgsxntr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSXNTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSXNTR"
+
+# 文档源列：spgsxptr_index
+# 文档配方：spgsxptr_index__mom13, spgsxptr_index__mom4
+[[universe.variable]]
+id = "spgsxptr_index"
+group = "Commodity"
+kind = "price"
+expr = "ts('SPGSXPTR Index','PX_LAST')"
+description = "商品总回报指数 SPGSXPTR"
+
+# ---- Equity_Style（文档家族：股票风格）
+
+# 文档源列：defs / moml
+# 文档配方：defs_over_moml__chg52
+[[universe.variable]]
+id = "defs_over_moml"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSXUDEFS Index','PX_LAST') / pos(ts('GSXUMFML Index','PX_LAST'))"
+description = "高盛股票风格比 defs / moml"
+
+# 文档源列：defs / moms
+# 文档配方：defs_over_moms__chg4
+[[universe.variable]]
+id = "defs_over_moms"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSXUDEFS Index','PX_LAST') / pos(ts('GSXUMFMS Index','PX_LAST'))"
+description = "高盛股票风格比 defs / moms"
+
+# 文档源列：himo / moml
+# 文档配方：himo_over_moml__chg13, himo_over_moml__chg52, himo_over_moml__level
+[[universe.variable]]
+id = "himo_over_moml"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHIMO Index','PX_LAST') / pos(ts('GSXUMFML Index','PX_LAST'))"
+description = "高盛股票风格比 himo / moml"
+
+# 文档源列：hvms
+# 文档配方：hvms__mom4, hvms__mom52
+[[universe.variable]]
+id = "hvms"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHVMS Index','PX_LAST')"
+description = "高盛股票风格指数 hvms"
+
+# 文档源列：hvms / cycl
+# 文档配方：hvms_over_cycl__chg52
+[[universe.variable]]
+id = "hvms_over_cycl"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHVMS Index','PX_LAST') / pos(ts('GSXUCYCL Index','PX_LAST'))"
+description = "高盛股票风格比 hvms / cycl"
+
+# 文档源列：hvms / defs
+# 文档配方：hvms_over_defs__chg52
+[[universe.variable]]
+id = "hvms_over_defs"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHVMS Index','PX_LAST') / pos(ts('GSXUDEFS Index','PX_LAST'))"
+description = "高盛股票风格比 hvms / defs"
+
+# 文档源列：hvms / moml
+# 文档配方：hvms_over_moml__chg52
+[[universe.variable]]
+id = "hvms_over_moml"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHVMS Index','PX_LAST') / pos(ts('GSXUMFML Index','PX_LAST'))"
+description = "高盛股票风格比 hvms / moml"
+
+# 文档源列：hvms / moms
+# 文档配方：hvms_over_moms__chg52
+[[universe.variable]]
+id = "hvms_over_moms"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSPRHVMS Index','PX_LAST') / pos(ts('GSXUMFMS Index','PX_LAST'))"
+description = "高盛股票风格比 hvms / moms"
+
+# 文档源列：moml
+# 文档配方：moml__mom52
+[[universe.variable]]
+id = "moml"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSXUMFML Index','PX_LAST')"
+description = "高盛股票风格指数 moml"
+
+# 文档源列：moms
+# 文档配方：moms__mom52
+[[universe.variable]]
+id = "moms"
+group = "Equity_Style"
+kind = "price"
+expr = "ts('GSXUMFMS Index','PX_LAST')"
+description = "高盛股票风格指数 moms"
+
+# ---- Forward（文档家族：远期利率）
+
+# 文档源列：fwd_1y2y − 2×fwd_1y10y + fwd_1y30y
+# 文档配方：fly_1y2s10s30s__chg52, fly_1y2s10s30s__level
+[[universe.variable]]
+id = "fly_1y2s10s30s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','2Y') - 2 * curve('USD_SOFR_OIS','fwd_start','1Y','10Y') + curve('USD_SOFR_OIS','fwd_start','1Y','30Y')"
+description = "SOFR OIS 远期曲线蝶式 1y2s10s30s"
+
+# 文档源列：fwd_1y2y − 2×fwd_1y5y + fwd_1y10y
+# 文档配方：fly_1y2s5s10s__chg4, fly_1y2s5s10s__chg52
+[[universe.variable]]
+id = "fly_1y2s5s10s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','2Y') - 2 * curve('USD_SOFR_OIS','fwd_start','1Y','5Y') + curve('USD_SOFR_OIS','fwd_start','1Y','10Y')"
+description = "SOFR OIS 远期曲线蝶式 1y2s5s10s"
+
+# 文档源列：fwd_1y2y − 2×fwd_1y5y + fwd_1y30y
+# 文档配方：fly_1y2s5s30s__chg1, fly_1y2s5s30s__chg13
+[[universe.variable]]
+id = "fly_1y2s5s30s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','2Y') - 2 * curve('USD_SOFR_OIS','fwd_start','1Y','5Y') + curve('USD_SOFR_OIS','fwd_start','1Y','30Y')"
+description = "SOFR OIS 远期曲线蝶式 1y2s5s30s"
+
+# 文档源列：fwd_1y5y − 2×fwd_1y10y + fwd_1y30y
+# 文档配方：fly_1y5s10s30s__chg52
+[[universe.variable]]
+id = "fly_1y5s10s30s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','5Y') - 2 * curve('USD_SOFR_OIS','fwd_start','1Y','10Y') + curve('USD_SOFR_OIS','fwd_start','1Y','30Y')"
+description = "SOFR OIS 远期曲线蝶式 1y5s10s30s"
+
+# 文档源列：fwd_5y5y_curve
+# 文档配方：fwd_5y5y_curve__chg13, fwd_5y5y_curve__chg26, fwd_5y5y_curve__chg52, fwd_5y5y_curve__level
+[[universe.variable]]
+id = "fwd_5y5y_curve"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','5Y','5Y')"
+description = "SOFR OIS 5Y5Y 远期利率"
+
+# 文档源列：fwd_1y2y − fwd_1y1y
+# 文档配方：slope_1y1s2s__chg4
+[[universe.variable]]
+id = "slope_1y1s2s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','2Y') - curve('USD_SOFR_OIS','fwd_start','1Y','1Y')"
+description = "SOFR OIS 远期曲线斜率 1y1s2s"
+
+# 文档源列：fwd_1y5y − fwd_1y1y
+# 文档配方：slope_1y1s5s__chg52
+[[universe.variable]]
+id = "slope_1y1s5s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','5Y') - curve('USD_SOFR_OIS','fwd_start','1Y','1Y')"
+description = "SOFR OIS 远期曲线斜率 1y1s5s"
+
+# 文档源列：fwd_1y20y − fwd_1y2y
+# 文档配方：slope_1y2s20s__chg1
+[[universe.variable]]
+id = "slope_1y2s20s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','20Y') - curve('USD_SOFR_OIS','fwd_start','1Y','2Y')"
+description = "SOFR OIS 远期曲线斜率 1y2s20s"
+
+# 文档源列：fwd_1y5y − fwd_1y2y
+# 文档配方：slope_1y2s5s__chg1
+[[universe.variable]]
+id = "slope_1y2s5s"
+group = "Forward"
+kind = "level"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','5Y') - curve('USD_SOFR_OIS','fwd_start','1Y','2Y')"
+description = "SOFR OIS 远期曲线斜率 1y2s5s"
+
+# ---- FF_Path（文档家族：FF政策路径）
+
+# 文档源列：far(t) − far(t−5日频观测)
+# 文档配方：ff_net_path_shock_5d__level
+[[universe.variable]]
+id = "ff_net_path_shock_5d"
+group = "FF_Path"
+kind = "level"
+expr = "vmean((100 - ts('FF6 Comdty','PX_LAST')), (100 - ts('FF12 Comdty','PX_LAST')), (100 - ts('FF18 Comdty','PX_LAST')), (100 - ts('FF24 Comdty','PX_LAST'))) - lag(vmean((100 - ts('FF6 Comdty','PX_LAST')), (100 - ts('FF12 Comdty','PX_LAST')), (100 - ts('FF18 Comdty','PX_LAST')), (100 - ts('FF24 Comdty','PX_LAST'))), 5)"
+description = "FF 远端路径 5 日净冲击"
+
+# 文档源列：r12 − policy
+# 文档配方：ff_rate_12_minus_policy__chg13, ff_rate_12_minus_policy__chg4
+[[universe.variable]]
+id = "ff_rate_12_minus_policy"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF12 Comdty','PX_LAST')) - (ts('FDTR Index','PX_LAST') + ts('FDTRFTRL Index','PX_LAST')) / 2"
+description = "FF12 隐含利率 − 政策利率中点"
+
+# 文档源列：r12 − r6
+# 文档配方：ff_segment_06_12__chg1, ff_segment_06_12__chg26
+[[universe.variable]]
+id = "ff_segment_06_12"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF12 Comdty','PX_LAST')) - (100 - ts('FF6 Comdty','PX_LAST'))"
+description = "FF 路径 r12 − r6"
+
+# 文档源列：r3 − r1
+# 文档配方：ff_slope_03_01__chg13
+[[universe.variable]]
+id = "ff_slope_03_01"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF3 Comdty','PX_LAST')) - (100 - ts('FF1 Comdty','PX_LAST'))"
+description = "FF 斜率 r3 − r1"
+
+# 文档源列：r9 − r1
+# 文档配方：ff_slope_09_01__chg52
+[[universe.variable]]
+id = "ff_slope_09_01"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF9 Comdty','PX_LAST')) - (100 - ts('FF1 Comdty','PX_LAST'))"
+description = "FF 斜率 r9 − r1"
+
+# 文档源列：r12 − r1
+# 文档配方：ff_slope_12_01__chg13, ff_slope_12_01__chg26
+[[universe.variable]]
+id = "ff_slope_12_01"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF12 Comdty','PX_LAST')) - (100 - ts('FF1 Comdty','PX_LAST'))"
+description = "FF 斜率 r12 − r1"
+
+# 文档源列：r18 − r1
+# 文档配方：ff_slope_18_01__chg26
+[[universe.variable]]
+id = "ff_slope_18_01"
+group = "FF_Path"
+kind = "level"
+expr = "(100 - ts('FF18 Comdty','PX_LAST')) - (100 - ts('FF1 Comdty','PX_LAST'))"
+description = "FF 斜率 r18 − r1"
+
+# 文档源列：max(R) − min(R)
+# 文档配方：ff_strip_range__chg4
+[[universe.variable]]
+id = "ff_strip_range"
+group = "FF_Path"
+kind = "level"
+expr = "vmax((100 - ts('FF3 Comdty','PX_LAST')), (100 - ts('FF6 Comdty','PX_LAST')), (100 - ts('FF9 Comdty','PX_LAST')), (100 - ts('FF12 Comdty','PX_LAST')), (100 - ts('FF18 Comdty','PX_LAST')), (100 - ts('FF24 Comdty','PX_LAST'))) - vmin((100 - ts('FF3 Comdty','PX_LAST')), (100 - ts('FF6 Comdty','PX_LAST')), (100 - ts('FF9 Comdty','PX_LAST')), (100 - ts('FF12 Comdty','PX_LAST')), (100 - ts('FF18 Comdty','PX_LAST')), (100 - ts('FF24 Comdty','PX_LAST')))"
+description = "FF 条带极差 max − min"
+
+# 文档源列：max(r1…r24) − policy
+# 文档配方：ff_terminal_minus_policy__chg4
+[[universe.variable]]
+id = "ff_terminal_minus_policy"
+group = "FF_Path"
+kind = "level"
+expr = "vmax((100 - ts('FF1 Comdty','PX_LAST')), (100 - ts('FF2 Comdty','PX_LAST')), (100 - ts('FF3 Comdty','PX_LAST')), (100 - ts('FF4 Comdty','PX_LAST')), (100 - ts('FF5 Comdty','PX_LAST')), (100 - ts('FF6 Comdty','PX_LAST')), (100 - ts('FF7 Comdty','PX_LAST')), (100 - ts('FF8 Comdty','PX_LAST')), (100 - ts('FF9 Comdty','PX_LAST')), (100 - ts('FF10 Comdty','PX_LAST')), (100 - ts('FF11 Comdty','PX_LAST')), (100 - ts('FF12 Comdty','PX_LAST')), (100 - ts('FF13 Comdty','PX_LAST')), (100 - ts('FF14 Comdty','PX_LAST')), (100 - ts('FF15 Comdty','PX_LAST')), (100 - ts('FF16 Comdty','PX_LAST')), (100 - ts('FF17 Comdty','PX_LAST')), (100 - ts('FF18 Comdty','PX_LAST')), (100 - ts('FF19 Comdty','PX_LAST')), (100 - ts('FF20 Comdty','PX_LAST')), (100 - ts('FF21 Comdty','PX_LAST')), (100 - ts('FF22 Comdty','PX_LAST')), (100 - ts('FF23 Comdty','PX_LAST')), (100 - ts('FF24 Comdty','PX_LAST'))) - (ts('FDTR Index','PX_LAST') + ts('FDTRFTRL Index','PX_LAST')) / 2"
+description = "FF 路径峰值 − 政策利率中点"
+
+[position]
+# 连续仓位 = sign * 信号(按波动率缩放的 y 单位); 缓冲带: 目标与当前仓位之差的绝对值 > buffer 才调仓,
+# 否则维持原仓位。buffer = 0 即每天跟随目标; 慢信号不必每天调仓。
+buffer = 0.5
+# 成交延迟: 信号在 t 日收盘后形成, 在其后第 1 个标的收盘成交, 新仓从成交后开始承担收益(与生产口径一致)。
+# 即 t 日的信号决定 t+1 日收盘起的仓位, 承担 t+1 -> t+2 的收益。设为 0 即信号当日收盘成交。
+execution_delay = 1
+
+[signals]
+std_window = 252
+clip = 4.0
+vol_halflife = 20
+
+[stats]
+hac_lags = 5
+min_obs = 250    # 每个候选在样本内(IS)至少需要的有效观测数, 不足者不检验
+n_boot = 1000
+min_shift = 60
+seed = 20261122
+
+[verdict]
+# 每个候选都是独立的单因子检验:
+#   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的样本内(IS)行。
+#   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
+#   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_is))。
+# 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按开发样本净 Sharpe(min_net_sharpe)筛选可交易性,
+# 通过的再按相关性去重, 代表组成 shortlist;
+# 样本外(OOS)由 confirm 确认(只打开一次, 不据此再调整)。
+z_pass = 2.5
+z_weak = 2.0
+dedupe_corr = 0.7        # 去重: 开发样本(IS+OBS)共同行上信号相关系数绝对值 >= 此值归入同一代表
+extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)
+obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它
+year_hit_min = 0.6       # 逐年 IC 为正的年份占比低于此值(且计入年数 >= 3)则标 unstable
+min_net_sharpe = 0.3     # 开发样本(样本内+观察期)上扣成本后的年化净 Sharpe 下限, 低于此值的候选在去重前被淘汰
+is_min_net_sharpe = 0.3  # 样本内扣成本后年化净 Sharpe 的下限(严格大于); 与 |z| 门槛同时满足才算通过第 1 步

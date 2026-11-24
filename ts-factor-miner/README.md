@@ -64,7 +64,7 @@ databank.py        transforms.py      stats.py            pipeline.py           
 
 报告的"可得性输入"表有一列"出处"；组合规则（利差两条腿 `a+b`、公式变量的多个叶子）取各组成部分里最弱的一档（起草 < 研究者确认 < 已验证，`+expr_lag` 不参与判断），表下方汇总各档的序列数。
 
-`configs/ty.toml`、`configs/eurusd.toml`、`configs/ty_vars.toml` 的 `[lags.class]` / `[lags.ticker]` 取值相同：
+`configs/ty.toml`、`configs/eurusd.toml`、`configs/ty_vars.toml`、`configs/ty_recipes.toml` 的 `[lags.class]` / `[lags.ticker]` 取值相同：
 
 | 规则 | lag | 出处 |
 |---|---|---|
@@ -163,12 +163,12 @@ shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对�
 
 ### 3.12 公式变量（`variables.py`）
 
-除了按类别盲扫，候选池也可以由研究者给定有经济含义的变量：`[[universe.variable]]` 的每一项是一个公式（`id`、`expr`、`kind`、`group`、`description`），成为面板的一列，序列 id 为 `var:<id>`；系统对每个变量照旧做固定的变换并逐个做双边检验，不预设方向。`[[universe.helper]]`（`id`、`expr`）只供 `ref()` 引用，不是候选。helper 与 variable 的 id 全局唯一（ASCII 字母数字下划线）。`configs/ty_vars.toml` 是 TY 的 63 个变量清单；`universe.select` 可以为空。
+除了按类别盲扫，候选池也可以由研究者给定有经济含义的变量：`[[universe.variable]]` 的每一项是一个公式（`id`、`expr`、`kind`、`group`、`description`），成为面板的一列，序列 id 为 `var:<id>`；系统对每个变量照旧做固定的变换并逐个做双边检验，不预设方向。`[[universe.helper]]`（`id`、`expr`）只供 `ref()` 引用，不是候选。helper 与 variable 的 id 全局唯一（ASCII 字母数字下划线）。`configs/ty_vars.toml` 是 TY 的 63 个变量清单；`configs/ty_recipes.toml` 是生产策略文档 135 条配方的“日频源列”去重后得到的变量清单（文档里的周度变换、标准化、映射不复现，变量走本系统的固定变换与 70/15/15 切分；各变量注释里列出文档中用到它的 factor_id）；`universe.select` 可以为空。
 
 表达式用 `ast` 解析后按白名单求值，不用 `eval` / `exec`：只允许数字常量、字符串常量（仅作函数参数）、`+ - * /`、一元 `+ -`、括号和下列函数，其余语法都抛 `ValueError`（带变量 id）。
 
 - 叶子（取数，返回已对齐到标的日历并已滞后的序列）：`ts(ticker[, field])`（存量，as-of + 陈旧截断 + 滞后）；`flow(ticker, field)`（流量：观测累加到日期 ≥ 观测日的第一个日历行，没有观测的行为 0、首个观测之前为 NaN，早于日历首日的观测丢弃，最后一个观测之后超过陈旧上限仍无观测则为 NaN，不向前填充，再整体滞后）；`chain(root, column)`（期货连续合约的一列，`return_valid == 1` 的行）；`curve(name, measure, start_tenor, tenor)`（库内曲线点）；`futures_oi(root)`（该品种所有具体合约 `OPEN_INT` 之和，不含 `XX1` / COMB 连续合约；规则只看 `[lags.field]` 的 `"OPEN_INT"`）；`ref(id)`（另一个变量或 helper 的未变换取值，循环引用报错）。
-- 运算（均因果）：`lag(x, n)`、`diff`、`dlog`（非正为 NaN）、`sign`、`nz`、`cumsum`（首个有限值之前为 NaN，之后 NaN 输入当 0 累加，但该行本身输出 NaN）、`clean(x, n, k)`（用此前 n 个有限观测的中位数与 MAD 剔除离群点，MAD 为 0 或历史不足 n//2 不过滤，前向填充的重复值不进入历史）、`rvol(x, n)`（`dlog` 的 n 日滚动标准差 × √252 × 100）。二元运算两侧都有限才有值，除以 0 为 NaN。
+- 运算（均因果）：`lag(x, n)`、`diff`、`dlog`（非正为 NaN）、`sign`、`nz`、`cumsum`（首个有限值之前为 NaN，之后 NaN 输入当 0 累加，但该行本身输出 NaN）、`rsum(x, n)`（最近 n 行求和，需满 n 个有限值，每个窗口单独求和）、`pos(x)`（x > 0 保留，否则 NaN，用作必须为正的分母）、`vmean(a, b, ...)` / `vmax` / `vmin`（至少两个参数，逐行，所有参数都有限才有值，参数可含常数但至少一个是序列；有效滞后取各参数最大值）、`clean(x, n, k)`（用此前 n 个有限观测的中位数与 MAD 剔除离群点，MAD 为 0 或历史不足 n//2 不过滤，前向填充的重复值不进入历史）、`rvol(x, n)`（`dlog` 的 n 日滚动标准差 × √252 × 100）。二元运算两侧都有限才有值，除以 0 为 NaN。
 - 可得性：每条底层叶子先各自对齐并滞后，再做公式运算。`ts` / `flow` 的优先级为 `[lags.ticker]` > `[lags.field]`（键为字段名）> `[lags.class]`；`chain` 先看 `[lags.field]` 里的 `"chain:<column>"`，再用 `lags.chain`；`curve` 看 `[lags.curve]`（键为曲线名）。任一叶子没有规则，该变量被拒收，`excluded` 里原因为 `no_availability_rule: <叶子>`，ticker 为 `var:<id>`。叶子取不到数据（未知 ticker / 字段、空数据）是配置错误，直接抛 `ValueError`。叶子的频率不是日频或周频则拒收（`freq_not_daily_or_weekly: <叶子>`）。变量的 `freq` 取各叶子最粗者，`lag` 取各叶子最大值，`lag_rule` 是各叶子规则键去重后用 `+` 连接。`lag` 是沿表达式树传播的有效滞后：叶子取其规则 lag，`lag(x, n)` 加 n，其余取各子节点最大值，`ref` 取被引用表达式的有效滞后；有效滞后大于各叶子规则 lag 的最大值时，`lag_rule` 末尾追加 `+expr_lag`。
 
 ## 4. 快速开始
@@ -300,6 +300,8 @@ python -m pytest -q
 - **可交易性筛选**：`test_high_turnover_signal_fails_tradability`（IC 显著但换手高、成本高 → DROP、不进 shortlist、`rep` 为空）、`test_gate_is_the_reason_for_the_drop`（同一份数据把 `min_net_sharpe` 设为 -1e9 后回到 shortlist）、`test_dedupe_after_screen_promotes_tradable_member`（簇内 t 最高的成员净 Sharpe 不达标时，同簇能交易的成员顶上来当代表）、`test_net_sharpe_gate_boundary_and_nonfinite`、`test_load_config_min_net_sharpe`。第 1 步的净 Sharpe 条件：`test_in_sample_net_sharpe_gate`、`test_final_verdict_boundary`、`test_load_config_is_min_net_sharpe`。
 - **IC 衰减 / 信号自相关 / 逐年命中**：`test_ic_decay_*`、`test_autocorr_and_half_life_of_random_walk_zscore`、`test_year_hit_*`。
 - **零分布标准差**：`test_null_sd_*`，以及 HAC t 的朴素对照与零假设校准。
+
+`rsum` / `vmean` / `vmax` / `vmin` / `pos` 的语义与因果性见 `tests/test_variables.py`，`configs/ty_recipes.toml` 的加载与连库核对见 `test_ty_recipes_config_loads`、`test_build_panel_ty_recipes_integration`。
 
 集成测试 `test_build_panel_ty_integration` 等需要本地数据库，数据库不存在时会 skip。
 

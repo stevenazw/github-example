@@ -98,6 +98,13 @@ def vals(res):
     "",
     "ts('x') +",
     "1e999",
+    "rsum(ts('x'), 0)",
+    "rsum(ts('x'), 2.5)",
+    "rsum(ts('x'))",
+    "pos(ts('x'), 1)",
+    "vmax(ts('x'))",
+    "vmean()",
+    "vmin(ts('x'), 'a')",
 ])
 def test_unsafe_or_invalid_expressions_rejected(expr):
     with pytest.raises(ValueError, match="myvar"):
@@ -201,6 +208,9 @@ CAUSAL = [
     "clean(ts('P') - ts('Q'), 10, 3)",
     "cumsum(clean(dlog(ts('P')), 8, 4)) + cumsum(ts('Q'))",
     "nz(clean(ts('Q'), 6, 2)) + lag(ts('P'), 2)",
+    "rsum(ts('P') - ts('Q'), 7) / pos(rsum(ts('Q'), 3))",
+    "vmax(ts('P'), ts('Q'), lag(ts('P'), 2)) - vmin(ts('P'), ts('Q')) + vmean(ts('P'), ts('Q'), 3)",
+    "vmean(ts('P'), ts('Q')) - lag(vmean(ts('P'), ts('Q')), 5)",
 ]
 
 
@@ -602,3 +612,55 @@ def test_futures_oi_expression_in_evaluator():
     p, _ = _oi_provider(LagsConfig(chain=0, field_={"OPEN_INT": 2}))
     r = Evaluator(p, {"v": "futures_oi('TY') / 10"}).evaluate("v")
     assert r.lag == 2 and r.lag_rule == "field:OPEN_INT" and r.series.iloc[2] == 10.0
+
+
+# ------------------------------------------------- rsum / vmean / vmax / vmin / pos
+def test_rsum_needs_a_full_window_of_finite_values():
+    v = [1, 2, 3, nan, 5, 6, 7, 8, 9, 10.0]
+    got = ev("rsum(ts('A'), 3)", {"A/PX_LAST": (S(v), 0, "r", "D")}).series.to_numpy()[:10]
+    np.testing.assert_array_equal(got, [nan, nan, 6, nan, nan, nan, 18, 21, 24, 27])
+    assert np.isnan(ev("rsum(ts('A'), 11)", {"A/PX_LAST": (S(v), 0, "r", "D")}).series.iloc[:10]).all()
+    got1 = ev("rsum(ts('A'), 1)", {"A/PX_LAST": (S(v), 0, "r", "D")}).series.to_numpy()[:10]
+    np.testing.assert_array_equal(got1, np.asarray(v))
+
+
+def test_rsum_has_no_running_sum_drift():
+    big = np.zeros(40)
+    big[5] = 1e16
+    big[6:] = 0.1
+    got = ev("rsum(ts('A'), 5)", {"A/PX_LAST": (S(big), 0, "r", "D")}).series.to_numpy()
+    assert got[39] == pytest.approx(0.5, abs=1e-12)           # a running sum would have lost the 0.1s to 1e16
+
+
+def test_pos_keeps_only_strictly_positive():
+    d = {"A/PX_LAST": (S([-1, 0, 2, nan, 5.0]), 0, "r", "D")}
+    np.testing.assert_array_equal(ev("pos(ts('A'))", d).series.to_numpy()[:5], [nan, nan, 2, nan, 5])
+    d["B/PX_LAST"] = (S([4, 4, 4, 4, 4.0]), 0, "r", "D")
+    np.testing.assert_array_equal(ev("ts('B') / pos(ts('A'))", d).series.to_numpy()[:5], [nan, nan, 2, nan, 0.8])
+
+
+def test_rowwise_functions_need_all_arguments_finite():
+    d = {"A/PX_LAST": (S([1, 5, nan, 4.0]), 0, "r", "D"), "B/PX_LAST": (S([3, 2, 9, 4.0]), 2, "r2", "D")}
+    np.testing.assert_array_equal(ev("vmax(ts('A'), ts('B'))", d).series.to_numpy()[:4], [3, 5, nan, 4])
+    np.testing.assert_array_equal(ev("vmin(ts('A'), ts('B'), 2)", d).series.to_numpy()[:4], [1, 2, nan, 2])
+    np.testing.assert_array_equal(ev("vmean(ts('A'), ts('B'))", d).series.to_numpy()[:4], [2, 3.5, nan, 4])
+    r = ev("vmean(ts('A'), ts('B'), 3)", d)
+    np.testing.assert_allclose(r.series.to_numpy()[:4], [7 / 3, 10 / 3, nan, 11 / 3])
+    assert r.lag == 2 and r.lag_rule == "r+r2"              # lag propagates as the maximum of the arguments
+    with pytest.raises(ValueError, match="at least one series"):
+        ev("vmax(1, 2)", d)
+
+
+def test_rowwise_and_rsum_causal_on_future_change():
+    rng = np.random.default_rng(3)
+    a, b = rng.normal(0, 1, 60), rng.normal(0, 1, 60)
+    cal = pd.bdate_range("2020-01-01", periods=60)
+
+    def run(a_, b_):
+        d = {"A/PX_LAST": (pd.Series(a_, index=cal), 0, "r", "D"), "B/PX_LAST": (pd.Series(b_, index=cal), 0, "r", "D")}
+        return ev("rsum(vmax(ts('A'), ts('B')), 5) - vmin(ts('A'), ts('B'))", d, calendar=cal).series
+
+    base = run(a, b)
+    a2, b2 = a.copy(), b.copy()
+    a2[40:], b2[40:] = 99.0, -99.0
+    pd.testing.assert_series_equal(run(a2, b2).iloc[:40], base.iloc[:40])

@@ -25,7 +25,9 @@ CHAIN_COLUMNS = ("return_index", "ret", "px_active", "calendar_spread", "oi_acti
 # name -> (kind, number of positional args allowed)
 _LEAF_ARITY = {"ts": (1, 2), "flow": (2, 2), "chain": (2, 2), "curve": (4, 4), "futures_oi": (1, 1),
                "ref": (1, 1)}
-_SERIES_FUNCS = {"lag": 2, "diff": 1, "dlog": 1, "sign": 1, "nz": 1, "cumsum": 1, "rvol": 2, "clean": 3}
+_SERIES_FUNCS = {"lag": 2, "diff": 1, "dlog": 1, "sign": 1, "nz": 1, "cumsum": 1, "rvol": 2, "clean": 3,
+                 "rsum": 2, "pos": 1}
+_ROWWISE_FUNCS = ("vmean", "vmax", "vmin")        # variadic (>= 2 arguments), row by row, all arguments finite
 _BIN_OPS = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
 
 
@@ -163,6 +165,12 @@ def _check(node, vid: str) -> None:
             for a in args:
                 _check_str_arg(a, vid, fn)
             return
+        if fn in _ROWWISE_FUNCS:
+            if len(args) < 2:
+                raise _err(vid, f"{fn}() takes at least 2 arguments, got {len(args)}")
+            for a in args:
+                _check(a, vid)
+            return
         if fn in _SERIES_FUNCS:
             if len(args) != _SERIES_FUNCS[fn]:
                 raise _err(vid, f"{fn}() takes {_SERIES_FUNCS[fn]} argument(s), got {len(args)}")
@@ -171,6 +179,8 @@ def _check(node, vid: str) -> None:
                 _check_int_arg(args[1], vid, fn, 0)
             elif fn == "rvol":
                 _check_int_arg(args[1], vid, fn, 2)
+            elif fn == "rsum":
+                _check_int_arg(args[1], vid, fn, 1)
             elif fn == "clean":
                 _check_int_arg(args[1], vid, fn, 2)
                 k = args[2]
@@ -314,6 +324,37 @@ def op_rvol(x: pd.Series, n: int) -> pd.Series:
     return op_dlog(x).rolling(n, min_periods=n).std(ddof=1) * np.sqrt(252.0) * 100.0
 
 
+def op_rsum(x: pd.Series, n: int) -> pd.Series:
+    """Sum of the last ``n`` rows (the row itself included); NaN unless all ``n`` rows are finite. Each window is
+    summed on its own (no running sum), so there is no drift. Causal."""
+    v = x.to_numpy(dtype=float)
+    out = np.full(len(v), np.nan)
+    if len(v) >= n:
+        win = np.lib.stride_tricks.sliding_window_view(v, n)
+        ok = np.isfinite(win).all(axis=1)
+        out[n - 1:] = np.where(ok, np.where(ok[:, None], win, 0.0).sum(axis=1), np.nan)
+    return pd.Series(out, index=x.index, dtype=float)
+
+
+def op_pos(x: pd.Series) -> pd.Series:
+    """x where x > 0, else NaN (use as a denominator that must be positive)."""
+    return x.where(x > 0)
+
+
+def op_rowwise(fn: str, parts: list) -> pd.Series:
+    """Row-wise mean / max / min of several series (constants broadcast); NaN unless every argument is finite."""
+    idx = next(p.index for p in parts if isinstance(p, pd.Series))
+    for p in parts:
+        if isinstance(p, pd.Series) and not p.index.equals(idx):
+            raise ValueError("operands are not on the same calendar")
+    m = np.vstack([p.to_numpy(dtype=float) if isinstance(p, pd.Series) else np.full(len(idx), float(p))
+                   for p in parts])
+    ok = np.isfinite(m).all(axis=0)
+    with np.errstate(all="ignore"):
+        r = {"vmean": np.mean, "vmax": np.max, "vmin": np.min}[fn](m, axis=0)
+    return pd.Series(np.where(ok, r, np.nan), index=idx, dtype=float)
+
+
 # ------------------------------------------------------------------ evaluator
 class _Ctx:
     def __init__(self, vid: str):
@@ -392,6 +433,11 @@ class Evaluator:
             return self._ref(node.args[0].value, ctx)
         if fn in _LEAF_ARITY:
             return self._leaf(fn, [a.value for a in node.args], ctx)
+        if fn in _ROWWISE_FUNCS:
+            vals = [self._ev(a, ctx) for a in node.args]
+            if not any(isinstance(v, pd.Series) for v, _ in vals):
+                raise _err(ctx.vid, f"{fn}() needs at least one series argument")
+            return op_rowwise(fn, [v for v, _ in vals]), max(l for _, l in vals)
         xv, lx = self._ev(node.args[0], ctx)
         x = _need_series(xv, ctx.vid, fn)
         if fn == "lag":
@@ -407,6 +453,10 @@ class Evaluator:
             r = x.where(np.isfinite(x), 0.0)
         elif fn == "cumsum":
             r = op_cumsum(x)
+        elif fn == "rsum":
+            r = op_rsum(x, int(node.args[1].value))
+        elif fn == "pos":
+            r = op_pos(x)
         elif fn == "clean":
             r = op_clean(x, int(node.args[1].value), float(node.args[2].value))
         else:                                                # rvol

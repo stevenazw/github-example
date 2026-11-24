@@ -1,6 +1,7 @@
 """Tests for tsminer.config and tsminer.databank (pure functions first, one integration test)."""
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -478,7 +479,7 @@ COMMODITY = [f"{c} Index" for c in ("SPGSAGTR SPGSALTR SPGSCITR SPGSCLTR SPGSCRT
 GS = [f"{c} Index" for c in "GSPRHIMO GSPRHVMS GSXUCYCL GSXUDEFS GSXUMFML GSXUMFMS".split()]
 
 
-@pytest.mark.parametrize("name", ["ty", "eurusd", "ty_vars"])
+@pytest.mark.parametrize("name", ["ty", "eurusd", "ty_vars", "ty_recipes"])
 def test_shipped_configs_final_lag_values_and_provenance(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     lg = cfg.lags
@@ -510,7 +511,7 @@ def test_shipped_configs_final_lag_values_and_provenance(name):
     drafts = {"class:Macro/Global", "class:Macro/US", "class:Positioning/CFTC_COT", "class:FED/Balance_Sheet",
               "class:FED/Primary_Dealer", "ticker:NFCIINDX Index"}
     assert not (drafts & (ver | set(lg.confirmed)))
-    if name == "ty_vars":
+    if name in ("ty_vars", "ty_recipes"):
         assert not ({"field:EQY_SH_OUT", "field:FUND_NET_ASSET_VAL", "field:CONVENTIONAL_CTD_FORWARD_FRSK",
                      "field:VOLUME"} & (ver | set(lg.confirmed)))
     assert json.loads(json.dumps(cfg.to_dict()))["lags"]["verified"] == lg.verified
@@ -588,6 +589,86 @@ def test_build_panel_ty_vars_integration():
     assert m.sum() > 1000
     np.testing.assert_allclose(got[m].to_numpy(), exp[m].to_numpy(), rtol=0, atol=1e-12)
     assert got[~m].isna().all()
+
+
+# --------------------------------------------------- ty_recipes.toml: daily source columns of the production recipes
+FAMILY_GROUPS = {"ETF_Flow", "Rates_Vol", "Futures_OI", "Econ_Surprise", "Commodity", "Equity_Style", "Forward",
+                 "FF_Path"}
+
+
+def test_ty_recipes_config_loads():
+    from tsminer.config import VARIABLE_KINDS
+
+    cfg = load_config(CONFIGS / "ty_recipes.toml")
+    ids = [v["id"] for v in cfg.universe.variable]
+    assert len(ids) == len(set(ids)) > 60
+    assert not (set(ids) & {h["id"] for h in cfg.universe.helper})
+    assert all(v["kind"] in VARIABLE_KINDS for v in cfg.universe.variable)
+    assert {v["group"] for v in cfg.universe.variable} == FAMILY_GROUPS
+    assert all(re.fullmatch(r"[a-z0-9_]+", i) for i in ids)
+    assert {"tlt_fund_flow_acc_3m", "bil_fund_flow", "fv_iv_skew", "ratio_oi_tu_over_oi_ty", "ff_slope_12_01",
+            "ff_net_path_shock_5d", "spgsintr_index", "defs_over_moml", "fly_1y2s5s10s"} <= set(ids)
+    assert cfg.universe.select == [] and cfg.universe.spread == [] and cfg.universe.chains == []
+    assert "recipe" not in cfg.to_dict()["universe"]
+    import tomllib
+    raw = tomllib.loads((CONFIGS / "ty_recipes.toml").read_text(encoding="utf-8"))
+    assert set(raw["universe"]) == {"fields", "helper", "variable"}
+    base = load_config(CONFIGS / "ty_vars.toml")
+    assert cfg.lags == base.lags and cfg.target == base.target and cfg.verdict == base.verdict
+    assert cfg.signals == base.signals and cfg.stats == base.stats and cfg.sample == base.sample
+    assert cfg.position == base.position and cfg.universe.fields == base.universe.fields
+    kind = {v["id"]: v["kind"] for v in cfg.universe.variable}
+    assert kind["tlt_fund_flow_acc_3m"] == kind["fv_iv_skew"] == kind["fly_1y2s5s10s"] == "level"
+    assert kind["ratio_oi_tu_over_oi_ty"] == kind["spgsintr_index"] == kind["defs_over_moml"] == "price"
+
+
+def test_build_panel_ty_recipes_integration():
+    cfg0, db = _db_cfg()
+    from tsminer.databank import _fetch, build_panel, align_flow_to_calendar
+
+    cfg = load_config(CONFIGS / "ty_recipes.toml")
+    panel = build_panel(cfg)
+    ids = {f"var:{v['id']}" for v in cfg.universe.variable}
+    assert set(panel.X.columns) | set(panel.excluded["ticker"]) == ids
+    assert all(c.startswith("var:") for c in panel.X.columns)
+    assert panel.excluded["ticker"].is_unique
+    rejected = {r.ticker: r.reason for r in panel.excluded.itertuples()}
+    assert not rejected, f"rejected variables: {rejected}"            # every rule needed is in [lags]
+    assert panel.X.index.equals(panel.target.index) and "recipes" not in panel.info
+
+    sys.path.insert(0, cfg.databank.toolkit_dir)
+    from data_query import DataQuery
+    q = DataQuery(db_path=db)
+    cal = panel.X.index
+    last = slice(-200, None)
+
+    def raw(tk, fld):
+        return _fetch(q, [tk], fld)[tk][0]
+
+    # (1) sum of the aligned daily TLT inflow over the last 63 rows
+    flow = raw("TLT US Equity", "FUND_FLOW")
+    al = align_flow_to_calendar(flow, cal, 1, STALE_LIMIT[infer_freq(flow.index)])
+    exp = pd.Series([al.iloc[i - 62:i + 1].sum() if al.iloc[i - 62:i + 1].notna().all() else np.nan
+                     for i in range(len(al))], index=cal)
+    got = panel.X["var:tlt_fund_flow_acc_3m"]
+    np.testing.assert_allclose(got.iloc[last].to_numpy(), exp.iloc[last].to_numpy(), rtol=1e-12, atol=1e-6)
+    assert got.iloc[last].notna().sum() > 150 and panel.meta.at["var:tlt_fund_flow_acc_3m", "lag"] == 1
+
+    # (2) put minus call implied vol, each leaf aligned with the FIELD lag (1) on its own
+    put, call = (raw("FV1 Comdty", f"1M_{k}_IMP_VOL_25DELTA_DFLT") for k in ("PUT", "CALL"))
+    exp = (align_to_calendar(put, cal, 1, STALE_LIMIT["D"]) - align_to_calendar(call, cal, 1, STALE_LIMIT["D"]))
+    got = panel.X["var:fv_iv_skew"]
+    np.testing.assert_allclose(got.iloc[last].to_numpy(), exp.iloc[last].to_numpy(), rtol=0, atol=1e-12)
+    assert got.iloc[last].notna().sum() > 150
+    assert panel.meta.at["var:fv_iv_skew", "lag"] == 1
+
+    # (3) FF12 implied rate minus FF1 implied rate = FF1 price - FF12 price, ticker rules (lag 0)
+    exp = (align_to_calendar(raw("FF1 Comdty", "PX_LAST"), cal, 0, STALE_LIMIT["D"])
+           - align_to_calendar(raw("FF12 Comdty", "PX_LAST"), cal, 0, STALE_LIMIT["D"]))
+    got = panel.X["var:ff_slope_12_01"]
+    np.testing.assert_allclose(got.iloc[last].to_numpy(), exp.iloc[last].to_numpy(), rtol=0, atol=1e-10)
+    assert got.iloc[last].notna().sum() > 150
+    assert panel.meta.at["var:ff_slope_12_01", "lag"] == 0
 
 
 def test_build_panel_variable_without_rule_is_excluded_with_leaf_named():
