@@ -69,10 +69,12 @@ def write_report(run_dir) -> None:
     vd, sm, ps = cfg["verdict"], cfg["sample"], cfg["position"]
     zp, zw = vd["z_pass"], vd["z_weak"]
     n_is_ok = fn["is_pass"] + fn["is_weak"]
+    isn = vd["is_min_net_sharpe"]
 
     L = [f"# 因子筛选报告：{run['target']}", ""]
     L += ["## 结论", ""]
-    head = (f"检验 {fn['tested']} 个 → 样本内通过 {n_is_ok} 个（PASS {fn['is_pass']}、WEAK_PASS {fn['is_weak']}）"
+    head = (f"检验 {fn['tested']} 个 → 样本内 |z| 达标 {fn['is_z_pass']} 个"
+            f"→ 其中净 Sharpe > {isn:g} 的 {n_is_ok} 个（通过 {fn['is_pass']}、弱通过 {fn['is_weak']}）"
             f"→ 观察期保留 {fn['obs_keep'] + fn['obs_insufficient']} 个（其中观察期样本不足 {fn['obs_insufficient']} 个）"
             f"→ 可交易（净 Sharpe ≥ {vd['min_net_sharpe']:g}）保留 {fn['trade_keep']} 个"
             f"→ 去重后 shortlist {fn['shortlist']} 个。")
@@ -115,8 +117,10 @@ def write_report(run_dir) -> None:
     L += ["", "这些规则是输入，不是系统推断的结果：t 日收盘的信号只能用日期 ≤ t−lag 的观测，需研究者确认。", ""]
 
     L += ["## 判定标准", "",
-          f"- 样本内：PASS：|z| ≥ {_num(zp, 2)}；WEAK_PASS：|z| ≥ {_num(zw, 2)}；其余 REJECT。"
-          "z = HAC t ÷ 该候选自身循环平移零分布的标准差。",
+          f"- 样本内（两个条件同时满足）：① |z| 达标：PASS：|z| ≥ {_num(zp, 2)}；WEAK_PASS：|z| ≥ {_num(zw, 2)}；"
+          "z = HAC t ÷ 该候选自身循环平移零分布的标准差。"
+          f"② 样本内行上扣成本后的年化净 Sharpe 严格大于 {isn:g}（is_min_net_sharpe；非有限视为不满足）。"
+          "不满足任一条件为 REJECT（candidates.csv 的 z_verdict 记录仅按 z 的结论）。",
           f"- 观察期：对样本内非 REJECT 的候选，要求方向与样本内一致且 retention（按样本内符号的观察期 IC ÷ |样本内 IC|）"
           f"≥ {_num(vd['obs_min_retention'], 2)}；观察期样本不足时不淘汰，保留并标注 obs_short。",
           f"- 可交易性：对未被观察期淘汰的候选，要求开发样本（样本内 + 观察期）上扣成本后的年化净 Sharpe "

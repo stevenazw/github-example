@@ -277,6 +277,8 @@ def _criteria_of(run: dict) -> dict:
     c = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
     if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
         c["min_net_sharpe"] = vd["min_net_sharpe"]
+    if "is_min_net_sharpe" in vd:                    # runs made before the in-sample Sharpe bar lack it
+        c["is_min_net_sharpe"] = vd["is_min_net_sharpe"]
     if "dedupe_corr" in vd:
         c["dedupe_corr"] = vd["dedupe_corr"]
     return c
@@ -783,7 +785,7 @@ function dl(label, kids, cls) { return h('div', {class: cls}, [h('dt', {text: la
 function criteriaEl(a) {
   var c = a.criteria;
   if (!c || c.z_weak == null || c.obs_min_retention == null) return null;
-  var txt = '样本内 |z| ≥ ' + c.z_weak + '；观察期方向一致且 IC 不低于样本内的 ' + (Math.round(c.obs_min_retention * 1000) / 10) + '%';
+  var txt = '样本内 |z| ≥ ' + c.z_weak + (c.is_min_net_sharpe != null ? ' 且扣成本后净 Sharpe > ' + c.is_min_net_sharpe : '') + '；观察期方向一致且 IC 不低于样本内的 ' + (Math.round(c.obs_min_retention * 1000) / 10) + '%';
   if (c.min_net_sharpe != null) txt += '；扣成本后净 Sharpe ≥ ' + c.min_net_sharpe + '（样本内+观察期）';
   if (c.dedupe_corr != null) txt += '；去重相关阈值 ' + c.dedupe_corr;
   if (a.criteria_mixed) txt += '。部分因子来自门槛不同的早期测试';

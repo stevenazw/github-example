@@ -24,11 +24,13 @@ OBS_MIN_OBS = 60
 HORIZONS = (1, 2, 5, 10, 20, 60)
 YEAR_MIN_ROWS = 60
 CAND_COLUMNS = ["id", "series", "transform", "group", "kind", "freq", "n_is", "is_start", "is_end", "n_obs",
-                "n_oos", "t", "null_sd", "z", "ic", "sign", "p", "verdict", "ic_obs_signed", "retention",
+                "n_oos", "t", "null_sd", "z", "ic", "sign", "p", "verdict", "z_verdict", "sharpe_gross_is",
+                "sharpe_net_is", "ic_obs_signed", "retention",
                 "obs_status", "t_dev", "sharpe_gross_dev", "sharpe_net_dev", "trade_status", "t_h1", "t_h2",
                 "t_xlag", "flags", "rep"]
 TRADE_COLUMNS = ["sharpe_gross_dev", "sharpe_net_dev", "trade_status"]
-SHORT_CAND_COLUMNS = [c for c in CAND_COLUMNS if c not in TRADE_COLUMNS]
+IS_BT_COLUMNS = ["z_verdict", "sharpe_gross_is", "sharpe_net_is"]
+SHORT_CAND_COLUMNS = [c for c in CAND_COLUMNS if c not in TRADE_COLUMNS + IS_BT_COLUMNS]
 BT_COLUMNS = ["sharpe_gross", "sharpe_net", "turnover"]
 IC_COLUMNS = [f"ic_h{h}" for h in HORIZONS]
 AC_COLUMNS = [f"ac_{h}" for h in HORIZONS]
@@ -85,6 +87,15 @@ def assign_verdict(z, z_pass, z_weak) -> str:
         return "REJECT"
     a = abs(float(z))
     return "PASS" if a >= z_pass else "WEAK_PASS" if a >= z_weak else "REJECT"
+
+
+def final_verdict(z_verdict, sharpe_net_is, is_min_net_sharpe) -> str:
+    """Step-1 verdict: the |z| verdict stands only if the in-sample net Sharpe is finite and strictly greater
+    than ``is_min_net_sharpe``; otherwise a PASS / WEAK_PASS becomes REJECT."""
+    if z_verdict == "REJECT":
+        return "REJECT"
+    ok = bool(np.isfinite(sharpe_net_is)) and float(sharpe_net_is) > is_min_net_sharpe
+    return z_verdict if ok else "REJECT"
 
 
 def dedupe(ids, S_dev_df, thresh, min_overlap=100) -> dict:
@@ -289,8 +300,17 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     null = sd_all[sel]
     z = t / null
     p = two_sided_p(z)
-    verdict = np.array([assign_verdict(a, vd.z_pass, vd.z_weak) for a in z])
+    z_verdict = np.array([assign_verdict(a, vd.z_pass, vd.z_weak) for a in z])
     sign = np.sign(t)
+    # in-sample net Sharpe (own IS rows only, rows < e1_j) for every candidate that clears the |z| bar
+    sharpe_gross_is = np.full(n_tested, np.nan)
+    sharpe_net_is = np.full(n_tested, np.nan)
+    for i in np.flatnonzero(z_verdict != "REJECT"):
+        j = sel[i]
+        m = is_m[:, j]
+        bt_is = backtest(S_rows[m, j], y[m], sig[m], float(sign[i]), cfg.target.cost_per_side, cfg.position.buffer)
+        sharpe_gross_is[i], sharpe_net_is[i] = bt_is["sharpe_gross"], bt_is["sharpe_net"]
+    verdict = np.array([final_verdict(zv, sn, vd.is_min_net_sharpe) for zv, sn in zip(z_verdict, sharpe_net_is)])
     print(f"[mine] rows={len(rows)} candidates={N} tested={n_tested} skipped={n_skipped}")
 
     # Every hac_t call below runs on ALL N columns (then subsets), so that a column's float result never
@@ -362,7 +382,8 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
         "group": cm.loc[ids, "group"].to_numpy(), "kind": cm.loc[ids, "kind"].to_numpy(),
         "freq": cm.loc[ids, "freq"].to_numpy(), "n_is": n_is, "is_start": is_start, "is_end": is_end,
         "n_obs": obs_m[:, sel].sum(axis=0), "n_oos": oos_m[:, sel].sum(axis=0), "t": t, "null_sd": null,
-        "z": z, "ic": ic, "sign": sign, "p": p, "verdict": verdict, "ic_obs_signed": ic_obs_signed,
+        "z": z, "ic": ic, "sign": sign, "p": p, "verdict": verdict, "z_verdict": z_verdict,
+        "sharpe_gross_is": sharpe_gross_is, "sharpe_net_is": sharpe_net_is, "ic_obs_signed": ic_obs_signed,
         "retention": retention, "obs_status": obs_status, "t_dev": t_dev, "sharpe_gross_dev": sharpe_gross_dev,
         "sharpe_net_dev": sharpe_net_dev, "trade_status": trade_status, "t_h1": t_h1, "t_h2": t_h2,
         "t_xlag": t_xlag, "flags": [";".join(f) for f in flags], "rep": "",
@@ -411,7 +432,7 @@ def mine(cfg, run_dir, panel=None, config_path=None) -> dict:
     cand.to_csv(run_dir / "candidates.csv", index=False)
     short.to_csv(run_dir / "shortlist.csv", index=False)
 
-    funnel = {"tested": n_tested, "is_pass": int((verdict == "PASS").sum()),
+    funnel = {"tested": n_tested, "is_z_pass": int((z_verdict != "REJECT").sum()), "is_pass": int((verdict == "PASS").sum()),
               "is_weak": int((verdict == "WEAK_PASS").sum()),
               "obs_keep": int((obs_status == "KEEP").sum()),
               "obs_insufficient": int((obs_status == "INSUFFICIENT").sum()),

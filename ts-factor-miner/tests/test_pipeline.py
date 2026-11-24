@@ -13,7 +13,7 @@ from tsminer.config import load_config
 from tsminer.confirm import OosLockedError, confirm
 from tsminer.databank import META_COLUMNS, Panel
 from tsminer.pipeline import (AC_COLUMNS, CAND_COLUMNS, IC_COLUMNS, SHORT_COLUMNS, assign_verdict, backtest, dedupe,
-                              dedupe_tradable, half_life, ic_decay, mine, positions, prepare, signal_autocorr, split_rows,
+                              dedupe_tradable, final_verdict, half_life, ic_decay, mine, positions, prepare, signal_autocorr, split_rows,
                               yearly_hit)
 from tsminer.transforms import make_signal
 
@@ -251,7 +251,7 @@ def test_isolation_is_stats_ignore_obs_and_oos(tmp_path, cfg, cfg_path, planted_
     a = pd.read_csv(planted_run / "candidates.csv").set_index("id").loc[cid]
     b = pd.read_csv(tmp_path / "b" / "candidates.csv").set_index("id").loc[cid]
     for k in ("t", "null_sd", "z", "ic", "n_is", "t_h1", "t_h2", "t_xlag", "sign", "p", "is_start", "is_end",
-              "verdict"):
+              "verdict", "z_verdict", "sharpe_gross_is", "sharpe_net_is"):
         assert _same(a[k], b[k]), (k, a[k], b[k])
     fa = {f for f in str(a["flags"]).split(";") if f in ("half_flip", "xlag_weak")}
     fb = {f for f in str(b["flags"]).split(";") if f in ("half_flip", "xlag_weak")}
@@ -312,7 +312,7 @@ def test_output_files_and_columns(planted_run):
     run = json.loads((d / "run.json").read_text())
     assert set(run) == {"target", "config", "panel_info", "dates", "n_rows", "n_series", "n_candidates",
                         "n_tested", "n_skipped", "n_is_summary", "funnel", "shortlist", "created_at"}
-    assert list(run["funnel"]) == ["tested", "is_pass", "is_weak", "obs_keep", "obs_insufficient", "obs_drop",
+    assert list(run["funnel"]) == ["tested", "is_z_pass", "is_pass", "is_weak", "obs_keep", "obs_insufficient", "obs_drop",
                                    "trade_keep", "trade_drop", "shortlist"]
     assert set(run["dates"]) == {"sample_start", "sample_end"}
     cand = pd.read_csv(d / "candidates.csv")
@@ -320,6 +320,13 @@ def test_output_files_and_columns(planted_run):
     assert run["n_tested"] == len(cand) == f["tested"] and run["n_candidates"] == run["n_tested"] + run["n_skipped"]
     assert f["is_pass"] == (cand["verdict"] == "PASS").sum() and f["is_weak"] == (cand["verdict"] == "WEAK_PASS").sum()
     assert f["obs_keep"] + f["obs_insufficient"] + f["obs_drop"] == f["is_pass"] + f["is_weak"]
+    assert f["is_z_pass"] >= f["is_pass"] + f["is_weak"] and f["is_z_pass"] == (cand["z_verdict"] != "REJECT").sum()
+    assert list(cand.columns)[list(cand.columns).index("verdict") + 1:list(cand.columns).index("verdict") + 4] == [
+        "z_verdict", "sharpe_gross_is", "sharpe_net_is"]
+    assert cand.loc[cand["z_verdict"] == "REJECT", ["sharpe_gross_is", "sharpe_net_is"]].isna().all().all()
+    zp = cand[cand["z_verdict"] != "REJECT"]
+    assert np.isfinite(zp["sharpe_net_is"]).all()
+    assert ((zp["sharpe_net_is"] > 0.3) == (zp["verdict"] != "REJECT")).all()
     assert f["trade_keep"] + f["trade_drop"] == f["obs_keep"] + f["obs_insufficient"]
     assert f["trade_keep"] == (cand["trade_status"] == "KEEP").sum() and f["trade_drop"] == (cand["trade_status"] == "DROP").sum()
     assert f["shortlist"] <= f["trade_keep"]
@@ -673,16 +680,29 @@ def test_observation_period_insufficient_is_kept(tmp_path, cfg_path):
 
 
 # ------------------------------------------------------------- tradability screen
-def _cfg_text(cost=None, min_net_sharpe=None):
+def _cfg_text(cost=None, min_net_sharpe=None, is_min=None):
     txt = TOML if cost is None else TOML.replace("cost_per_side = 0.00005", f"cost_per_side = {cost}")
+    extra = []
     if min_net_sharpe is not None:
-        txt += f"\n[verdict]\nmin_net_sharpe = {min_net_sharpe}\n"
+        extra.append(f"min_net_sharpe = {min_net_sharpe}")
+    if is_min is not None:
+        extra.append(f"is_min_net_sharpe = {is_min}")
+    if extra:
+        txt += "\n[verdict]\n" + "\n".join(extra) + "\n"
     return txt
 
 
 @pytest.fixture(scope="module")
 def costly_run(tmp_path_factory, planted_panel):
     d = tmp_path_factory.mktemp("costly")
+    p = _write_cfg(d, _cfg_text(HIGH_COST, None, "-1e9"))     # step-1 Sharpe bar off: isolates step 3
+    mine(load_config(p), d / "run", panel=planted_panel, config_path=p)
+    return d / "run"
+
+
+@pytest.fixture(scope="module")
+def is_gated_run(tmp_path_factory, planted_panel):
+    d = tmp_path_factory.mktemp("is_gated")
     p = _write_cfg(d, _cfg_text(HIGH_COST))
     mine(load_config(p), d / "run", panel=planted_panel, config_path=p)
     return d / "run"
@@ -691,7 +711,7 @@ def costly_run(tmp_path_factory, planted_panel):
 @pytest.fixture(scope="module")
 def costly_off_run(tmp_path_factory, planted_panel):
     d = tmp_path_factory.mktemp("costly_off")
-    p = _write_cfg(d, _cfg_text(HIGH_COST, "-1e9"))
+    p = _write_cfg(d, _cfg_text(HIGH_COST, "-1e9", "-1e9"))
     mine(load_config(p), d / "run", panel=planted_panel, config_path=p)
     return d / "run"
 
@@ -764,6 +784,55 @@ def test_net_sharpe_gate_boundary_and_nonfinite(tmp_path, planted_panel, planted
     mine(load_config(p), tmp_path / "eq", panel=planted_panel, config_path=p)
     c3 = pd.read_csv(tmp_path / "eq" / "candidates.csv").set_index("id")
     assert c3.loc["sig|chg_1", "trade_status"] == "KEEP"                # equality passes
+
+
+def test_final_verdict_boundary():
+    nan = float("nan")
+    for zv in ("PASS", "WEAK_PASS"):
+        assert final_verdict(zv, 0.3 + 1e-9, 0.3) == zv
+        assert final_verdict(zv, 0.3, 0.3) == "REJECT"                  # strictly greater
+        assert final_verdict(zv, 0.29, 0.3) == "REJECT"
+        assert final_verdict(zv, nan, 0.3) == "REJECT" and final_verdict(zv, float("inf"), 0.3) == "REJECT"
+        assert final_verdict(zv, nan, -1e9) == "REJECT"                 # non-finite never passes
+        assert final_verdict(zv, -5.0, -1e9) == zv
+    assert final_verdict("REJECT", 5.0, 0.3) == "REJECT"
+
+
+def test_in_sample_net_sharpe_gate(is_gated_run, costly_run):
+    a = pd.read_csv(is_gated_run / "candidates.csv").set_index("id")
+    b = pd.read_csv(costly_run / "candidates.csv").set_index("id")
+    short = pd.read_csv(is_gated_run / "shortlist.csv")
+    for cid in ("sig|chg_1", "sig2|chg_1", "short|chg_1"):
+        r = a.loc[cid]
+        print("is gate", cid, {k: r[k] for k in ("z", "z_verdict", "sharpe_gross_is", "sharpe_net_is", "verdict")})
+        assert r["z_verdict"] == "PASS" and r["verdict"] == "REJECT"
+        assert r["sharpe_gross_is"] > 1.0 and r["sharpe_net_is"] <= 0.3
+        assert r[["ic_obs_signed", "retention", "t_dev", "sharpe_net_dev"]].isna().all()
+        assert pd.isna(r["obs_status"]) and pd.isna(r["trade_status"]) and (pd.isna(r["rep"]) or r["rep"] == "")
+        assert cid not in set(short["id"])
+        # gate off (same data and cost): the same readings, but the verdict stands
+        assert b.loc[cid, "sharpe_net_is"] == r["sharpe_net_is"] and b.loc[cid, "verdict"] == "PASS"
+        assert b.loc[cid, "obs_status"] == "KEEP"
+    fa = json.loads((is_gated_run / "run.json").read_text())["funnel"]
+    fb = json.loads((costly_run / "run.json").read_text())["funnel"]
+    assert fa["is_z_pass"] == fb["is_z_pass"] and fa["is_pass"] + fa["is_weak"] < fb["is_pass"] + fb["is_weak"]
+    assert fa["is_z_pass"] >= fa["is_pass"] + fa["is_weak"]
+    assert fa["is_pass"] + fa["is_weak"] == fa["obs_keep"] + fa["obs_insufficient"] + fa["obs_drop"]
+
+
+def test_load_config_is_min_net_sharpe(tmp_path):
+    assert load_config(_write_cfg(tmp_path, TOML)).verdict.is_min_net_sharpe == 0.3
+    for v, want in (("0.8", 0.8), ("-1e9", -1e9), ("1", 1)):
+        c = load_config(_write_cfg(tmp_path, TOML + f"\n[verdict]\nis_min_net_sharpe = {v}\n"))
+        assert c.verdict.is_min_net_sharpe == want
+    for bad in ('"abc"', "true", "[0.3]", "inf", "nan", "-inf"):
+        with pytest.raises(ValueError):
+            load_config(_write_cfg(tmp_path, TOML + f"\n[verdict]\nis_min_net_sharpe = {bad}\n"))
+    for name in ("ty", "eurusd", "ty_vars"):
+        c = load_config(ROOT / "configs" / f"{name}.toml")
+        assert c.verdict.is_min_net_sharpe == 0.3 and c.verdict.min_net_sharpe == 0.3
+        assert "is_min_net_sharpe = 0.3" in (ROOT / "configs" / f"{name}.toml").read_text(encoding="utf-8")
+    assert load_config(_write_cfg(tmp_path, TOML)).to_dict()["verdict"]["is_min_net_sharpe"] == 0.3
 
 
 def test_load_config_min_net_sharpe(tmp_path):

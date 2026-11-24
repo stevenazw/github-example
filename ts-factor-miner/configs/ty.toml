@@ -155,3 +155,4 @@ extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低
 obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它
 year_hit_min = 0.6       # 逐年 IC 为正的年份占比低于此值(且计入年数 >= 3)则标 unstable
 min_net_sharpe = 0.3     # 开发样本(样本内+观察期)上扣成本后的年化净 Sharpe 下限, 低于此值的候选在去重前被淘汰
+is_min_net_sharpe = 0.3  # 样本内扣成本后年化净 Sharpe 的下限(严格大于); 与 |z| 门槛同时满足才算通过第 1 步

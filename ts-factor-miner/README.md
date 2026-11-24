@@ -9,7 +9,7 @@
 1. 从 DataBank 数据库取几百条原始序列；每条序列的可得性（值何时可知）由配置给定，没有规则的序列拒收。
 2. 每条序列按固定的变换集合生成候选信号。
 3. 每个候选在自己的有效数据内切成三段：样本内 IS 70%、观察期 OBS 15%、样本外 OOS 15%。
-4. 第 1 步：在 IS 上做单因子检验，过门槛（PASS / WEAK_PASS）的候选留下。
+4. 第 1 步：在 IS 上做单因子检验，|z| 达标（PASS / WEAK_PASS）**且**样本内扣成本后净 Sharpe 大于 `is_min_net_sharpe`（默认 0.3）的候选留下。
 5. 第 2 步：在观察期上筛选，方向或强度没有保持的候选被淘汰。
 6. 第 3 步：可交易性筛选。对未被淘汰的候选在开发样本（IS + OBS）上做扣成本回测，年化净 Sharpe 低于 `min_net_sharpe`（默认 0.3）的被淘汰。
 7. 第 4 步：对通过可交易性筛选的候选按相关性去重，代表组成 shortlist，并给出 IC 衰减、信号自相关、逐年稳定性与连续仓位的回测读数。
@@ -87,7 +87,9 @@ databank.py        transforms.py      stats.py            pipeline.py           
 
 零分布标准差 `null_sd`：对候选 j，把 y 在 `[0, e1[j])` 上做循环平移（平移量在 `min_shift`..`e-min_shift` 间均匀取），重复 `n_boot` 次重算 t*，取其标准差。这保留各自的自相关，只打断对齐；厚尾信号的 t 天然更分散，除以自身的 null_sd 才公平。具有相同 `e1` 的候选共用一次计算。`e1 − 2×min_shift < 1` 的候选样本太短无法平移，同样计入 `n_skipped`。
 
-`z = t / null_sd`；`p` 是由 |z| 按正态近似得到的双侧 p，仅供展示。判决：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`。门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_is）。
+`z = t / null_sd`；`p` 是由 |z| 按正态近似得到的双侧 p，仅供展示。判决：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`（这个仅按 z 的结论记为 `z_verdict`）。门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_is）。
+
+**样本内净 Sharpe 条件。** 对 `z_verdict` 非 REJECT 的候选，在它自己的 IS 行（行号 < `e1`）上用 3.9 的回测（方向取 IS 上 t 的符号）算 `sharpe_gross_is`、`sharpe_net_is`；`sharpe_net_is` 非有限或 ≤ `is_min_net_sharpe`（严格大于才通过）则最终 `verdict` 改为 `REJECT`。后续步骤、flags 与看板仍以 `verdict != REJECT` 为准。这是样本内统计量，不读行号 ≥ `e1` 的数据。
 
 IS 上的 flags（不改变判决）：`half_flip`（IS 有效行按个数对半分，前后半段 t 异号）、`xlag_weak`（信号再多滞后一天后 |t| 低于 `extra_lag_t_min`、变号或非有限，说明信息集中在最近一天）。
 
@@ -182,7 +184,7 @@ python -m pytest -q
 | 文件 | 内容 |
 |---|---|
 | `report.md` | 人类可读报告：结论、数据与样本、可得性输入、判定标准、shortlist、IC 衰减与信号自相关、提示与局限、下一步；confirm 之后追加样本外确认 |
-| `run.json` | 机器可读摘要：配置快照、`dates`、`n_rows`、`n_series`、`n_candidates`、`n_tested`、`n_skipped`、`n_is_summary`、`funnel`（tested / is_pass / is_weak / obs_keep / obs_insufficient / obs_drop / trade_keep / trade_drop / shortlist）、shortlist；不含任何 OOS 取值 |
+| `run.json` | 机器可读摘要：配置快照、`dates`、`n_rows`、`n_series`、`n_candidates`、`n_tested`、`n_skipped`、`n_is_summary`、`funnel`（tested / is_z_pass / is_pass / is_weak / obs_keep / obs_insufficient / obs_drop / trade_keep / trade_drop / shortlist）、shortlist；不含任何 OOS 取值 |
 | `candidates.csv` | 第 1 步所有 t、null_sd 有效的候选，按 \|z\| 降序 |
 | `shortlist.csv` | 通过可交易性筛选并去重后的代表候选，另含 `cluster_size`、回测、IC 衰减、信号自相关、逐年稳定性与描述列；可为空表 |
 | `config.toml` | 本次运行所用配置的副本（`confirm` 从这里重建配置） |
@@ -205,7 +207,8 @@ python -m pytest -q
 | `ic` | IS 样本 IC（y 与 s 的相关） |
 | `sign` | t 的符号，后续步骤与 `confirm` 用它定方向 |
 | `p` | 由 \|z\| 按正态近似得到的双侧 p，仅供展示 |
-| `verdict` | PASS / WEAK_PASS / REJECT |
+| `verdict` | 最终结论：PASS / WEAK_PASS / REJECT（|z| 达标且样本内净 Sharpe > `is_min_net_sharpe` 才不是 REJECT） |
+| `z_verdict`, `sharpe_gross_is`, `sharpe_net_is` | 仅按 z 的结论；IS 行上的毛 / 净年化 Sharpe（只有 `z_verdict` 非 REJECT 的候选有值，其余留空） |
 | `ic_obs_signed`, `retention`, `obs_status` | 观察期带符号 IC、retention、KEEP / DROP / INSUFFICIENT；第 1 步 REJECT 的候选留空 |
 | `t_dev` | DEV（IS+OBS）上的带符号 t，未被 DROP 的候选才有 |
 | `sharpe_gross_dev`, `sharpe_net_dev`, `trade_status` | DEV 上的毛 / 净年化 Sharpe 与可交易性结论（KEEP / DROP，净 Sharpe ≥ `min_net_sharpe` 为 KEEP）；只有第 2 步存活的候选有值，其余留空 |
@@ -238,6 +241,7 @@ python -m pytest -q
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 IS 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |
 | `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0` |
 | `[verdict]` `dedupe_corr`, `extra_lag_t_min` | 去重的相关阈值（默认 0.7）；`xlag_weak` 的 \|t\| 阈值（默认 2.0） |
+| `[verdict]` `is_min_net_sharpe` | 样本内（IS）扣成本后年化净 Sharpe 的下限（默认 0.3，严格大于），与 |z| 门槛同时满足才算通过第 1 步；任意有限实数，设为很小的负数（如 -1e9）即关闭 |
 | `[verdict]` `min_net_sharpe` | 开发样本（IS+OBS）上扣成本后的年化净 Sharpe 下限（默认 0.3），低于此值的候选在去重前被淘汰（第 3 步）；任意有限实数，设为很小的负数（如 -1e9）即关闭 |
 | `[verdict]` `obs_min_retention`, `year_hit_min` | 观察期保留与 `confirm` 的 CONSISTENT 用的 retention 下限（默认 0.5）；`unstable` 的逐年命中率下限（默认 0.6） |
 
@@ -266,7 +270,7 @@ python -m pytest -q
 - **逐候选隔离**：`test_isolation_nothing_from_oos`（行号 ≥ `e2` 之后的 target 与该候选原始序列换成随机数，candidates.csv 与 shortlist.csv 的数值列逐值不变）、`test_isolation_is_stats_ignore_obs_and_oos`（行号 ≥ `e1` 之后换掉，IS 统计量逐值不变），长历史与短历史候选各验证一次。
 - **植入信号 / 观察期淘汰 / lock**：`test_planted_signal_survives_screens`、`test_planted_signal_confirmed`、`test_observation_period_drops_decayed_signal`、`test_lock_and_force`、`test_cli_locked_exit_code`、`test_nothing_to_confirm`。
 - **仓位与回测**：`test_positions_*`、`test_backtest*`。
-- **可交易性筛选**：`test_high_turnover_signal_fails_tradability`（IC 显著但换手高、成本高 → DROP、不进 shortlist、`rep` 为空）、`test_gate_is_the_reason_for_the_drop`（同一份数据把 `min_net_sharpe` 设为 -1e9 后回到 shortlist）、`test_dedupe_after_screen_promotes_tradable_member`（簇内 t 最高的成员净 Sharpe 不达标时，同簇能交易的成员顶上来当代表）、`test_net_sharpe_gate_boundary_and_nonfinite`、`test_load_config_min_net_sharpe`。
+- **可交易性筛选**：`test_high_turnover_signal_fails_tradability`（IC 显著但换手高、成本高 → DROP、不进 shortlist、`rep` 为空）、`test_gate_is_the_reason_for_the_drop`（同一份数据把 `min_net_sharpe` 设为 -1e9 后回到 shortlist）、`test_dedupe_after_screen_promotes_tradable_member`（簇内 t 最高的成员净 Sharpe 不达标时，同簇能交易的成员顶上来当代表）、`test_net_sharpe_gate_boundary_and_nonfinite`、`test_load_config_min_net_sharpe`。第 1 步的净 Sharpe 条件：`test_in_sample_net_sharpe_gate`、`test_final_verdict_boundary`、`test_load_config_is_min_net_sharpe`。
 - **IC 衰减 / 信号自相关 / 逐年命中**：`test_ic_decay_*`、`test_autocorr_and_half_life_of_random_walk_zscore`、`test_year_hit_*`。
 - **零分布标准差**：`test_null_sd_*`，以及 HAC t 的朴素对照与零假设校准。
 
@@ -285,7 +289,7 @@ python -m http.server -d site-out        # 本地打开 index.html
 
 **同一因子的合并。** 汇集各 run 中样本内过门槛（`candidates.csv` 里 `verdict` 为 PASS 或 WEAK_PASS）的全部因子。两个因子是同一个因子，当且仅当变换名相同，且在双方 DEV 行（样本内 ∪ 观察期）的共同日期上信号的相关系数绝对值 ≥ `IDENTITY_CORR = 0.999`（共同日期少于 250 个则不是同一个；符号相反也算同一个；判定是传递的，A≡B、B≡C 则三者一组）。典型情形：同一个底层序列在一个 run 里是原始序列、在另一个 run 里是变量清单里的公式变量。合并时保留所在 run 样本外已打开的那条，同等条件下保留较新（登记册里靠后）的 run 的那条，再按 \|z\| 取大；被合并掉的其他 id 记入保留者的 `also_as`，卡片上以"同一因子的其他写法"次要显示。
 
-**展示对象与四层漏斗。** 看板展示合并后**所有通过样本内门槛的因子**，不只是最终入选的，并按它们到达的最远一层分层（纯函数 `factor_stage`）。前两层由因子自身的属性决定，去重则在合并后的"可交易"池上重新计算（按 `t_dev` 降序，NaN 最后；与已选代表在共同 DEV 日期上的 \|相关系数\| ≥ `dedupe_corr` 则并入第一个满足的代表，共同日期少于 100 视为不相关）。`dedupe_corr`、`z_weak`、`obs_min_retention`、`min_net_sharpe` 取自**最新**一个 run 的配置；各 run 的门槛不一致时数据里 `criteria_mixed` 为 true，页面在入选条件后注明"部分因子来自门槛不同的早期测试"。
+**展示对象与四层漏斗。** 看板展示合并后**所有通过样本内门槛的因子**，不只是最终入选的，并按它们到达的最远一层分层（纯函数 `factor_stage`）。前两层由因子自身的属性决定，去重则在合并后的"可交易"池上重新计算（按 `t_dev` 降序，NaN 最后；与已选代表在共同 DEV 日期上的 \|相关系数\| ≥ `dedupe_corr` 则并入第一个满足的代表，共同日期少于 100 视为不相关）。`dedupe_corr`、`z_weak`、`obs_min_retention`、`min_net_sharpe`、`is_min_net_sharpe` 取自**最新**一个 run 的配置；各 run 的门槛不一致时数据里 `criteria_mixed` 为 true，页面在入选条件后注明"部分因子来自门槛不同的早期测试"。
 
 | stage | 层 | 含义 |
 |---|---|---|
@@ -305,7 +309,7 @@ python -m http.server -d site-out        # 本地打开 index.html
 | `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个标的 `#<slug>`） |
 | `artifact.html` | 同一模板生成的片段版（无 doctype / html / head / body 标签），用于发布到托管环境 |
 | `runs.json` | 登记册，见上 |
-| `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`is_frac` / `obs_frac`（最新 run）、`created_at`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`oos_counts`（只统计 stage 4：`confirmed`、`consistent`、`failed`、`insufficient`、`unopened`）、`criteria`（`z_weak`、`obs_min_retention`、`min_net_sharpe`、`dedupe_corr`）、`criteria_mixed`、`n_merged`（被合并掉的重复条数）、`skipped`、`runs`（纳入的 run 目录名，仅作追溯）与 `factors`（合并后的统一列表：`stage`、`stage_note`、`is_verdict`、`also_as`、`oos_opened`、净值、分段统计、公式、方向，stage 4 且样本外已打开的另有 `oos_verdict` 与 `oos_confirm`） |
+| `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`is_frac` / `obs_frac`（最新 run）、`created_at`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`oos_counts`（只统计 stage 4：`confirmed`、`consistent`、`failed`、`insufficient`、`unopened`）、`criteria`（`z_weak`、`obs_min_retention`、`min_net_sharpe`、`is_min_net_sharpe`（旧 run 无此键则缺省）、`dedupe_corr`）、`criteria_mixed`、`n_merged`（被合并掉的重复条数）、`skipped`、`runs`（纳入的 run 目录名，仅作追溯）与 `factors`（合并后的统一列表：`stage`、`stage_note`、`is_verdict`、`also_as`、`oos_opened`、净值、分段统计、公式、方向，stage 4 且样本外已打开的另有 `oos_verdict` 与 `oos_confirm`） |
 
 **净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 

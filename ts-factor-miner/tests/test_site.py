@@ -294,8 +294,8 @@ def test_site_files(site_dir):
 def test_new_run_has_criteria_and_trade_keep(site_dir, run_dir, locked_data):
     vd = load_config(run_dir / "config.toml").verdict
     want = {"z_weak": vd.z_weak, "obs_min_retention": vd.obs_min_retention, "min_net_sharpe": vd.min_net_sharpe,
-            "dedupe_corr": vd.dedupe_corr}
-    assert want["min_net_sharpe"] == 0.3
+            "is_min_net_sharpe": vd.is_min_net_sharpe, "dedupe_corr": vd.dedupe_corr}
+    assert want["min_net_sharpe"] == 0.3 and want["is_min_net_sharpe"] == 0.3
     assert locked_data["criteria"] == want
     run = json.loads((run_dir / "run.json").read_text())
     assert locked_data["funnel"]["n_final"] == run["funnel"]["shortlist"]
@@ -306,6 +306,7 @@ def test_new_run_has_criteria_and_trade_keep(site_dir, run_dir, locked_data):
     assert "入选条件" in art and "criteria" in art
     assert "cost" + "_negative" not in art and "扣成本后收益为负" not in art
     assert "min_net_sharpe" in art and "扣成本后净 Sharpe ≥ " in art
+    assert "扣成本后净 Sharpe > " in art and "is_min_net_sharpe" in art
 
 
 def test_old_style_run_without_trade_keys(tmp_path, run_dir):
@@ -313,6 +314,7 @@ def test_old_style_run_without_trade_keys(tmp_path, run_dir):
     shutil.copytree(run_dir, old)
     rj = json.loads((old / "run.json").read_text())
     del rj["funnel"]["trade_keep"], rj["funnel"]["trade_drop"], rj["config"]["verdict"]["min_net_sharpe"]
+    del rj["config"]["verdict"]["is_min_net_sharpe"]
     (old / "run.json").write_text(json.dumps(rj))
     cdf = pd.read_csv(old / "candidates.csv")
     assert not (cdf["trade_status"] == "DROP").any()
@@ -320,7 +322,7 @@ def test_old_style_run_without_trade_keys(tmp_path, run_dir):
     out = tmp_path / "site"
     build_site([old], out)                                           # must not raise
     d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
-    assert "min_net_sharpe" not in d["criteria"] and all(f["stage"] != 2 for f in d["factors"])
+    assert "min_net_sharpe" not in d["criteria"] and "is_min_net_sharpe" not in d["criteria"] and all(f["stage"] != 2 for f in d["factors"])
     assert d["funnel"]["n_final"] == len(pd.read_csv(old / "shortlist.csv"))
     assert d["criteria"]["z_weak"] == rj["config"]["verdict"]["z_weak"]
     assert d["factors"]
@@ -469,7 +471,8 @@ def costly_run(tmp_path_factory, panel):
     """Same IC evidence but a high cost: the net Sharpe is too low for the tradability screen."""
     d = tmp_path_factory.mktemp("costly")
     p = d / "c.toml"
-    p.write_text(TOML.replace("cost_per_side = 0.00005", f"cost_per_side = {HIGH_COST}"))
+    p.write_text(TOML.replace("cost_per_side = 0.00005", f"cost_per_side = {HIGH_COST}")
+                 + "\n[verdict]\nis_min_net_sharpe = -1e9\n")      # step-1 Sharpe bar off: isolates step 3
     mine(load_config(p), d / "run", panel=panel, config_path=p)
     return d / "run"
 
