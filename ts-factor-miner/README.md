@@ -279,7 +279,28 @@ python -m tsminer site runs/ty-v5 runs/eurusd-v5 --out site-out
 python -m http.server -d site-out        # 本地打开 index.html
 ```
 
-每个 run 目录对应一个资产（两个 run 的 target 同名则报错退出，退出码 1）。该命令只读 run 目录，不运行 `mine` 或 `confirm`。
+每个 run 目录对应一个来源（候选池）；target 相同的多个 run 合并到同一个标的下，按来源分组展示（来源顺序即命令行里 run 目录的顺序）。例如同一个标的可以同时传入"盲扫原始序列"的 run 与"研究者给定变量清单"的 run：
+
+```bash
+python -m tsminer site runs/ty-scan runs/ty-vars --out site-out
+```
+
+**来源名。** 一个 run 的来源名由纯函数 `infer_source_name` 确定：配置里 `[universe] name` 非空则用它；否则若该 run 的 shortlist 或面板 meta 里存在以 `var:` 开头的序列，为"变量清单"；否则为"原始序列扫描"。同一标的下两个 run 的来源名相同则报错退出（退出码 1），此时在其中一个配置里设置 `[universe] name = "..."` 加以区分（`name` 可选，默认空串，必须是字符串，不影响挖掘本身）。
+
+**展示对象与四层漏斗。** 看板展示每个来源里**所有通过样本内门槛的因子**（`candidates.csv` 中 `verdict` 为 PASS 或 WEAK_PASS 的全部候选），不只是最终 shortlist，并按它们到达的最远一层分层（纯函数 `factor_stage`）：
+
+| stage | 层 | 含义 |
+|---|---|---|
+| 1 | 观察期未保留 | 过了样本内门槛，但 `obs_status = DROP`（观察期 IC 保留比例低于 `obs_min_retention` 或方向相反） |
+| 2 | 可交易筛选未通过 | 观察期保留（KEEP / INSUFFICIENT），但 `trade_status = DROP`（扣成本后净 Sharpe 低于 `min_net_sharpe`） |
+| 3 | 去重时被合并 | 前几层都过了，但去重时并入了别的代表（`rep` 非空且不是自己） |
+| 4 | 去重后留下 | 在 shortlist 里 |
+
+每个因子带 `stage` 与一句 `stage_note`（拦住它的那道门槛的具体数字，数值读自 `candidates.csv` 与 run 配置；stage 4 为空）。更早版本的 run 的 `candidates.csv` 没有 `trade_status` 列时，不会有 stage 2。因子排序：stage 降序；stage 4 内按样本外结论再按 `t_dev`，其余层按 \|z\| 降序。每个来源的漏斗条是 `样本内过门槛 N1 → 观察期保留 N2 → 可交易 N3 → 去重后留下 N4 → 样本外`（每层计数包含更靠后的层），可点击：点第 k 步只显示 stage ≥ k 的因子。被淘汰因子的净值与三段统计照常计算；样本外已打开时它们也画样本外段，但**样本外结论只给 stage 4 的因子**（被淘汰的 `oos_verdict` 为 null），样本外只作展示。看板**不显示、数据文件也不含**"共检验了多少候选"这类总数，只记录过了样本内门槛的因子。
+
+**各来源独立。** 每个来源保留自己的漏斗、入选条件、切分比例、因子分层与样本外状态：是否打开样本外只看该 run 目录里有没有 `confirm.json`，一个来源已 confirm 不影响另一个来源；未 confirm 的来源不读、不算、不输出任何样本外行。同一个因子 id 可以在两个来源里各出现一次，互不合并。页面里每个标的按来源分节，并提供"样本外结论"与"来源"两组筛选（同时生效）。
+
+该命令只读 run 目录，不运行 `mine` 或 `confirm`。
 
 输出文件：
 
@@ -287,9 +308,9 @@ python -m http.server -d site-out        # 本地打开 index.html
 |---|---|
 | `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个资产 `#<slug>`） |
 | `artifact.html` | 同一模板生成的片段版（无 doctype / html / head / body 标签），用于发布到托管环境 |
-| `data/<slug>.json` | 每个资产一份（slug = target 小写），页面按需 `fetch`：shortlist 因子的净值、分段统计、公式、方向、样本外结论，另有 `funnel` 与 `criteria`（入选条件：`z_weak`、`obs_min_retention`、`min_net_sharpe`，读自 run.json 的配置快照；没有这些键的旧 run 对应项不显示） |
+| `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。标的级字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`created_at`、`summary`（因子总数、各样本外结论总数）；`sources` 列表按命令行顺序，每个来源含 `name`、`key`、`run_dir`（目录名）、`is_frac` / `obs_frac`、`oos_opened`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`criteria`（入选条件：`z_weak`、`obs_min_retention`、`min_net_sharpe`、`dedupe_corr`，读自 run.json 的配置快照；没有这些键的旧 run 对应项不显示）、`oos_counts`（只统计 stage 4）、`skipped` 与 `factors`（全部过样本内门槛的因子：`stage`、`stage_note`、`is_verdict`、净值、分段统计、公式、方向，stage 4 另有样本外结论）。因子 id 可能跨来源重复，页面的 DOM id 带来源 `key` |
 
-**净值定义。** 对每个 shortlist 因子，取其有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
+**净值定义。** 对每个展示的因子（不论 stage），取其有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 
 **样本外何时显示。** 只有 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值并附 `confirm.csv` 的样本外结论。否则不读取、不计算、不输出任何样本外行，净值只到观察期末，页面标为"样本外未打开"。
 

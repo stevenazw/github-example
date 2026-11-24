@@ -55,6 +55,7 @@ class UniverseConfig:
     spread: list[dict] = field(default_factory=list)
     helper: list[dict] = field(default_factory=list)      # {id, expr}: only reachable through ref(), not candidates
     variable: list[dict] = field(default_factory=list)    # {id, expr, kind, group, description}: panel columns
+    name: str = ""                                        # optional label of this candidate pool (dashboard source name)
 
 
 VARIABLE_KINDS = {"level", "price"}
@@ -292,7 +293,9 @@ def load_config(path: str | os.PathLike) -> Config:
 
     # universe
     sec = _section(raw, "universe", {"fields", "chains", "carry_chains", "exclude_tickers", "select", "spread",
-                                       "helper", "variable"})
+                                       "helper", "variable", "name"})
+    if "name" in sec:
+        _check_type(sec["name"], (str,), "universe.name")
     for k in ("fields", "chains", "carry_chains", "exclude_tickers"):
         if k in sec:
             _str_list(sec[k], f"universe.{k}")

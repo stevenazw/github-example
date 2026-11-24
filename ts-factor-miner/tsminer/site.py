@@ -156,11 +156,68 @@ def downsample_idx(seg, max_points=MAX_POINTS) -> np.ndarray:
 
 
 # --------------------------------------------------------------- per-asset data
+DEFAULT_SOURCE = "原始序列扫描"
+VARIABLE_SOURCE = "变量清单"
+
+
+def infer_source_name(universe_name, series_ids) -> str:
+    """Source label of one run: ``universe.name`` if set, else "变量清单" when a ``var:`` series is present
+    (in the shortlist or in the panel meta), else "原始序列扫描"."""
+    name = str(universe_name or "").strip()
+    if name:
+        return name
+    if any(str(x).startswith("var:") for x in series_ids):
+        return VARIABLE_SOURCE
+    return DEFAULT_SOURCE
+
+
 def _read_run(run_dir: Path) -> dict:
     return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
 
 
-def build_asset_data(run_dir) -> dict:
+STAGE_NAMES = {4: "去重后留下", 3: "去重时被合并", 2: "可交易筛选未通过", 1: "观察期未保留"}
+
+
+def factor_stage(row, shortlist_ids) -> int:
+    """Furthest layer an IS-passing candidate reached: 1 observation period dropped it, 2 tradability screen
+    dropped it, 3 merged into another representative at de-duplication, 4 kept (in the shortlist).
+    Runs from before the tradability screen have no ``trade_status``: that layer is then passed by everyone."""
+    def get(k):
+        v = row.get(k, "")
+        return "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
+    if get("obs_status") == "DROP":
+        return 1
+    if get("trade_status") == "DROP":
+        return 2
+    return 4 if row["id"] in shortlist_ids else 3
+
+
+def stage_note(row, stage, criteria, titles) -> str:
+    """One sentence naming the gate that stopped the candidate, with the numbers (from the CSV and the config)."""
+    if stage == 1:
+        r, lim = row.get("retention"), criteria.get("obs_min_retention")
+        if r is None or not np.isfinite(float(r)):
+            return f"观察期 IC 保留比例不足（低于 {_g(lim)}）"
+        return (f"观察期方向相反（保留比例 {float(r):.2f}）" if float(r) < 0
+                else f"观察期 IC 保留比例 {float(r):.2f}，低于 {_g(lim)}")
+    if stage == 2:
+        sh = row.get("sharpe_net_dev")
+        shs = f"{float(sh):.2f}" if sh is not None and np.isfinite(float(sh)) else "无法计算"
+        return f"扣成本后净 Sharpe {shs}，低于 {_g(criteria.get('min_net_sharpe'))}"
+    if stage == 3:
+        rep = row.get("rep")
+        return f"与「{titles.get(rep, rep)}」高度相关，去重时并入" if isinstance(rep, str) and rep else "去重时并入其他代表"
+    return ""
+
+
+def stage_counts(factors) -> dict:
+    """Layered counts of the factors that passed the in-sample bar (a layer includes everything beyond it)."""
+    n = lambda k: sum(1 for f in factors if f["stage"] >= k)
+    return {"n_is": n(1), "n_obs": n(2), "n_trade": n(3), "n_final": n(4)}
+
+
+def build_source_data(run_dir) -> tuple[dict, dict]:
+    """One run directory -> (asset-level header, source dict). Reads ``confirm.*`` only if ``confirm.json`` exists."""
     d = Path(run_dir)
     run = _read_run(d)
     target = run["target"]
@@ -178,9 +235,29 @@ def build_asset_data(run_dir) -> dict:
                                                                 "ic_oos_signed", "retention_oos", "sharpe_net")
                                            if k in r.index})
     short = pd.read_csv(d / "shortlist.csv")
-    for c in ("flags", "description"):
-        if c in short.columns:
-            short[c] = short[c].fillna("").astype(str)
+    short_by_id = {r["id"]: r for _, r in short.iterrows()}
+    cand = pd.read_csv(d / "candidates.csv")
+    for c in ("flags", "obs_status", "trade_status", "rep"):
+        if c in cand.columns:
+            cand[c] = cand[c].fillna("").astype(str)
+    cand = cand[cand["verdict"] != "REJECT"].reset_index(drop=True)          # everything that passed the IS bar
+    source_name = infer_source_name(cfg.universe.name, list(cand["series"]) + list(short["series"])
+                                    + list(panel.meta.index))
+    cfg_d = run["config"]
+    vd = cfg_d["verdict"]
+    criteria = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
+    if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
+        criteria["min_net_sharpe"] = vd["min_net_sharpe"]
+    if "dedupe_corr" in vd:
+        criteria["dedupe_corr"] = vd["dedupe_corr"]
+    short_ids = set(short["id"])
+    desc_of = panel.meta["description"] if "description" in panel.meta.columns else pd.Series(dtype=object)
+
+    def display(r):
+        desc = desc_of.get(r["series"], "")
+        desc = desc if isinstance(desc, str) and desc else str(r["series"])
+        return desc, f"{desc} · {transform_label(r['transform'])}"
+    titles = {r["id"]: display(r)[1] for _, r in cand.iterrows()}
 
     prep = prepare(panel, cfg)
     S, rows = prep["S"], prep["rows"]
@@ -191,9 +268,10 @@ def build_asset_data(run_dir) -> dict:
     col_of = {c: i for i, c in enumerate(S.columns)}
     is_m, obs_m, oos_m = prep["is_mask"], prep["obs_mask"], prep["oos_mask"]
     real_dates = np.asarray(cal[rows + 1].strftime("%Y-%m-%d"))    # return of row p is realised on row p+1
+    rep_count = cand["rep"].value_counts() if "rep" in cand.columns else pd.Series(dtype=int)
 
     factors, skipped = [], []
-    for _, r in short.iterrows():
+    for _, r in cand.iterrows():
         cid = r["id"]
         if cid not in col_of:
             skipped.append({"id": cid, "reason": "信号不在候选池中"})
@@ -213,16 +291,21 @@ def build_asset_data(run_dir) -> dict:
             segments[2] = {"seg": 2, "name": SEG_NAMES[2], "opened": False}
         keep = downsample_idx(seg)
         meta_row = panel.meta.loc[r["series"]]
-        desc = r["description"] or str(r["series"])
-        verdict = verdicts.get(cid) if opened else None
+        desc, title = display(r)
+        stage = factor_stage(r, short_ids)
+        final = stage == 4
+        verdict = verdicts.get(cid) if (opened and final) else None
+        sr = short_by_id.get(cid)
+        csize = int(sr["cluster_size"]) if sr is not None else (int(rep_count.get(cid, 0)) or None)
         factors.append(_jsonable({
             "id": cid, "series": r["series"], "transform": r["transform"],
-            "title": f"{desc} · {transform_label(r['transform'])}", "description": desc,
+            "title": title, "description": desc,
             "group": r["group"], "sign": int(sign), "direction": direction_text(sign, target),
             "formula": formula_text(meta_row, r["transform"], cfg, sign),
-            "z": float(r["z"]), "t_dev": float(r["t_dev"]), "cluster_size": int(r["cluster_size"]),
+            "is_verdict": str(r["verdict"]), "stage": stage, "stage_note": stage_note(r, stage, criteria, titles),
+            "z": float(r["z"]), "t_dev": float(r["t_dev"]) if pd.notna(r["t_dev"]) else None, "cluster_size": csize,
             "flags": flag_texts(r["flags"]), "oos_verdict": verdict,
-            "oos_confirm": oos_info.get(cid) if opened else None,
+            "oos_confirm": oos_info.get(cid) if (opened and final) else None,
             "segments": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in sg.items()}
                          for sg in segments],
             "nav": {"dates": [str(x) for x in real_dates[idx][keep]],
@@ -231,53 +314,85 @@ def build_asset_data(run_dir) -> dict:
         }))
 
     def sort_key(f):
-        v = VERDICT_ORDER.get(f["oos_verdict"], 4) if opened else 4
-        t = f["t_dev"] if f["t_dev"] is not None else float("-inf")
-        return (v, -t)
+        if f["stage"] == 4:
+            v = VERDICT_ORDER.get(f["oos_verdict"], 4) if opened else 4
+            t = f["t_dev"] if f["t_dev"] is not None else float("-inf")
+            return (-4, v, -t)
+        return (-f["stage"], 0, -abs(f["z"]))
     factors.sort(key=sort_key)
 
     vc = pd.Series([f["oos_verdict"] for f in factors if f["oos_verdict"]], dtype=object).value_counts()
-    cfg_d = run["config"]
-    vd = cfg_d["verdict"]
-    criteria = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
-    if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
-        criteria["min_net_sharpe"] = vd["min_net_sharpe"]
-    return {
-        "target": target, "slug": slug,
-        "db_published_at": run["panel_info"].get("published_at"),
-        "sample_start": run["dates"]["sample_start"], "sample_end": run["dates"]["sample_end"],
+    header = {"target": target, "slug": slug, "db_published_at": run["panel_info"].get("published_at"),
+              "sample_start": run["dates"]["sample_start"], "sample_end": run["dates"]["sample_end"]}
+    source = {
+        "name": source_name, "run_dir": d.resolve().name,
         "is_frac": cfg_d["sample"]["is_frac"], "obs_frac": cfg_d["sample"]["obs_frac"],
-        "oos_opened": bool(opened), "funnel": run["funnel"], "criteria": criteria,
+        "oos_opened": bool(opened), "funnel": stage_counts(factors), "criteria": criteria,
         "oos_counts": ({"confirmed": int(vc.get("CONFIRMED", 0)), "consistent": int(vc.get("CONSISTENT", 0)),
                         "failed": int(vc.get("FAILED", 0)), "insufficient": int(vc.get("INSUFFICIENT", 0))}
                        if opened else None),
         "skipped": skipped, "factors": factors,
+    }
+    return header, source
+
+
+def combine_sources(headers: list[dict], sources: list[dict]) -> dict:
+    """Asset-level record from the per-run headers / sources of one target (command-line order is kept)."""
+    names = [s["name"] for s in sources]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"target {headers[0]['target']!r}: duplicate source name(s) {dup}; "
+                         "set a distinct [universe] name in the run configs to tell them apart")
+    for i, s in enumerate(sources):
+        s["key"] = f"s{i}"                           # factor ids may repeat across sources; DOM keys are key + id
+    totals = {k: 0 for k in ("confirmed", "consistent", "failed", "insufficient")}
+    for s in sources:
+        for k, v in (s["oos_counts"] or {}).items():
+            totals[k] += v
+    pub = [h["db_published_at"] for h in headers if h["db_published_at"]]
+    return {
+        "target": headers[0]["target"], "slug": headers[0]["slug"],
+        "db_published_at": max(pub) if pub else None,
+        "sample_start": min(h["sample_start"] for h in headers), "sample_end": max(h["sample_end"] for h in headers),
+        "sources": sources,
+        "summary": {"n_factors": sum(len(s["factors"]) for s in sources), "n_sources": len(sources),
+                    "n_final": sum(s["funnel"]["n_final"] for s in sources),
+                    "n_opened": sum(1 for s in sources if s["oos_opened"]), "oos_counts": totals},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def build_asset_data(run_dirs) -> dict:
+    """Asset data of one target from one run directory or a list of them (all of the same target)."""
+    if isinstance(run_dirs, (str, Path)):
+        run_dirs = [run_dirs]
+    pairs = [build_source_data(p) for p in run_dirs]
+    slugs = {h["slug"] for h, _ in pairs}
+    if len(slugs) != 1:
+        raise ValueError(f"run directories belong to different targets: {sorted(slugs)}")
+    return combine_sources([h for h, _ in pairs], [s for _, s in pairs])
 
 
 # --------------------------------------------------------------- site
 def build_site(run_dirs, out_dir) -> dict:
     run_dirs = [Path(p) for p in run_dirs]
-    seen: dict[str, Path] = {}
+    groups: dict[str, list[Path]] = {}                  # slug -> run dirs, in command-line order
     for p in run_dirs:
-        t = _read_run(p)["target"]
-        slug = slugify(t)
-        if slug in seen:
-            raise ValueError(f"duplicate target {t!r}: {seen[slug]} and {p}")
-        seen[slug] = p
+        groups.setdefault(slugify(_read_run(p)["target"]), []).append(p)
+    built = {slug: build_asset_data(ps) for slug, ps in groups.items()}    # all checks pass before anything is written
     out = Path(out_dir)
     (out / "data").mkdir(parents=True, exist_ok=True)
     assets = []
-    for slug, p in seen.items():
-        data = build_asset_data(p)
+    for slug, data in built.items():
         (out / "data" / f"{slug}.json").write_text(
             json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")), encoding="utf-8")
-        assets.append({"target": data["target"], "slug": slug, "n_factors": len(data["factors"]),
-                       "n_skipped": len(data["skipped"]), "oos_opened": data["oos_opened"],
-                       "sample_end": data["sample_end"], "db_published_at": data["db_published_at"],
-                       "funnel": data["funnel"], "oos_counts": data["oos_counts"]})
-        print(f"[site] {data['target']}: {len(data['factors'])} factors, oos_opened={data['oos_opened']}")
+        assets.append({"target": data["target"], "slug": slug, "sample_end": data["sample_end"],
+                       "db_published_at": data["db_published_at"], "summary": data["summary"],
+                       "sources": [{k: s[k] for k in ("key", "name", "oos_opened", "funnel", "oos_counts")}
+                                   | {"n_factors": len(s["factors"]), "n_skipped": len(s["skipped"])}
+                                   for s in data["sources"]]})
+        for s in data["sources"]:
+            print(f"[site] {data['target']} / {s['name']}: {len(s['factors'])} factors, oos_opened={s['oos_opened']}")
     head, body = render_page({"assets": assets})
     (out / "artifact.html").write_text(head + body, encoding="utf-8")
     (out / "index.html").write_text(
@@ -372,7 +487,18 @@ table.ov tr { cursor: pointer; }
 .summary dt { color: var(--muted); font-size: 12px; margin: 0; }
 .summary dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .summary .wide { grid-column: 1 / -1; }
-.funnel { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+.funnel { display: flex; flex-wrap: wrap; gap: 6px 6px; align-items: center; margin: 8px 0 10px; }
+.funnel button.fstep { background: transparent; border: 1px solid var(--border); padding: 4px 12px; border-radius: 2px; }
+.funnel button.fstep:hover { background: var(--hover); }
+.funnel button.fstep[aria-pressed="true"] { border-color: var(--fg); background: var(--fg); color: var(--bg); font-weight: 600; }
+.funnel .fend { min-width: 0; overflow-wrap: anywhere; }
+.stagesec { margin: 18px 0 8px; }
+.stagehead { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+.stagedesc { margin: 0 0 10px; font-size: 12.5px; }
+.stagenote { margin: 0 0 10px; font-size: 12.5px; color: var(--fg-2); }
+article.card.weak { border-style: dashed; background: transparent; }
+article.card.weak h3 { font-weight: 500; }
+.chartbox { min-height: 230px; }
 .funnel b { font-family: var(--font-mono); font-weight: 600; font-variant-numeric: tabular-nums; }
 .funnel .arr { color: var(--muted); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; }
@@ -385,6 +511,15 @@ table.ov tr { cursor: pointer; }
 .filters button:hover { background: var(--hover); }
 .filters button[aria-pressed="true"] { border-color: var(--fg); background: var(--fg); color: var(--bg); font-weight: 600; }
 .filters .cnt { font-family: var(--font-mono); font-variant-numeric: tabular-nums; margin-left: 6px; opacity: .8; }
+.filterbars { margin: 0 0 22px; }
+.filterbars .filters { margin-bottom: 8px; }
+.glabel { color: var(--muted); font-size: 12px; margin-right: 4px; min-width: 5em; }
+.assetblock { margin: 0 0 26px; }
+.assethead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; cursor: pointer; font-size: 16px; }
+.assethead a { text-decoration: none; border-bottom: 1px solid var(--axis); }
+.srcsec { margin: 0 0 34px; }
+.srchead { font-size: 16px; padding-bottom: 6px; margin: 0 0 4px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.summary.srcinfo { margin: 10px 0 16px; padding-bottom: 0; border-bottom: 0; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 30rem), 1fr)); gap: 16px; }
 article.card { border: 1px solid var(--border); background: var(--surface); padding: 14px 16px 12px; min-width: 0; }
 .card h3 { font-size: 15px; line-height: 1.35; margin: 0 0 4px; font-weight: 600; overflow-wrap: anywhere; }
@@ -497,133 +632,205 @@ function oosText(a) {
   return '确认 ' + c.confirmed + ' · 一致 ' + c.consistent + ' · 失败 ' + c.failed + (c.insufficient ? ' · 样本不足 ' + c.insufficient : '');
 }
 
+var STAGES = {
+  4: {name: '去重后留下', shape: '◆'},
+  3: {name: '去重时被合并', shape: '⊕'},
+  2: {name: '可交易筛选未通过', shape: '▽'},
+  1: {name: '观察期未保留', shape: '✕'}
+};
+
 function renderOverview() {
   var root = h('div');
   root.appendChild(h('h1', {text: '因子跟踪看板'}));
-  root.appendChild(h('p', {class: 'sub', text: '每个标的资产一个页面：展示通过检测的因子（shortlist）的净值走势、公式与交易方向。点击一行进入。'}));
+  root.appendChild(h('p', {class: 'sub', text: '每个标的资产一个页面：按来源（候选池）分组，展示全部通过样本内门槛的因子，并按漏斗逐层分开。点击标的或其中一行进入。'}));
   if (!MANIFEST.assets.length) { root.appendChild(h('div', {class: 'empty', text: '没有资产。'})); return root; }
-  var hasTrade = MANIFEST.assets.some(function (a) { return a.funnel.trade_keep != null; });
-  var head = ['标的', '数据截止日', '检验', '样本内通过', '观察期保留'].concat(hasTrade ? ['可交易'] : [], ['去重后留下', '样本外']);
-  var numCols = hasTrade ? 6 : 5;
-  var tb = h('tbody');
+  var head = ['来源', '样本内过门槛', '观察期保留', '可交易', '去重后留下', '样本外'];
   MANIFEST.assets.forEach(function (a) {
-    var f = a.funnel;
-    var tr = h('tr', {onclick: function (e) { if (e.target.tagName !== 'A') location.hash = '#' + a.slug; }}, [
-      h('td', null, [h('a', {href: '#' + a.slug, text: a.target})]),
-      h('td', {class: 'mono', text: a.sample_end}),
-      h('td', {class: 'n', text: fint(f.tested)}),
-      h('td', {class: 'n', text: fint(f.is_pass + f.is_weak)}),
-      h('td', {class: 'n', text: fint(f.obs_keep + f.obs_insufficient)}),
-      hasTrade ? h('td', {class: 'n', text: fint(f.trade_keep)}) : null,
-      h('td', {class: 'n', text: fint(f.shortlist)}),
-      h('td', {text: oosText(a)})
-    ]);
-    tb.appendChild(tr);
+    var go = function (e) { if (e.target.tagName !== 'A') location.hash = '#' + a.slug; };
+    var tb = h('tbody');
+    a.sources.forEach(function (s) {
+      var f = s.funnel;
+      tb.appendChild(h('tr', {onclick: go}, [
+        h('td', {text: s.name}),
+        h('td', {class: 'n', text: fint(f.n_is)}),
+        h('td', {class: 'n', text: fint(f.n_obs)}),
+        h('td', {class: 'n', text: fint(f.n_trade)}),
+        h('td', {class: 'n', text: fint(f.n_final)}),
+        h('td', {text: oosText(s)})
+      ]));
+    });
+    var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 1 && i <= 4) ? 'n' : null, text: t}); }))]), tb]);
+    root.appendChild(h('section', {class: 'assetblock'}, [
+      h('h2', {class: 'assethead', onclick: go}, [h('a', {href: '#' + a.slug, text: a.target}),
+        h('span', {class: 'muted', text: ' · ' + a.sources.length + ' 个来源 · 因子 ' + a.summary.n_factors + ' 个 · 数据截止 ' + a.sample_end})]),
+      h('div', {class: 'scroll'}, [tbl])
+    ]));
   });
-  var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 2 && i <= numCols) ? 'n' : null, text: t}); }))]), tb]);
-  root.appendChild(h('div', {class: 'scroll'}, [tbl]));
-  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：检验 → 样本内通过（PASS + WEAK_PASS）→ 观察期保留 → ' + (hasTrade ? '可交易（扣成本净 Sharpe 达标）→ ' : '') + '去重后留下 → 样本外确认 / 一致 / 失败。样本外只在运行 confirm 之后才显示。'}));
+  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：样本内过门槛 → 观察期保留 → 可交易（扣成本净 Sharpe 达标）→ 去重后留下 → 样本外确认 / 一致 / 失败。每一层的数字包含更靠后的层；每个来源有自己的漏斗，样本外各自独立：只有该来源运行过 confirm 之后才显示，且只对去重后留下的因子给结论。'}));
   return root;
 }
 
-function funnelEl(a) {
-  var f = a.funnel, parts = [['检验', f.tested], ['样本内通过', f.is_pass + f.is_weak], ['观察期保留', f.obs_keep + f.obs_insufficient]];
-  if (f.trade_keep != null) parts.push(['可交易', f.trade_keep]);
-  parts.push(['去重后留下', f.shortlist]);
-  var el = h('div', {class: 'funnel'});
-  parts.forEach(function (p, i) {
-    if (i) el.appendChild(h('span', {class: 'arr', text: '→'}));
-    el.appendChild(h('span', null, [p[0] + ' ', h('b', {text: String(p[1])})]));
-  });
-  el.appendChild(h('span', {class: 'arr', text: '→'}));
-  if (a.oos_opened) {
-    var c = a.oos_counts;
-    el.appendChild(h('span', null, ['确认 ', h('b', {text: String(c.confirmed)}), ' · 一致 ', h('b', {text: String(c.consistent)}), ' · 失败 ', h('b', {text: String(c.failed)}), (c.insufficient ? ' · 样本不足 ' : ''), (c.insufficient ? h('b', {text: String(c.insufficient)}) : null)]));
-  } else el.appendChild(h('span', {class: 'muted', text: '样本外未打开'}));
-  return el;
-}
+function dl(label, kids, cls) { return h('div', {class: cls}, [h('dt', {text: label}), h('dd', null, kids)]); }
 
 function criteriaEl(a) {
   var c = a.criteria;
   if (!c || c.z_weak == null || c.obs_min_retention == null) return null;
   var txt = '样本内 |z| ≥ ' + c.z_weak + '；观察期方向一致且 IC 不低于样本内的 ' + (Math.round(c.obs_min_retention * 1000) / 10) + '%';
   if (c.min_net_sharpe != null) txt += '；扣成本后净 Sharpe ≥ ' + c.min_net_sharpe + '（样本内+观察期）';
+  if (c.dedupe_corr != null) txt += '；去重相关阈值 ' + c.dedupe_corr;
   return dl('入选条件', [txt], 'wide');
 }
 
-function legendEl(opened) {
+function stageDesc(k, c) {
+  if (k === 4) return '过了样本内门槛、观察期保留' + (c.min_net_sharpe != null ? '、扣成本后净 Sharpe 达标' : '') + '，并在去重后作为代表留下。只有这一层的因子有样本外结论。';
+  if (k === 3) return '通过了前几层，但与另一个代表高度相关' + (c.dedupe_corr != null ? '（相关 ≥ ' + c.dedupe_corr + '）' : '') + '，去重时并入该代表。';
+  if (k === 2) return '观察期保留，但样本内+观察期扣成本后的净 Sharpe 低于 ' + (c.min_net_sharpe != null ? c.min_net_sharpe : '门槛') + '。';
+  return '过了样本内门槛（|z| ≥ ' + c.z_weak + '），但观察期 IC 保留比例低于 ' + c.obs_min_retention + ' 或方向相反。';
+}
+
+function legendEl(opened, mixed) {
   return h('div', {class: 'legend'}, [
     h('span', null, [h('i', {class: 'key is'}), '样本内']),
     h('span', null, [h('i', {class: 'key obs'}), '观察期']),
-    opened ? h('span', null, [h('i', {class: 'key oos'}), '样本外']) : h('span', {class: 'muted'}, [h('i', {class: 'key off'}), '样本外未打开'])
+    opened ? h('span', null, [h('i', {class: 'key oos'}), '样本外']) : h('span', {class: 'muted'}, [h('i', {class: 'key off'}), '样本外未打开']),
+    mixed ? h('span', {class: 'muted', text: '（仅已打开样本外的来源有此段）'}) : null
   ]);
 }
 
-function dl(label, kids, cls) { return h('div', {class: cls}, [h('dt', {text: label}), h('dd', null, kids)]); }
-
 function renderAsset(a) {
-  var root = h('div');
+  var root = h('div'), srcs = a.sources, multi = srcs.length > 1;
+  var nOpen = srcs.filter(function (s) { return s.oos_opened; }).length;
+  var nSkip = srcs.reduce(function (n, s) { return n + s.skipped.length; }, 0);
   root.appendChild(h('h1', {text: a.target + ' 因子跟踪'}));
-  root.appendChild(h('p', {class: 'sub', text: '通过检测的因子 ' + a.factors.length + ' 个' + (a.skipped.length ? '，另有 ' + a.skipped.length + ' 个无法标定净值而未出图' : '') + '。'}));
-  var sum = h('dl', {class: 'summary'}, [
+  root.appendChild(h('p', {class: 'sub', text: (multi ? srcs.length + ' 个来源，' : '') + '通过样本内门槛的因子共 ' + a.summary.n_factors + ' 个，其中去重后留下 ' + a.summary.n_final + ' 个' + (nSkip ? '；另有 ' + nSkip + ' 个无法标定净值而未出图' : '') + '。'}));
+  root.appendChild(h('dl', {class: 'summary'}, [
     dl('数据截止日', [h('span', {class: 'mono', text: a.sample_end})]),
     dl('标的样本', [h('span', {class: 'mono', text: a.sample_start + ' 至 ' + a.sample_end})]),
     dl('数据库发布', [h('span', {class: 'mono', text: (a.db_published_at || '–').slice(0, 10)})]),
-    dl('切分规则', ['每个因子在自身有效数据内按 ' + Math.round(a.is_frac * 100) + '/' + Math.round(a.obs_frac * 100) + '/' + Math.round((1 - a.is_frac - a.obs_frac) * 100) + ' 切成样本内 / 观察期 / 样本外']),
     dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%']),
-    dl('三段图例', [legendEl(a.oos_opened)]),
-    dl('筛选漏斗', [funnelEl(a)], 'wide'),
-    criteriaEl(a)
-  ]);
-  root.appendChild(sum);
-  var bar = h('div', {class: 'filters', role: 'group', 'aria-label': '按样本外结论筛选'});
-  var list = h('div', {class: 'grid'});
-  var cnt = {ALL: a.factors.length};
-  a.factors.forEach(function (f) { var k = f.oos_verdict || 'NONE'; cnt[k] = (cnt[k] || 0) + 1; });
-  var opts = a.oos_opened ? [['ALL', '全部'], ['CONFIRMED', '确认'], ['CONSISTENT', '一致'], ['FAILED', '失败'], ['INSUFFICIENT', '样本不足']] : [['ALL', '全部']];
-  if (!a.oos_opened) filterKey = 'ALL';
-  else if (!opts.some(function (o) { return o[0] === filterKey; })) filterKey = 'ALL';
-  function fill() {
-    redraws = [];
-    list.textContent = '';
-    var shown = a.factors.filter(function (f) { return filterKey === 'ALL' || f.oos_verdict === filterKey; });
-    if (!shown.length) list.appendChild(h('div', {class: 'empty', text: a.factors.length ? '该结论下没有因子。' : '没有因子通过检测。'}));
-    shown.forEach(function (f) { list.appendChild(card(f, a)); });
-    shown.forEach(function (f, i) { redraws[i](); });
-    Array.prototype.forEach.call(bar.children, function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-k') === filterKey)); });
+    dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < srcs.length)])
+  ]));
+  var sKey = 'ALL', step = {};
+  srcs.forEach(function (s) { step[s.key] = 1; });
+  var bars = h('div', {class: 'filterbars'});
+  var vbar = h('div', {class: 'filters', role: 'group', 'aria-label': '按样本外结论筛选'});
+  var sbar = h('div', {class: 'filters', role: 'group', 'aria-label': '按来源筛选'});
+  var secs = h('div', {class: 'sections'});
+  var cnt = {ALL: a.summary.n_final};
+  srcs.forEach(function (s) { s.factors.forEach(function (f) { if (f.stage === 4) { var k = f.oos_verdict || 'NONE'; cnt[k] = (cnt[k] || 0) + 1; } }); });
+  var vopts = nOpen ? [['ALL', '全部'], ['CONFIRMED', '确认'], ['CONSISTENT', '一致'], ['FAILED', '失败'], ['INSUFFICIENT', '样本不足']] : [['ALL', '全部']];
+  if (!vopts.some(function (o) { return o[0] === filterKey; })) filterKey = 'ALL';
+  var sopts = [['ALL', '全部', a.summary.n_factors]].concat(srcs.map(function (s) { return [s.key, s.name, s.factors.length]; }));
+  var items = [];
+  var io = null;
+  if ('IntersectionObserver' in window) {
+    io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        io.unobserve(e.target);
+        if (e.target._item) e.target._item.draw();
+      });
+    }, {rootMargin: '400px 0px'});
   }
-  opts.forEach(function (o) {
-    bar.appendChild(h('button', {type: 'button', 'data-k': o[0], 'aria-pressed': String(o[0] === filterKey), onclick: function () { filterKey = o[0]; fill(); }}, [o[1], h('span', {class: 'cnt', text: String(cnt[o[0]] || 0)})]));
+  function fill() {
+    if (io) io.disconnect();
+    items = [];
+    redraws = [];
+    secs.textContent = '';
+    srcs.forEach(function (s) {
+      if (sKey !== 'ALL' && sKey !== s.key) return;
+      secs.appendChild(section(s, a, items, step, function (k) { step[s.key] = k; fill(); }));
+    });
+    items.forEach(function (it) {
+      var item = {done: false, draw: function () { item.done = true; drawChart(it.box, it.f, it.opened); }};
+      it.box._item = item;
+      redraws.push(function () { if (item.done) item.draw(); });
+      var top = it.box.getBoundingClientRect().top;
+      if (!io || top < window.innerHeight * 1.5) item.draw(); else io.observe(it.box);
+    });
+    Array.prototype.forEach.call(vbar.querySelectorAll('button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-k') === filterKey)); });
+    Array.prototype.forEach.call(sbar.querySelectorAll('button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-k') === sKey)); });
+  }
+  vbar.appendChild(h('span', {class: 'glabel', text: '样本外结论'}));
+  vopts.forEach(function (o) {
+    vbar.appendChild(h('button', {type: 'button', 'data-k': o[0], onclick: function () { filterKey = o[0]; fill(); }}, [o[1], h('span', {class: 'cnt', text: String(cnt[o[0]] || 0)})]));
   });
-  if (!a.oos_opened) bar.appendChild(h('span', {class: 'muted', text: '样本外未打开，暂无结论可筛选。'}));
-  root.appendChild(bar);
-  root.appendChild(list);
+  vbar.appendChild(h('span', {class: 'muted', text: nOpen ? '只对「去重后留下」的因子给结论；选了某个结论时其他层隐藏。' : '样本外未打开，暂无结论可筛选。'}));
+  bars.appendChild(vbar);
+  if (multi) {
+    sbar.appendChild(h('span', {class: 'glabel', text: '来源'}));
+    sopts.forEach(function (o) {
+      sbar.appendChild(h('button', {type: 'button', 'data-k': o[0], onclick: function () { sKey = o[0]; fill(); }}, [o[1], h('span', {class: 'cnt', text: String(o[2])})]));
+    });
+    bars.appendChild(sbar);
+  }
+  root.appendChild(bars);
+  root.appendChild(secs);
   root._after = fill;
   return root;
+}
+
+function funnelBar(s, cur, pick) {
+  var f = s.funnel, el = h('div', {class: 'funnel', role: 'group', 'aria-label': s.name + ' 漏斗：点击某一步只看到达该步的因子'});
+  [['样本内过门槛', f.n_is], ['观察期保留', f.n_obs], ['可交易', f.n_trade], ['去重后留下', f.n_final]].forEach(function (p, i) {
+    if (i) el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
+    el.appendChild(h('button', {type: 'button', class: 'fstep', 'aria-pressed': String(cur === i + 1), onclick: function () { pick(i + 1); }}, [p[0] + ' ', h('b', {text: String(p[1])})]));
+  });
+  el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
+  if (s.oos_opened) {
+    var c = s.oos_counts;
+    el.appendChild(h('span', {class: 'fend'}, ['样本外：确认 ', h('b', {text: String(c.confirmed)}), ' · 一致 ', h('b', {text: String(c.consistent)}), ' · 失败 ', h('b', {text: String(c.failed)}), (c.insufficient ? ' · 样本不足 ' : ''), (c.insufficient ? h('b', {text: String(c.insufficient)}) : null)]));
+  } else el.appendChild(h('span', {class: 'muted fend', text: '样本外未打开'}));
+  return el;
+}
+
+function section(s, a, items, step, pick) {
+  var cur = step[s.key];
+  var vis = s.factors.filter(function (f) {
+    return f.stage >= cur && (filterKey === 'ALL' || (f.stage === 4 && f.oos_verdict === filterKey));
+  });
+  var kids = [h('h2', {class: 'srchead'}, [s.name, h('span', {class: 'muted', text: ' · ' + s.factors.length + ' 个因子' + (vis.length !== s.factors.length ? '（当前显示 ' + vis.length + '）' : '')})]),
+    funnelBar(s, cur, pick)];
+  var info = [criteriaEl(s),
+    dl('切分规则', ['每个因子在自身有效数据内按 ' + Math.round(s.is_frac * 100) + '/' + Math.round(s.obs_frac * 100) + '/' + Math.round((1 - s.is_frac - s.obs_frac) * 100) + ' 切成样本内 / 观察期 / 样本外'], 'wide')];
+  if (s.skipped.length) info.push(dl('未出图', [s.skipped.length + ' 个因子无法标定净值：' + s.skipped.map(function (k) { return k.id; }).join('、')], 'wide'));
+  kids.push(h('dl', {class: 'summary srcinfo'}, info));
+  if (!vis.length) kids.push(h('div', {class: 'empty', text: '该来源在当前筛选下没有因子。'}));
+  [4, 3, 2, 1].forEach(function (k) {
+    var fs = vis.filter(function (f) { return f.stage === k; });
+    if (!fs.length) return;
+    var list = h('div', {class: 'grid'});
+    fs.forEach(function (f) { list.appendChild(card(f, s, a, items)); });
+    kids.push(h('section', {class: 'stagesec st' + k, 'aria-label': s.name + ' · ' + STAGES[k].name}, [
+      h('h3', {class: 'stagehead'}, [h('span', {class: 'shape', 'aria-hidden': 'true', text: STAGES[k].shape + ' '}), STAGES[k].name, h('span', {class: 'muted', text: ' · ' + fs.length + ' 个'})]),
+      h('p', {class: 'stagedesc muted', text: stageDesc(k, s.criteria)}),
+      list]));
+  });
+  return h('section', {class: 'srcsec', id: 'src-' + a.slug + '-' + s.key, 'aria-label': s.name}, kids);
 }
 
 function badge(cls, shape, text, extra) {
   return h('span', {class: 'badge ' + cls + (extra ? ' ' + extra : '')}, [h('span', {class: 'shape', 'aria-hidden': 'true', text: shape}), text]);
 }
 
-function card(f, a) {
-  var v = VERD[f.oos_verdict || 'NONE'] || VERD.NONE;
+function card(f, s, a, items) {
+  var v = VERD[f.oos_verdict || 'NONE'] || VERD.NONE, st = STAGES[f.stage];
   var box = h('div', {class: 'chartbox'});
-  var el = h('article', {class: 'card'}, [
+  var badges = [badge('dir', f.sign > 0 ? '▲' : '▼', f.direction, 'dir'), badge('stage', st.shape, '到达：' + st.name, 'stage')];
+  if (f.stage === 4) badges.push(badge(v.cls, v.shape, '样本外：' + v.label));
+  var el = h('article', {class: 'card' + (f.stage < 4 ? ' weak' : ''), id: 'card-' + a.slug + '-' + s.key + '-' + String(f.id).replace(/\s/g, '_'), 'data-source': s.key, 'data-stage': String(f.stage)}, [
     h('h3', {text: f.title}),
-    h('div', {class: 'idline'}, [h('span', {class: 'mono', text: f.id}), ' · ' + f.group + ' · z ' + fx(f.z, 2) + (f.cluster_size > 1 ? ' · 同簇 ' + f.cluster_size + ' 个' : '')]),
-    h('div', {class: 'badges'}, [
-      badge('dir', f.sign > 0 ? '▲' : '▼', f.direction, 'dir'),
-      badge(v.cls, v.shape, '样本外：' + v.label)
-    ]),
+    h('div', {class: 'idline'}, [h('span', {class: 'mono', text: f.id}), ' · ' + f.group + ' · ' + (f.is_verdict === 'PASS' ? '样本内通过' : '样本内弱通过') + ' · z ' + fx(f.z, 2) + (f.cluster_size > 1 ? ' · 同簇 ' + f.cluster_size + ' 个' : '')]),
+    h('div', {class: 'badges'}, badges),
+    f.stage_note ? h('p', {class: 'stagenote', text: f.stage_note}) : null,
     h('pre', {class: 'formula', tabindex: '0', 'aria-label': '因子公式', text: f.formula.join('\n')}),
-    cardLegend(a.oos_opened),
+    cardLegend(s.oos_opened),
     box,
     statsTable(f),
     oosNote(f),
     f.flags.length ? h('ul', {class: 'flags'}, f.flags.map(function (t) { return h('li', {text: t}); })) : null
   ]);
-  redraws.push(function () { drawChart(box, f, a.oos_opened); });
+  items.push({box: box, f: f, opened: s.oos_opened});
   return el;
 }
 
@@ -658,7 +865,7 @@ function statsTable(f) {
 function oosNote(f) {
   var c = f.oos_confirm;
   if (!c) return null;
-  return h('p', {class: 'oosnote'}, ['样本外检验：t ', h('span', {class: 'num', text: fx(c.t_signed, 2)}), ' · 单边 p ', h('span', {class: 'num', text: fx(c.p_one, 3)}), ' · retention ', h('span', {class: 'num', text: fx(c.retention_oos, 2)})]);
+  return h('p', {class: 'oosnote'}, ['样本外统计：t ', h('span', {class: 'num', text: fx(c.t_signed, 2)}), ' · 单边 p ', h('span', {class: 'num', text: fx(c.p_one, 3)}), ' · retention ', h('span', {class: 'num', text: fx(c.retention_oos, 2)})]);
 }
 
 /* ------------------------------------------------------------ chart */

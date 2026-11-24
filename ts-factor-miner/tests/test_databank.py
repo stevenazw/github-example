@@ -164,6 +164,7 @@ chain = 1
 def test_load_shipped_configs(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     assert cfg.target.name.lower() == name
+    assert cfg.universe.name == ""
     assert cfg.universe.select and cfg.universe.spread
     assert cfg.lags.chain >= 0
     assert cfg.lags.class_["Positioning/CFTC_COT"] == 4
@@ -196,6 +197,15 @@ def test_minimal_config_defaults(tmp_path):
     assert cfg.lags.chain == 1 and cfg.lags.class_ == {} and cfg.lags.ticker == {}
     assert (cfg.sample.is_frac, cfg.sample.obs_frac) == (0.70, 0.15) and cfg.position.buffer == 0.5
     assert (cfg.verdict.obs_min_retention, cfg.verdict.year_hit_min) == (0.5, 0.6)
+
+
+def test_universe_name(tmp_path):
+    assert load_config(_write(tmp_path, MINIMAL)).universe.name == ""
+    assert load_config(_write(tmp_path, MINIMAL + '\n[universe]\nname = "变量清单"\n')).universe.name == "变量清单"
+    for bad in ("name = 3", "name = true", "name = [\"a\"]"):
+        with pytest.raises(ValueError, match="universe.name"):
+            load_config(_write(tmp_path, MINIMAL + f"\n[universe]\n{bad}\n"))
+    assert load_config(_write(tmp_path, MINIMAL)).to_dict()["universe"]["name"] == ""
 
 
 def test_lags_section_is_an_input(tmp_path):

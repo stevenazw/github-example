@@ -23,7 +23,8 @@ def main(argv=None) -> int:
     pc.add_argument("run_dir")
     pc.add_argument("--force", metavar="REASON", help="re-open an already opened OOS (logged)")
     ps = sub.add_parser("site", help="build the factor-tracking dashboard (static site) from run directories")
-    ps.add_argument("run_dirs", nargs="+", metavar="RUN_DIR", help="one run directory per asset")
+    ps.add_argument("run_dirs", nargs="+", metavar="RUN_DIR",
+                    help="run directories; runs of the same target are merged and grouped by source")
     ps.add_argument("--out", required=True, metavar="DIR", help="output directory of the site")
     a = ap.parse_args(argv)
 
