@@ -1,0 +1,17 @@
+# TY 滚动挖掘(walk-forward)配置: 用 `python -m tsminer roll configs/ty_roll.toml RUN_DIR... --out DIR` 运行。
+# 验证的是"选择规则", 不是"某个因子是否永远有效": 每个重挖日只用此前 window_years 年的行选因子,
+# 持有到下一个重挖日, 再看被选中的集合在之后的表现; 每个持有日相对选出它的那次选择都是样本外。
+# 入口门槛(z_weak / is_min_net_sharpe / dedupe_corr)、统计设置、缓冲带与成本取自各 run 的 config.toml。
+
+[rolling]
+window_years = 3          # 滚动挖掘窗口(年)
+step_months = 6           # 重挖频率(月)
+first_date = "2005-01-01" # 第一个重挖日 = 该日期当天或之后的第一个标的交易日
+holdout_years = 3         # 标的最后这几个自然年封存: 不读取、不评估
+stay_z = 1.0              # 在持因子: 符号不变且 |z| >= stay_z 则继续持有(无净 Sharpe 条件)
+group_cap = 0.3334        # 单个 group 的总权重上限
+coverage = 0.8            # 候选在窗口内至少要有这个比例的有限值行
+
+[rolling.grid]            # 事先声明的稳健性网格: 全部报告, 不挑选
+window_years = [3, 5]
+step_months = [6, 12]
