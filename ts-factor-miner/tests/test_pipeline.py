@@ -804,3 +804,15 @@ def test_cli_locked_exit_code(confirmed_run):
     p = subprocess.run([sys.executable, "-m", "tsminer", "confirm", str(d)], cwd=ROOT, env=env,
                        capture_output=True, text=True)
     assert p.returncode == 2
+
+
+def test_report_lists_variables_without_rule_with_their_leaves(tmp_path, cfg, cfg_path):
+    panel = make_panel(22)
+    panel.excluded = pd.DataFrame({"ticker": ["var:ff_3m", "var:x", "u"],
+                                   "reason": ["no_availability_rule: FF1 Comdty/PX_LAST, FF4 Comdty/PX_LAST",
+                                              "no_availability_rule: curve:C/fwd_start/1Y/1Y", "no_data"]})
+    mine(cfg, tmp_path / "r", panel=panel, config_path=cfg_path)
+    rep = (tmp_path / "r" / "report.md").read_text(encoding="utf-8")
+    sec = rep.split("## 可得性输入")[1].split("## 判定标准")[0]
+    assert "2 个" in sec and "var:ff_3m [FF1 Comdty/PX_LAST, FF4 Comdty/PX_LAST]" in sec and "var:x" in sec
+    assert "no_availability_rule: 2" in rep and "no_data: 1" in rep

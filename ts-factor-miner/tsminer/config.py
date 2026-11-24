@@ -12,6 +12,8 @@ import tomllib
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .variables import ID_RE, validate_definitions
+
 ENV_TOOLKIT = "DATABANK_TOOLKIT"
 ENV_CACHE = "DATABANK_CACHE"
 
@@ -51,6 +53,11 @@ class UniverseConfig:
     exclude_tickers: list[str] = field(default_factory=list)
     select: list[dict] = field(default_factory=list)
     spread: list[dict] = field(default_factory=list)
+    helper: list[dict] = field(default_factory=list)      # {id, expr}: only reachable through ref(), not candidates
+    variable: list[dict] = field(default_factory=list)    # {id, expr, kind, group, description}: panel columns
+
+
+VARIABLE_KINDS = {"level", "price"}
 
 
 @dataclass
@@ -59,6 +66,8 @@ class LagsConfig:
     chain: int                                              # futures chains ``chain:*`` and ``carry:*``
     class_: dict[str, int] = field(default_factory=dict)   # TOML key: "class"; keys "class_one/class_two"
     ticker: dict[str, int] = field(default_factory=dict)
+    field_: dict[str, int] = field(default_factory=dict)   # TOML key: "field"; field name or "chain:<column>"
+    curve: dict[str, int] = field(default_factory=dict)    # curve name
 
 
 @dataclass
@@ -109,6 +118,7 @@ class Config:
         """JSON-serialisable nested dict (``lags.class_`` is emitted as ``class``)."""
         d = asdict(self)
         d["lags"]["class"] = d["lags"].pop("class_")
+        d["lags"]["field"] = d["lags"].pop("field_")
         return d
 
 
@@ -206,6 +216,35 @@ def _parse_spread(entry: Any, i: int) -> dict:
     return dict(entry)
 
 
+def _parse_definition(entry: Any, i: int, section: str, keys: set[str], required: set[str]) -> dict:
+    where = f"universe.{section}[{i}]"
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where}: must be a table")
+    unknown = set(entry) - keys
+    if unknown:
+        raise ValueError(f"{where}: unknown key(s) {sorted(unknown)}")
+    missing = required - set(entry)
+    if missing:
+        raise ValueError(f"{where}: missing required key(s) {sorted(missing)}")
+    for k, v in entry.items():
+        _check_type(v, (str,), f"{where}.{k}")
+    if not ID_RE.fullmatch(entry["id"]):
+        raise ValueError(f"{where}.id: {entry['id']!r} must be ASCII letters, digits and underscores")
+    if not entry["expr"].strip():
+        raise ValueError(f"{where}.expr: empty expression for {entry['id']!r}")
+    return dict(entry)
+
+
+def _parse_variable(entry: Any, i: int) -> dict:
+    out = _parse_definition(entry, i, "variable", {"id", "expr", "kind", "group", "description"}, {"id", "expr"})
+    out.setdefault("kind", "level")
+    out.setdefault("group", "Variable")
+    out.setdefault("description", out["id"])
+    if out["kind"] not in VARIABLE_KINDS:
+        raise ValueError(f"universe.variable[{i}].kind must be one of {sorted(VARIABLE_KINDS)}, got {out['kind']!r}")
+    return out
+
+
 # -------------------------------------------------------------------- main
 def load_config(path: str | os.PathLike) -> Config:
     """Load and validate a TOML config; raise ``ValueError`` on any config error."""
@@ -252,7 +291,8 @@ def load_config(path: str | os.PathLike) -> Config:
         raise ValueError("sample requires is_frac > 0, obs_frac > 0 and is_frac + obs_frac < 1")
 
     # universe
-    sec = _section(raw, "universe", {"fields", "chains", "carry_chains", "exclude_tickers", "select", "spread"})
+    sec = _section(raw, "universe", {"fields", "chains", "carry_chains", "exclude_tickers", "select", "spread",
+                                       "helper", "variable"})
     for k in ("fields", "chains", "carry_chains", "exclude_tickers"):
         if k in sec:
             _str_list(sec[k], f"universe.{k}")
@@ -261,12 +301,20 @@ def load_config(path: str | os.PathLike) -> Config:
     ids = [s["id"] for s in spread]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate universe.spread id")
-    universe = UniverseConfig(**sec, select=select, spread=spread)
+    helper = [_parse_definition(e, i, "helper", {"id", "expr"}, {"id", "expr"})
+              for i, e in enumerate(sec.pop("helper", []))]
+    variable = [_parse_variable(e, i) for i, e in enumerate(sec.pop("variable", []))]
+    all_ids = [d["id"] for d in helper + variable]
+    if len(all_ids) != len(set(all_ids)):
+        dup = sorted({i for i in all_ids if all_ids.count(i) > 1})
+        raise ValueError(f"duplicate id among universe.helper / universe.variable: {dup}")
+    validate_definitions({d["id"]: d["expr"] for d in helper + variable})
+    universe = UniverseConfig(**sec, select=select, spread=spread, helper=helper, variable=variable)
     if not universe.fields:
         raise ValueError("universe.fields must not be empty")
 
     # lags (availability input: required, no frequency defaults)
-    sec = _section(raw, "lags", {"chain", "class", "ticker"}, {"chain"})
+    sec = _section(raw, "lags", {"chain", "class", "ticker", "field", "curve"}, {"chain"})
     _check_type(sec["chain"], (int,), "lags.chain")
     if sec["chain"] < 0:
         raise ValueError("lags.chain must be >= 0")
@@ -278,6 +326,10 @@ def load_config(path: str | os.PathLike) -> Config:
                 raise ValueError(f"lags.class key must look like 'class_one/class_two', got {key!r}")
     if "ticker" in sec:
         lags_kwargs["ticker"] = _int_map(sec["ticker"], "lags.ticker")
+    if "field" in sec:
+        lags_kwargs["field_"] = _int_map(sec["field"], "lags.field")
+    if "curve" in sec:
+        lags_kwargs["curve"] = _int_map(sec["curve"], "lags.curve")
     lags = LagsConfig(**lags_kwargs)
 
     # position

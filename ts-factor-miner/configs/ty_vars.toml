@@ -1,0 +1,709 @@
+# TY 变量清单配置（研究者给定的变量，而不是盲扫候选池）。
+# - 候选池 = [[universe.variable]] 里的 63 个公式变量; 每个变量由一条或多条底层序列按公式构造
+#   (利差、比值、多腿组合、累加、已实现波动率等), 系统对每个变量照旧做 6 个固定变换并逐个检验。
+# - 不预设方向: 每个变量一律双边检验, 方向由样本内符号决定。
+# - 可得性规则是【输入】, 由研究者确认: 每条底层序列先按自己的规则 as-of 对齐并滞后, 再做公式运算;
+#   任何一条底层序列没有规则, 该变量被拒收(no_availability_rule)并在 excluded 里列出缺规则的叶子。
+# - 叶子函数: ts(ticker[, field]) 存量; flow(ticker, field) 流量(累加到下一个日历行, 不向前填充);
+#   chain(root, column) 期货连续合约的一列; curve(name, measure, start_tenor, tenor) 库内曲线点;
+#   ref(id) 引用另一个变量或 helper 的未变换取值。运算函数: lag diff dlog sign nz cumsum rvol。
+# - 本文件的 [target] / [databank] / [sample] / [signals] / [stats] / [verdict] / [position] 与 configs/ty.toml 相同。
+
+[target]
+name = "TY"
+kind = "futures_chain"      # "futures_chain" | "spot"
+root = "TY"                 # used by futures_chain
+# ticker / field             # used by spot: log difference of PX_LAST is the daily return
+cost_per_side = 0.00014     # 单边成本(收益率单位): TY 半个 tick 1/64 点 ÷ 价格约 110
+
+[databank]
+toolkit_dir = "/home/user/databank-work/entry"
+cache_dir = "/home/user/databank-work/databank-cache"
+
+[sample]
+start = ""                  # 可选 ISO 日期; 空 = 标的全部历史
+is_frac = 0.70              # 每个候选在自己与标的重叠的有效行内切成: 样本内 IS 70% / 观察期 OBS 15% / 样本外 OOS 15%
+obs_frac = 0.15
+
+[universe]
+fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: ts(ticker) 省略字段时取该 ticker 拥有的第一个
+
+[lags]
+# 可得性(availability)是【输入】, 由研究者确认, 系统不猜测、不套默认值。数值含义: t 日收盘的信号只能用日期 <= t-lag 的观测。
+# 优先级: ts / flow 叶子: [lags.ticker] 精确 ticker > [lags.field] 字段名 > [lags.class] 的 "class_one/class_two";
+#         chain 叶子: [lags.field] 里键 "chain:<column>" > chain; curve 叶子: [lags.curve] 的曲线名。
+chain = 0      # 期货连续合约: 不滞后
+
+[lags.class]
+"Market_Data/Government_Bond" = 0
+"Market_Data/Money_Market" = 0
+"Market_Data/Swap_OIS" = 0
+"Market_Data/VOL" = 1
+"Market_Data/Commodity" = 0
+"Market_Data/Equity" = 0
+"Market_Data/Inflation_Linked" = 0
+"Market_Data/Credit" = 0
+"Market_Data/MBS" = 0
+"Market_Data/FX" = 0
+"Macro/Global" = 1
+"Macro/US" = 1
+"Positioning/CFTC_COT" = 4     # 周二数据、周五 15:30 ET 发布 -> 下周一可用
+"FED/Balance_Sheet" = 2        # 周三数据、周四 16:30 ET 发布 -> 周五可用
+"FED/Primary_Dealer" = 8       # 周三数据、下周四发布 -> 保守取 8
+
+[lags.ticker]
+"NFCIINDX Index" = 6
+
+[lags.field]
+"FUND_FLOW" = 1                       # ETF 资金流: 滞后 1 天(研究者确认)
+"EQY_SH_OUT" = 1
+"FUND_NET_ASSET_VAL" = 1
+"1M_CALL_IMP_VOL_25DELTA_DFLT" = 1    # 隐含波动率: 滞后 1 天(研究者确认)
+"1M_PUT_IMP_VOL_25DELTA_DFLT" = 1
+"CONVENTIONAL_CTD_FORWARD_FRSK" = 1
+"VOLUME" = 0
+"chain:oi_active" = 1                 # 持仓量: 交易所次日公布, 起草为滞后 1 天, 待研究者确认
+"chain:oi_next" = 1
+
+[lags.curve]
+"USD_SOFR_OIS" = 0
+
+# ---------------------------------------------------------------- helper（只供 ref() 引用，不是候选）
+# 缩写: PUT = 1M_PUT_IMP_VOL_25DELTA_DFLT, CALL = 1M_CALL_IMP_VOL_25DELTA_DFLT, FRSK = CONVENTIONAL_CTD_FORWARD_FRSK
+# aum_*: ETF 规模取前一日 (lag(..., 1)); fl_*: ETF 资金流 (flow 叶子)。
+[[universe.helper]]
+id = "iv_ty"
+expr = "(ts('TY1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') + ts('TY1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')) / 2"
+
+[[universe.helper]]
+id = "iv_tu"
+expr = "(ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') + ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')) / 2"
+
+[[universe.helper]]
+id = "iv_us"
+expr = "(ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') + ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')) / 2"
+
+[[universe.helper]]
+id = "skew_ty"
+expr = "ts('TY1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TY1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+
+[[universe.helper]]
+id = "skew_tu"
+expr = "ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+
+[[universe.helper]]
+id = "skew_fv"
+expr = "ts('FV1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('FV1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+
+[[universe.helper]]
+id = "skew_us"
+expr = "ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+
+[[universe.helper]]
+id = "dur_ty"
+expr = "ts('TY1 Comdty','CONVENTIONAL_CTD_FORWARD_FRSK')"
+
+[[universe.helper]]
+id = "dur_tu"
+expr = "ts('TU1 Comdty','CONVENTIONAL_CTD_FORWARD_FRSK')"
+
+[[universe.helper]]
+id = "dur_fv"
+expr = "ts('FV1 Comdty','CONVENTIONAL_CTD_FORWARD_FRSK')"
+
+[[universe.helper]]
+id = "dur_us"
+expr = "ts('US1 Comdty','CONVENTIONAL_CTD_FORWARD_FRSK')"
+
+[[universe.helper]]
+id = "oi_ty"
+expr = "chain('TY','oi_active') + nz(chain('TY','oi_next'))"
+
+[[universe.helper]]
+id = "oi_tu"
+expr = "chain('TU','oi_active') + nz(chain('TU','oi_next'))"
+
+[[universe.helper]]
+id = "oi_fv"
+expr = "chain('FV','oi_active') + nz(chain('FV','oi_next'))"
+
+[[universe.helper]]
+id = "oi_us"
+expr = "chain('US','oi_active') + nz(chain('US','oi_next'))"
+
+[[universe.helper]]
+id = "aum_ief"
+expr = "lag(ts('IEF US Equity','EQY_SH_OUT') * ts('IEF US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_tlt"
+expr = "lag(ts('TLT US Equity','EQY_SH_OUT') * ts('TLT US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_tlh"
+expr = "lag(ts('TLH US Equity','EQY_SH_OUT') * ts('TLH US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_iei"
+expr = "lag(ts('IEI US Equity','EQY_SH_OUT') * ts('IEI US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_govt"
+expr = "lag(ts('GOVT US Equity','EQY_SH_OUT') * ts('GOVT US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_shy"
+expr = "lag(ts('SHY US Equity','EQY_SH_OUT') * ts('SHY US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_bil"
+expr = "lag(ts('BIL US Equity','EQY_SH_OUT') * ts('BIL US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_sgov"
+expr = "lag(ts('SGOV US Equity','EQY_SH_OUT') * ts('SGOV US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "aum_tip"
+expr = "lag(ts('TIP US Equity','EQY_SH_OUT') * ts('TIP US Equity','FUND_NET_ASSET_VAL'), 1)"
+
+[[universe.helper]]
+id = "fl_ief"
+expr = "flow('IEF US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tlt"
+expr = "flow('TLT US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tlh"
+expr = "flow('TLH US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_iei"
+expr = "flow('IEI US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_govt"
+expr = "flow('GOVT US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_shy"
+expr = "flow('SHY US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_bil"
+expr = "flow('BIL US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_sgov"
+expr = "flow('SGOV US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "fl_tip"
+expr = "flow('TIP US Equity','FUND_FLOW')"
+
+[[universe.helper]]
+id = "f_1y1y"
+expr = "curve('USD_SOFR_OIS','fwd_start','1Y','1Y')"
+
+[[universe.helper]]
+id = "f_2y1y"
+expr = "curve('USD_SOFR_OIS','fwd_start','2Y','1Y')"
+
+[[universe.helper]]
+id = "f_5y5y"
+expr = "curve('USD_SOFR_OIS','fwd_start','5Y','5Y')"
+
+[[universe.helper]]
+id = "f_10y10y"
+expr = "curve('USD_SOFR_OIS','fwd_start','10Y','10Y')"
+
+# ---------------------------------------------------------------- variable（每个变量是面板的一列，序列 id 为 var:<id>）
+# ---- Rates
+[[universe.variable]]
+id = "slope_2s10s"
+group = "Rates"
+kind = "level"
+expr = "ts('USGG10YR Index') - ts('USGG2YR Index')"
+description = "期限利差 2s10s"
+
+[[universe.variable]]
+id = "slope_3m10y"
+group = "Rates"
+kind = "level"
+expr = "ts('USGG10YR Index') - ts('USGG3M Index')"
+description = "期限利差 3M10Y"
+
+[[universe.variable]]
+id = "slope_5s30s"
+group = "Rates"
+kind = "level"
+expr = "ts('USGG30YR Index') - ts('USGG5YR Index')"
+description = "长端斜率 5s30s"
+
+[[universe.variable]]
+id = "fly_2s5s10s"
+group = "Rates"
+kind = "level"
+expr = "2*ts('USGG5YR Index') - ts('USGG2YR Index') - ts('USGG10YR Index')"
+description = "曲率 2s5s10s"
+
+[[universe.variable]]
+id = "ty_carry"
+group = "Rates"
+kind = "level"
+expr = "chain('TY','calendar_spread') / chain('TY','px_active')"
+description = "TY carry（跨月价差÷主力价格）"
+
+[[universe.variable]]
+id = "ty_momentum"
+group = "Rates"
+kind = "price"
+expr = "chain('TY','return_index')"
+description = "TY 动量（连续合约收益指数）"
+
+[[universe.variable]]
+id = "policy_path"
+group = "Rates"
+kind = "level"
+expr = "ts('USOSFR1 Curncy') - ts('FDTR Index')"
+description = "政策路径定价（1 年 OIS − 政策利率）"
+
+# ---- Inflation
+[[universe.variable]]
+id = "real_10y"
+group = "Inflation"
+kind = "level"
+expr = "ts('USGGT10Y Index')"
+description = "10 年实际利率"
+
+[[universe.variable]]
+id = "be_10y"
+group = "Inflation"
+kind = "level"
+expr = "ts('USGGBE10 Index')"
+description = "10 年盈亏平衡通胀"
+
+[[universe.variable]]
+id = "infl_5y5y"
+group = "Inflation"
+kind = "level"
+expr = "2*ts('USSWIT10 Curncy') - ts('USSWIT5 Curncy')"
+description = "远期通胀 5y5y（通胀互换）"
+
+[[universe.variable]]
+id = "crude"
+group = "Inflation"
+kind = "price"
+expr = "ts('SPGSCLTR Index')"
+description = "原油（标普高盛原油指数）"
+
+[[universe.variable]]
+id = "ind_metals"
+group = "Inflation"
+kind = "price"
+expr = "ts('SPGSINTR Index')"
+description = "工业金属（标普高盛工业金属指数）"
+
+[[universe.variable]]
+id = "gold_copper"
+group = "Inflation"
+kind = "price"
+expr = "ts('SPGSGCTR Index') / ts('SPGSINTR Index')"
+description = "金铜比（黄金÷工业金属）"
+
+# ---- Risk
+[[universe.variable]]
+id = "global_equity"
+group = "Risk"
+kind = "price"
+expr = "ts('MXWDU Index')"
+description = "全球股票（MSCI 除美国）"
+
+[[universe.variable]]
+id = "cyc_def"
+group = "Risk"
+kind = "price"
+expr = "ts('GU704866 Index') / ts('GU704865 Index')"
+description = "周期相对防御（MSCI 美国板块）"
+
+[[universe.variable]]
+id = "vix"
+group = "Risk"
+kind = "level"
+expr = "ts('VIX Index')"
+description = "VIX"
+
+[[universe.variable]]
+id = "em_oas"
+group = "Risk"
+kind = "level"
+expr = "ts('BSSUOAS Index')"
+description = "新兴市场主权利差"
+
+[[universe.variable]]
+id = "cesi_us"
+group = "Risk"
+kind = "level"
+expr = "ts('CESIUSD Index')"
+description = "美国经济意外指数"
+
+[[universe.variable]]
+id = "fci_us"
+group = "Risk"
+kind = "level"
+expr = "ts('BFCIUS Index')"
+description = "美国金融条件指数"
+
+[[universe.variable]]
+id = "audusd"
+group = "Risk"
+kind = "price"
+expr = "ts('AUDUSD BGN Curncy')"
+description = "AUD/USD"
+
+# ---- Global
+[[universe.variable]]
+id = "bund_momentum"
+group = "Global"
+kind = "price"
+expr = "chain('RX','return_index')"
+description = "Bund 动量"
+
+[[universe.variable]]
+id = "gilt_momentum"
+group = "Global"
+kind = "price"
+expr = "chain('G','return_index')"
+description = "Gilt 动量"
+
+[[universe.variable]]
+id = "ty_vs_bund"
+group = "Global"
+kind = "price"
+expr = "chain('TY','return_index') / chain('RX','return_index')"
+description = "美德相对表现（TY÷Bund）"
+
+[[universe.variable]]
+id = "swap_spread_10y"
+group = "Global"
+kind = "level"
+expr = "ts('USOSFR10 Curncy') - ts('USGG10YR Index')"
+description = "互换利差 10 年（OIS − 国债）"
+
+# ---- Liquidity
+[[universe.variable]]
+id = "bill_ois_3m"
+group = "Liquidity"
+kind = "level"
+expr = "ts('USGG3M Index') - ts('USOSFRC BGN Curncy')"
+description = "短债相对 OIS（3 个月）"
+
+[[universe.variable]]
+id = "fed_ust"
+group = "Liquidity"
+kind = "price"
+expr = "ts('FARWUST Index')"
+description = "Fed 持有国债"
+
+[[universe.variable]]
+id = "tga"
+group = "Liquidity"
+kind = "price"
+expr = "ts('FARBDTRS Index')"
+description = "财政部账户 TGA"
+
+[[universe.variable]]
+id = "mortgage_spread"
+group = "Liquidity"
+kind = "level"
+expr = "ts('NMCMFR30 Index') - ts('USGG10YR Index')"
+description = "按揭利差（30 年按揭 − 10 年）"
+
+# ---- Positioning
+[[universe.variable]]
+id = "cftc_ty_spec"
+group = "Positioning"
+kind = "level"
+expr = "ts('CBT4TNCN Index','CFTC_CONTRACTS') / ts('CBT4TOIN Index','CFTC_OPEN_INTEREST')"
+description = "TY 投机净持仓占比"
+
+[[universe.variable]]
+id = "cftc_ust_spec"
+group = "Positioning"
+kind = "level"
+expr = "(ts('CBT42NCN Index','CFTC_CONTRACTS') + ts('CBT55NCN Index','CFTC_CONTRACTS') + ts('CBT4TNCN Index','CFTC_CONTRACTS') + ts('CBT3TNCN Index','CFTC_CONTRACTS') + ts('CBT3BNCN Index','CFTC_CONTRACTS')) / (ts('CBT42OIN Index','CFTC_OPEN_INTEREST') + ts('CBT55OIN Index','CFTC_OPEN_INTEREST') + ts('CBT4TOIN Index','CFTC_OPEN_INTEREST') + ts('CBT3TOIN Index','CFTC_OPEN_INTEREST') + ts('CBT3BOIN Index','CFTC_OPEN_INTEREST'))"
+description = "美债期货投机总持仓占比"
+
+[[universe.variable]]
+id = "dealer_ust"
+group = "Positioning"
+kind = "level"
+expr = "ts('PDPPPCCS Index')"
+description = "一级交易商附息国债净头寸"
+
+# ---- ETF_Flow
+[[universe.variable]]
+id = "etf_flow_duration"
+group = "ETF_Flow"
+kind = "level"
+expr = "cumsum((nz(ref('fl_ief')) + nz(ref('fl_tlt')) + nz(ref('fl_tlh')) + nz(ref('fl_iei')) + nz(ref('fl_govt'))) / (nz(ref('aum_ief')) + nz(ref('aum_tlt')) + nz(ref('aum_tlh')) + nz(ref('aum_iei')) + nz(ref('aum_govt'))))"
+description = "中长久期国债 ETF 累计流入"
+
+[[universe.variable]]
+id = "etf_flow_tlt"
+group = "ETF_Flow"
+kind = "level"
+expr = "cumsum(ref('fl_tlt') / ref('aum_tlt'))"
+description = "长端 ETF（TLT）累计流入"
+
+[[universe.variable]]
+id = "etf_flow_short"
+group = "ETF_Flow"
+kind = "level"
+expr = "cumsum((nz(ref('fl_shy')) + nz(ref('fl_bil')) + nz(ref('fl_sgov'))) / (nz(ref('aum_shy')) + nz(ref('aum_bil')) + nz(ref('aum_sgov'))))"
+description = "短端与现金类 ETF 累计流入"
+
+[[universe.variable]]
+id = "etf_duration_pref"
+group = "ETF_Flow"
+kind = "level"
+expr = "cumsum((nz(ref('fl_tlt')) + nz(ref('fl_tlh'))) / (nz(ref('aum_tlt')) + nz(ref('aum_tlh'))) - (nz(ref('fl_shy')) + nz(ref('fl_bil'))) / (nz(ref('aum_shy')) + nz(ref('aum_bil'))))"
+description = "久期偏好（长端 − 短端累计流入）"
+
+[[universe.variable]]
+id = "etf_flow_tip"
+group = "ETF_Flow"
+kind = "level"
+expr = "cumsum(ref('fl_tip') / ref('aum_tip'))"
+description = "通胀保值 ETF（TIP）累计流入"
+
+# ---- Forward
+[[universe.variable]]
+id = "fwd_1y1y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_1y1y')"
+description = "远期 1y1y"
+
+[[universe.variable]]
+id = "fwd_2y1y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_2y1y')"
+description = "远期 2y1y"
+
+[[universe.variable]]
+id = "fwd_5y5y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_5y5y')"
+description = "远期 5y5y"
+
+[[universe.variable]]
+id = "fwd_10y10y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_10y10y')"
+description = "远期 10y10y"
+
+[[universe.variable]]
+id = "fwd_slope_5y5y_1y1y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_5y5y') - ref('f_1y1y')"
+description = "远期利差 5y5y − 1y1y"
+
+[[universe.variable]]
+id = "fwd_slope_10y10y_5y5y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_10y10y') - ref('f_5y5y')"
+description = "远期利差 10y10y − 5y5y"
+
+[[universe.variable]]
+id = "fwd_slope_2y1y_1y1y"
+group = "Forward"
+kind = "level"
+expr = "ref('f_2y1y') - ref('f_1y1y')"
+description = "远期利差 2y1y − 1y1y"
+
+[[universe.variable]]
+id = "fwd_fly_front"
+group = "Forward"
+kind = "level"
+expr = "2*ref('f_2y1y') - ref('f_1y1y') - ref('f_5y5y')"
+description = "远期蝶式（前中段）"
+
+[[universe.variable]]
+id = "fwd_fly_back"
+group = "Forward"
+kind = "level"
+expr = "2*ref('f_5y5y') - ref('f_2y1y') - ref('f_10y10y')"
+description = "远期蝶式（中后段）"
+
+# ---- FF_Curve
+# 隐含利率 = 100 − 价格, 所以隐含利率之差 = 价格之差取反。
+[[universe.variable]]
+id = "ff_3m"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF1 Comdty') - ts('FF4 Comdty')"
+description = "FF 隐含利率：3 个月定价（FF4 − FF1）"
+
+[[universe.variable]]
+id = "ff_6m"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF1 Comdty') - ts('FF7 Comdty')"
+description = "FF 隐含利率：6 个月定价"
+
+[[universe.variable]]
+id = "ff_12m"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF1 Comdty') - ts('FF13 Comdty')"
+description = "FF 隐含利率：12 个月定价"
+
+[[universe.variable]]
+id = "ff_h2"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF7 Comdty') - ts('FF13 Comdty')"
+description = "FF 隐含利率：后半年定价"
+
+[[universe.variable]]
+id = "ff_fly_6m"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF1 Comdty') + ts('FF7 Comdty') - 2*ts('FF4 Comdty')"
+description = "FF 隐含利率蝶式（半年内）"
+
+[[universe.variable]]
+id = "ff_fly_12m"
+group = "FF_Curve"
+kind = "level"
+expr = "ts('FF1 Comdty') + ts('FF13 Comdty') - 2*ts('FF7 Comdty')"
+description = "FF 隐含利率蝶式（一年内）"
+
+# ---- Vol
+[[universe.variable]]
+id = "ty_iv"
+group = "Vol"
+kind = "level"
+expr = "ref('iv_ty')"
+description = "TY 隐含波动率"
+
+[[universe.variable]]
+id = "ty_skew"
+group = "Vol"
+kind = "level"
+expr = "ref('skew_ty')"
+description = "TY 偏度（看跌 − 看涨）"
+
+[[universe.variable]]
+id = "ty_skew_rel"
+group = "Vol"
+kind = "level"
+expr = "ref('skew_ty') / ref('iv_ty')"
+description = "TY 相对偏度"
+
+[[universe.variable]]
+id = "ty_vrp"
+group = "Vol"
+kind = "level"
+expr = "ref('iv_ty') - rvol(chain('TY','return_index'), 20)"
+description = "波动率风险溢价（隐含 − 已实现）"
+
+[[universe.variable]]
+id = "vol_front_rel"
+group = "Vol"
+kind = "level"
+expr = "(ref('iv_tu') / ref('dur_tu')) / (ref('iv_ty') / ref('dur_ty'))"
+description = "短端相对 10 年波动"
+
+[[universe.variable]]
+id = "vol_long_rel"
+group = "Vol"
+kind = "level"
+expr = "(ref('iv_us') / ref('dur_us')) / (ref('iv_ty') / ref('dur_ty'))"
+description = "长端相对 10 年波动"
+
+[[universe.variable]]
+id = "skew_avg"
+group = "Vol"
+kind = "level"
+expr = "(ref('skew_tu') + ref('skew_fv') + ref('skew_ty') + ref('skew_us')) / 4"
+description = "全曲线平均偏度"
+
+# ---- OI
+# ty_price_oi: 持仓量滞后 1 天, 所以对价格取 lag(..., 1), 让"当日涨跌方向"与"同一天的持仓变化"配对;
+# 若日后把持仓量(chain:oi_active / chain:oi_next)的滞后改为 0, 这里的 lag 也要去掉。
+[[universe.variable]]
+id = "ty_oi"
+group = "OI"
+kind = "price"
+expr = "ref('oi_ty')"
+description = "TY 总持仓量"
+
+[[universe.variable]]
+id = "ty_price_oi"
+group = "OI"
+kind = "level"
+expr = "cumsum(lag(sign(dlog(chain('TY','return_index'))), 1) * dlog(ref('oi_ty')))"
+description = "价量配合（涨跌方向 × 持仓变化，累计）"
+
+[[universe.variable]]
+id = "ust_oi_dur"
+group = "OI"
+kind = "price"
+expr = "ref('oi_tu')*ref('dur_tu') + ref('oi_fv')*ref('dur_fv') + ref('oi_ty')*ref('dur_ty') + ref('oi_us')*ref('dur_us')"
+description = "国债期货久期加权总持仓"
+
+[[universe.variable]]
+id = "oi_curve_tu_ty"
+group = "OI"
+kind = "price"
+expr = "(ref('oi_tu')*ref('dur_tu')) / (ref('oi_ty')*ref('dur_ty'))"
+description = "持仓的曲线分布（TU÷TY，久期加权）"
+
+[[universe.variable]]
+id = "ty_turnover"
+group = "OI"
+kind = "level"
+expr = "ts('TY1 Comdty','VOLUME') / ref('oi_ty')"
+description = "换手强度（成交量÷总持仓）"
+
+[position]
+# 连续仓位 = sign * 信号(按波动率缩放的 y 单位); 缓冲带: 目标与当前仓位之差的绝对值 > buffer 才调仓,
+# 否则维持原仓位。buffer = 0 即每天跟随目标; 慢信号不必每天调仓。
+buffer = 0.5
+
+[signals]
+std_window = 252
+clip = 4.0
+vol_halflife = 20
+
+[stats]
+hac_lags = 5
+min_obs = 250    # 每个候选在样本内(IS)至少需要的有效观测数, 不足者不检验
+n_boot = 1000
+min_shift = 60
+seed = 20261122
+
+[verdict]
+# 每个候选都是独立的单因子检验:
+#   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的样本内(IS)行。
+#   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
+#   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_is))。
+# 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按开发样本净 Sharpe(min_net_sharpe)筛选可交易性,
+# 通过的再按相关性去重, 代表组成 shortlist;
+# 样本外(OOS)由 confirm 确认(只打开一次, 不据此再调整)。
+z_pass = 2.5
+z_weak = 2.0
+dedupe_corr = 0.7        # 去重: 开发样本(IS+OBS)共同行上信号相关系数绝对值 >= 此值归入同一代表
+extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)
+obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它
+year_hit_min = 0.6       # 逐年 IC 为正的年份占比低于此值(且计入年数 >= 3)则标 unstable
+min_net_sharpe = 0.3     # 开发样本(样本内+观察期)上扣成本后的年化净 Sharpe 下限, 低于此值的候选在去重前被淘汰

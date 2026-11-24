@@ -17,12 +17,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .variables import (CHAIN_COLUMNS, FREQ_RANK, Evaluator, Leaf, LeafInfo, Rejected,  # noqa: F401
+                        align_flow_to_calendar)
+
 STALE_LIMIT = {"D": 5, "W": 10}     # calendar rows an observation may be carried forward
 MIN_FINITE_OBS = 250                # series with fewer finite aligned values are excluded
 BATCH_SIZE = 200
 
 META_COLUMNS = ["ticker", "field", "kind", "freq", "group", "lag", "lag_rule", "description", "first_obs", "n_obs"]
-FREQ_RANK = {"D": 0, "W": 1, "other": 2}
 
 
 @dataclass
@@ -73,11 +75,19 @@ def infer_kind(unit: str, data_type: str) -> str:
     return "level"
 
 
-def resolve_lag_rule(ticker: str, class_one: str, class_two: str, lags_cfg) -> tuple[int, str] | None:
-    """(lag, rule key) with priority ticker exact > 'class_one/class_two'; None when no rule applies."""
+def resolve_lag_rule(ticker: str, class_one: str, class_two: str, lags_cfg,
+                     field: str | None = None) -> tuple[int, str] | None:
+    """(lag, rule key) with priority ticker exact > field name > 'class_one/class_two'; None when no rule applies.
+
+    ``field`` is only consulted when given (formula-variable leaves); the plain candidate pool passes none.
+    """
     by_ticker = _lags_attr(lags_cfg, "ticker")
     if ticker in by_ticker:
         return int(by_ticker[ticker]), f"ticker:{ticker}"
+    if field is not None:
+        by_field = _lags_attr(lags_cfg, "field")
+        if field in by_field:
+            return int(by_field[field]), f"field:{field}"
     by_class = _lags_attr(lags_cfg, "class")
     key = f"{class_one}/{class_two}"
     if key in by_class:
@@ -85,17 +95,17 @@ def resolve_lag_rule(ticker: str, class_one: str, class_two: str, lags_cfg) -> t
     return None
 
 
-def resolve_lag(ticker: str, class_one: str, class_two: str, lags_cfg) -> int | None:
-    """Lag in calendar rows: ticker override > 'class_one/class_two'; None if neither is given."""
-    hit = resolve_lag_rule(ticker, class_one, class_two, lags_cfg)
+def resolve_lag(ticker: str, class_one: str, class_two: str, lags_cfg, field: str | None = None) -> int | None:
+    """Lag in calendar rows: ticker override > field > 'class_one/class_two'; None if none is given."""
+    hit = resolve_lag_rule(ticker, class_one, class_two, lags_cfg, field)
     return None if hit is None else hit[0]
 
 
 def _lags_attr(lags_cfg, name: str):
-    """Accept a LagsConfig or a plain dict (keys 'chain','class','ticker')."""
+    """Accept a LagsConfig or a plain dict (keys 'chain','class','ticker','field','curve')."""
     if isinstance(lags_cfg, dict):
-        return lags_cfg.get(name, {} if name in ("class", "ticker") else None)
-    return getattr(lags_cfg, "class_" if name == "class" else name)
+        return lags_cfg.get(name, {} if name in ("class", "ticker", "field", "curve") else None)
+    return getattr(lags_cfg, {"class": "class_", "field": "field_"}.get(name, name))
 
 
 def _ns(idx: pd.DatetimeIndex) -> np.ndarray:
@@ -221,6 +231,99 @@ def _chain_series(q, root: str, calendar: pd.DatetimeIndex, lag: int, what: str)
     return align_to_calendar(s, calendar, lag, STALE_LIMIT["D"])
 
 
+class DBLeaves:
+    """Leaf provider for ``variables.Evaluator`` backed by the databank (read-only, cached per request)."""
+
+    def __init__(self, q, cfg, calendar: pd.DatetimeIndex, sec_info: dict):
+        self.q, self.lags, self.priority = q, cfg.lags, cfg.universe.fields
+        self.calendar, self.sec_info = calendar, sec_info
+        self._ts: dict = {}
+        self._chain: dict = {}
+        self._curve: dict = {}
+
+    def _series(self, ticker: str, field: str) -> pd.Series:
+        key = (ticker, field)
+        if key not in self._ts:
+            got = _fetch(self.q, [ticker], field)
+            if ticker not in got or len(got[ticker][0]) == 0:
+                raise ValueError(f"no data for {ticker}/{field}")
+            self._ts[key] = got[ticker][0]
+        return self._ts[key]
+
+    def _stock_or_flow(self, ticker: str, field: str | None, flow: bool) -> Leaf:
+        if field is None:
+            try:
+                field = _pick_field(self.q, ticker, self.priority)
+            except Exception as e:
+                raise ValueError(f"cannot list fields of {ticker!r} ({e})") from e
+            if field is None:
+                raise ValueError(f"{ticker!r} has none of the fields {self.priority}")
+        name = f"{ticker}/{field}"
+        s = self._series(ticker, field)
+        info = self.sec_info.get(ticker, {})
+        hit = resolve_lag_rule(ticker, info.get("class_one", ""), info.get("class_two", ""), self.lags, field)
+        if hit is None:
+            raise Rejected("no_availability_rule", name)
+        freq = infer_freq(s.index)
+        if freq == "other":
+            raise Rejected("freq_not_daily_or_weekly", name)
+        lag, rule = hit
+        out = (align_flow_to_calendar(s, self.calendar, lag) if flow
+               else align_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]))
+        return Leaf(out, LeafInfo(name, lag, rule, freq))
+
+    def ts(self, ticker: str, field: str | None = None) -> Leaf:
+        return self._stock_or_flow(ticker, field, flow=False)
+
+    def flow(self, ticker: str, field: str) -> Leaf:
+        return self._stock_or_flow(ticker, field, flow=True)
+
+    def chain(self, root: str, column: str) -> Leaf:
+        if column not in CHAIN_COLUMNS:
+            raise ValueError(f"unknown chain column {column!r}; allowed: {list(CHAIN_COLUMNS)}")
+        name = f"chain:{root}/{column}"
+        if root not in self._chain:
+            ch = self.q.get_futures_chain(root)
+            self._chain[root] = ch[ch["return_valid"] == 1]
+        ch = self._chain[root]
+        if len(ch) == 0:
+            raise ValueError(f"no valid chain rows for {root!r}")
+        s = pd.Series(ch[column].to_numpy(dtype=float), index=pd.to_datetime(ch["trade_date"]))
+        s = s[np.isfinite(s)]
+        if len(s) == 0:
+            raise ValueError(f"chain {root!r} has no finite {column}")
+        key = f"chain:{column}"
+        if key in self.lags.field_:
+            lag, rule = int(self.lags.field_[key]), f"field:{key}"
+        else:
+            lag, rule = int(self.lags.chain), "chain"
+        freq = infer_freq(s.index)
+        if freq == "other":
+            raise Rejected("freq_not_daily_or_weekly", name)
+        return Leaf(align_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]), LeafInfo(name, lag, rule, freq))
+
+    def curve(self, curve_name: str, measure: str, start_tenor: str, tenor: str) -> Leaf:
+        name = f"curve:{curve_name}/{measure}/{start_tenor}/{tenor}"
+        key = (curve_name, measure)
+        if key not in self._curve:
+            self._curve[key] = self.q.get_curve_history(curve_name, measures=[measure])
+        df = self._curve[key]
+        df = df[(df["start_tenor"] == start_tenor) & (df["tenor"] == tenor)]
+        if len(df) == 0:
+            raise ValueError(f"no curve points for {name}")
+        s = _records_to_series(df)
+        if len(s) == 0:
+            raise ValueError(f"no finite curve points for {name}")
+        if curve_name not in self.lags.curve:
+            raise Rejected("no_availability_rule", name)
+        freq = infer_freq(s.index)
+        if freq == "other":
+            raise Rejected("freq_not_daily_or_weekly", name)
+        lag = int(self.lags.curve[curve_name])
+        return Leaf(align_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]),
+                    LeafInfo(name, lag, f"curve:{curve_name}", freq))
+
+
 def build_panel(cfg) -> Panel:
     q, cur = _open_query(cfg)
     r = _build_target(q, cfg)
@@ -325,6 +428,20 @@ def build_panel(cfg) -> Panel:
                    field=f"{a['ticker']}-{b['ticker']}", kind="level", freq=freq, group="Spread",
                    lag=max(a["lag"], b["lag"]), lag_rule=f"{a['lag_rule']}+{b['lag_rule']}",
                    description=f"{sp['a']} minus {sp['b']}")
+
+    # 6b. formula variables: every leaf is aligned and lagged on its own, then the expression is evaluated
+    if cfg.universe.variable:
+        defs = {d["id"]: d["expr"] for d in cfg.universe.helper + cfg.universe.variable}
+        ev = Evaluator(DBLeaves(q, cfg, calendar, sec_info), defs)
+        for v in cfg.universe.variable:
+            res = ev.evaluate(v["id"])
+            sid = f"var:{v['id']}"
+            if res.series is None:
+                excluded.append({"ticker": sid, "reason": res.reason})
+                continue
+            add_series(sid, res.series.reindex(calendar), ticker=sid, field=v["expr"], kind=v["kind"],
+                       freq=res.freq, group=v["group"], lag=res.lag, lag_rule=res.lag_rule,
+                       description=v["description"])
 
     # 7. minimum observations, then assemble
     keep = []

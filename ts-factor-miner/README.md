@@ -136,6 +136,16 @@ shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对�
 
 没有跨候选的校正。完成后写入 `confirm.lock`。样本外只能看一次，之后不应再据其结果调整候选或参数。
 
+### 3.12 公式变量（`variables.py`）
+
+除了按类别盲扫，候选池也可以由研究者给定有经济含义的变量：`[[universe.variable]]` 的每一项是一个公式（`id`、`expr`、`kind`、`group`、`description`），成为面板的一列，序列 id 为 `var:<id>`；系统对每个变量照旧做固定的变换并逐个做双边检验，不预设方向。`[[universe.helper]]`（`id`、`expr`）只供 `ref()` 引用，不是候选。helper 与 variable 的 id 全局唯一（ASCII 字母数字下划线）。`configs/ty_vars.toml` 是 TY 的 63 个变量清单；`universe.select` 可以为空。
+
+表达式用 `ast` 解析后按白名单求值，不用 `eval` / `exec`：只允许数字常量、字符串常量（仅作函数参数）、`+ - * /`、一元 `+ -`、括号和下列函数，其余语法都抛 `ValueError`（带变量 id）。
+
+- 叶子（取数，返回已对齐到标的日历并已滞后的序列）：`ts(ticker[, field])`（存量，as-of + 陈旧截断 + 滞后）；`flow(ticker, field)`（流量：观测累加到日期 ≥ 观测日的第一个日历行，没有观测的行为 0、首个观测之前为 NaN，不向前填充，再整体滞后）；`chain(root, column)`（期货连续合约的一列，`return_valid == 1` 的行）；`curve(name, measure, start_tenor, tenor)`（库内曲线点）；`ref(id)`（另一个变量或 helper 的未变换取值，循环引用报错）。
+- 运算（均因果）：`lag(x, n)`、`diff`、`dlog`（非正为 NaN）、`sign`、`nz`、`cumsum`（首个有限值之前为 NaN，之后把 NaN 当 0）、`rvol(x, n)`（`dlog` 的 n 日滚动标准差 × √252 × 100）。二元运算两侧都有限才有值，除以 0 为 NaN。
+- 可得性：每条底层叶子先各自对齐并滞后，再做公式运算。`ts` / `flow` 的优先级为 `[lags.ticker]` > `[lags.field]`（键为字段名）> `[lags.class]`；`chain` 先看 `[lags.field]` 里的 `"chain:<column>"`，再用 `lags.chain`；`curve` 看 `[lags.curve]`（键为曲线名）。任一叶子没有规则，该变量被拒收，`excluded` 里原因为 `no_availability_rule: <叶子>`，ticker 为 `var:<id>`。叶子取不到数据（未知 ticker / 字段、空数据）是配置错误，直接抛 `ValueError`。叶子的频率不是日频或周频则拒收（`freq_not_daily_or_weekly: <叶子>`）。变量的 `freq` 取各叶子最粗者，`lag` 取各叶子最大值，`lag_rule` 是各叶子规则键去重后用 `+` 连接。注意：`lag` 只汇总叶子的可得性滞后，表达式里显式的 `lag(x, n)` 不计入。
+
 ## 4. 快速开始
 
 **依赖**：Python ≥ 3.11（用到标准库 `tomllib`），`pip install -r requirements.txt`。
@@ -221,7 +231,8 @@ python -m pytest -q
 | `[universe]` `exclude_tickers` | 从候选池剔除的 ticker |
 | `[[universe.select]]` | 候选池选择，每条恰为三种形式之一：`class_one` / `class_two` / `class_three`（仅 `class_three` 可为列表）；`family` + `attrs`（如 CFTC）；`tickers`（显式列表） |
 | `[[universe.spread]]` | `id`、`a`、`b`：生成 `spread:<id>` = a − b（level） |
-| `[lags]` `chain`, `class`, `ticker` | 可得性输入，见 3.2。`chain` 必填；`class` 的键形如 `"class_one/class_two"`；没有频率默认值，出现 `D` / `W` 报错 |
+| `[[universe.helper]]`, `[[universe.variable]]` | 公式变量，见 3.12 |
+| `[lags]` `chain`, `class`, `ticker`, `field`, `curve` | 可得性输入，见 3.2 与 3.12（`field`、`curve` 只用于公式变量的叶子）。`chain` 必填；`class` 的键形如 `"class_one/class_two"`；没有频率默认值，出现 `D` / `W` 报错 |
 | `[position]` `buffer` | 缓冲带宽度（默认 0.5，≥ 0），见 3.9 |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 IS 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |

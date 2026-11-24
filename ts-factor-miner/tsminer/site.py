@@ -73,6 +73,8 @@ def formula_text(meta_row, transform: str, cfg, sign: float = 1.0) -> list[str]:
         first = f"x[t] = {ticker.split(':', 1)[1]} 期货连续合约收益指数{avail}"
     elif ticker.startswith("carry:"):
         first = f"x[t] = {ticker.split(':', 1)[1]} 跨月价差 ÷ 主力合约价格{avail}"
+    elif ticker.startswith("var:"):
+        first = f"x[t] = {field}"                       # the variable's expression, verbatim
     elif ticker.startswith("spread:"):
         legs = field.split("-")
         pair = f"{legs[0].strip()} − {legs[1].strip()}" if len(legs) == 2 else field
@@ -396,7 +398,8 @@ article.card { border: 1px solid var(--border); background: var(--surface); padd
 .badge.none { border-style: dashed; color: var(--fg-2); }
 .badge.dir { font-weight: 500; }
 pre.formula { margin: 0 0 12px; padding: 8px 10px; background: var(--bg); border-left: 2px solid var(--axis);
-  font-size: 12px; line-height: 1.6; overflow-x: auto; max-width: 100%; white-space: pre; }
+  font-size: 12px; line-height: 1.6; overflow-x: auto; max-width: 100%; white-space: pre-wrap;
+  overflow-wrap: anywhere; word-break: break-word; }
 .chartbox { position: relative; margin-bottom: 8px; min-width: 0; }
 .chartbox svg { display: block; width: 100%; touch-action: pan-y; }
 .chartbox svg:focus-visible { outline: 2px solid var(--focus); }

@@ -347,3 +347,36 @@ def test_cli(tmp_path, run_dir, opened_dir):
     dup = subprocess.run([sys.executable, "-m", "tsminer", "site", str(run_dir), str(opened_dir), "--out",
                           str(tmp_path / "s2")], cwd=ROOT, env=env, capture_output=True, text=True)
     assert dup.returncode != 0 and "duplicate" in dup.stderr
+
+
+# ------------------------------------------------------------- 8. formula variables
+def test_formula_text_for_variable_series(cfg):
+    expr = "(ts('A','PUT') + ts('A','CALL')) / 2 - rvol(chain('TY','return_index'), 20)"
+    row = _meta(ticker="var:ty_vrp", field=expr, kind="level", lag=1)
+    lines = formula_text(row, "chg_20", cfg, 1.0)
+    assert lines[0] == f"x[t] = {expr}"
+    assert lines[1] == "d[t] = x[t] − x[t−20]" and lines[-2] == "pos[t] = +1 × s[t] ÷ σ[t]"
+    assert len(lines) == len(formula_text(_meta(), "chg_20", cfg, 1.0))          # the other lines are unchanged
+    assert formula_text(row, "z_60", cfg, -1.0)[0] == f"x[t] = {expr}"
+
+
+def test_variable_card_title_and_formula_wraps(tmp_path, cfg, cfg_path):
+    panel = make_panel(1, plant=True, short=True)
+    expr = "ts('A') - ts('B') + " + " + ".join(f"ts('LONGTICKER{i} Index')" for i in range(12))
+    panel.X = panel.X.rename(columns={"sig": "var:sig"})
+    panel.meta = panel.meta.rename(index={"sig": "var:sig"})
+    panel.meta.loc["var:sig", ["ticker", "field", "description"]] = ["var:sig", expr, "信号变量"]
+    d = tmp_path / "run"
+    mine(cfg, d, panel=panel, config_path=cfg_path)
+    data = build_asset_data(d)
+    cards = [f for f in data["factors"] if f["series"] == "var:sig"]
+    assert cards
+    for f in cards:
+        assert f["formula"][0] == f"x[t] = {expr}"
+        assert f["title"].startswith("信号变量 · ") and f["description"] == "信号变量"
+    build_site([d], tmp_path / "o")
+    css = re.search(r"<style>(.*?)</style>", (tmp_path / "o" / "artifact.html").read_text(encoding="utf-8"), re.S).group(1)
+    rule = re.search(r"pre\.formula\s*\{([^}]*)\}", css).group(1)
+    assert "pre-wrap" in rule and "overflow-wrap: anywhere" in rule
+    rep = (d / "report.md").read_text(encoding="utf-8")
+    assert "信号变量" in rep.split("## Shortlist")[1].split("## IC 衰减")[0]

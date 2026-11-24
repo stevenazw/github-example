@@ -394,3 +394,146 @@ def test_build_panel_spread_leg_without_rule_raises():
     cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_))
     with pytest.raises(ValueError, match="availability"):
         build_panel(cfg2)
+
+
+# ------------------------------------------------------- formula variables: config
+def test_load_variable_and_helper_config(tmp_path):
+    cfg = load_config(_write(tmp_path, MINIMAL + (
+        "\n[lags.field]\n\"PX_LAST\" = 0\n[lags.curve]\n\"C\" = 1\n"
+        "\n[universe]\nfields = [\"PX_LAST\"]\n"
+        "[[universe.helper]]\nid = \"h1\"\nexpr = \"ts('A')\"\n"
+        "[[universe.variable]]\nid = \"v1\"\nexpr = \"ref('h1') * 2\"\ngroup = \"G\"\ndescription = \"中文\"\n"
+        "[[universe.variable]]\nid = \"v2\"\nexpr = \"ts('B')\"\nkind = \"price\"\n")))
+    u = cfg.universe
+    assert u.select == [] and [h["id"] for h in u.helper] == ["h1"]
+    assert u.variable[0] == {"id": "v1", "expr": "ref('h1') * 2", "kind": "level", "group": "G", "description": "中文"}
+    assert u.variable[1]["kind"] == "price" and u.variable[1]["description"] == "v2"
+    assert cfg.lags.field_ == {"PX_LAST": 0} and cfg.lags.curve == {"C": 1}
+    d = cfg.to_dict()
+    assert d["lags"]["field"] == {"PX_LAST": 0} and d["lags"]["curve"] == {"C": 1}
+    json.dumps(d)
+
+
+def _vcfg(tmp_path, body):
+    return load_config(_write(tmp_path, MINIMAL + "\n[universe]\nfields = [\"PX_LAST\"]\n" + body))
+
+
+@pytest.mark.parametrize("body", [
+    '[[universe.variable]]\nid = "a"\nexpr = "ts(\'X\')"\n[[universe.variable]]\nid = "a"\nexpr = "ts(\'Y\')"\n',   # dup variable
+    '[[universe.helper]]\nid = "a"\nexpr = "ts(\'X\')"\n[[universe.helper]]\nid = "a"\nexpr = "ts(\'Y\')"\n',      # dup helper
+    '[[universe.helper]]\nid = "a"\nexpr = "ts(\'X\')"\n[[universe.variable]]\nid = "a"\nexpr = "ts(\'Y\')"\n',    # across
+    '[[universe.variable]]\nid = "a"\nexpr = "ts(\'X\')"\nkind = "weird"\n',                                       # bad kind
+    '[[universe.variable]]\nid = "a"\n',                                                                           # no expr
+    '[[universe.helper]]\nid = "a"\n',
+    '[[universe.variable]]\nexpr = "ts(\'X\')"\n',                                                                 # no id
+    '[[universe.variable]]\nid = "a-b"\nexpr = "ts(\'X\')"\n',                                                     # bad id
+    '[[universe.variable]]\nid = "中文"\nexpr = "ts(\'X\')"\n',
+    '[[universe.variable]]\nid = "a"\nexpr = "ts(\'X\') ** 2"\n',                                                  # unsafe expr
+    '[[universe.variable]]\nid = "a"\nexpr = "__import__(\'os\')"\n',
+    '[[universe.variable]]\nid = "a"\nexpr = "ref(\'zzz\')"\n',                                                    # unknown ref
+    '[[universe.variable]]\nid = "a"\nexpr = "ref(\'b\')"\n[[universe.variable]]\nid = "b"\nexpr = "ref(\'a\')"\n', # cycle
+    '[[universe.variable]]\nid = "a"\nexpr = "ts(\'X\')"\nbogus = 1\n',                                            # unknown key
+    '[[universe.helper]]\nid = "a"\nexpr = "ts(\'X\')"\nkind = "level"\n',
+])
+def test_bad_variable_config_raises(tmp_path, body):
+    with pytest.raises(ValueError):
+        _vcfg(tmp_path, body)
+
+
+def test_bad_lags_field_curve_raise(tmp_path):
+    for bad in ('[lags.field]\n"X" = -1\n', '[lags.curve]\n"X" = "a"\n', '[lags.field]\n"X" = 1.5\n'):
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, MINIMAL + "\n" + bad))
+
+
+def test_ty_vars_config_loads():
+    cfg = load_config(CONFIGS / "ty_vars.toml")
+    assert len(cfg.universe.variable) == 63 and cfg.universe.select == [] and cfg.universe.chains == []
+    assert cfg.universe.spread == [] and cfg.universe.carry_chains == []
+    assert cfg.universe.fields == ["PX_LAST", "CFTC_CONTRACTS"]
+    ids = [v["id"] for v in cfg.universe.variable]
+    assert len(set(ids)) == 63 and {"slope_2s10s", "ff_3m", "ty_oi"} <= set(ids)
+    assert cfg.lags.field_["FUND_FLOW"] == 1 and cfg.lags.field_["chain:oi_active"] == 1
+    assert cfg.lags.curve == {"USD_SOFR_OIS": 0} and cfg.lags.ticker == {"NFCIINDX Index": 6}
+    base = load_config(CONFIGS / "ty.toml")
+    assert cfg.lags.class_ == base.lags.class_ and cfg.target == base.target and cfg.verdict == base.verdict
+    assert cfg.signals == base.signals and cfg.stats == base.stats and cfg.sample == base.sample
+
+
+@pytest.mark.parametrize("name", ["ty", "eurusd"])
+def test_old_configs_have_no_variables_and_unchanged_lags(name):
+    cfg = load_config(CONFIGS / f"{name}.toml")
+    assert cfg.universe.variable == [] and cfg.universe.helper == []
+    assert cfg.lags.field_ == {} and cfg.lags.curve == {}
+    assert len(cfg.universe.select) > 0 and len(cfg.universe.spread) == 3
+
+
+def test_resolve_lag_rule_field_priority():
+    lags = LagsConfig(chain=0, class_={"A/B": 4}, ticker={"T": 9}, field_={"F": 2})
+    assert resolve_lag_rule("T", "A", "B", lags, "F") == (9, "ticker:T")
+    assert resolve_lag_rule("U", "A", "B", lags, "F") == (2, "field:F")
+    assert resolve_lag_rule("U", "A", "B", lags, "G") == (4, "class:A/B")
+    assert resolve_lag_rule("U", "A", "B", lags) == (4, "class:A/B")           # no field given: field rules unused
+    assert resolve_lag_rule("U", "X", "Y", lags, "G") is None
+    assert resolve_lag_rule("U", "X", "Y", {"chain": 0, "field": {"F": 7}}, "F") == (7, "field:F")
+
+
+# --------------------------------------------------- formula variables: real databank
+def test_build_panel_ty_vars_integration():
+    cfg0, db = _db_cfg()
+    from tsminer.databank import _fetch, build_panel
+
+    cfg = load_config(CONFIGS / "ty_vars.toml")
+    panel = build_panel(cfg)
+    assert len(panel.X.columns) > 0 and all(c.startswith("var:") for c in panel.X.columns)
+    assert panel.X.index.equals(panel.target.index) and list(panel.meta.index) == list(panel.X.columns)
+    assert list(panel.meta.columns) == META_COLUMNS
+    assert (panel.meta["ticker"] == panel.meta.index).all()
+    assert panel.excluded["ticker"].str.startswith("var:").all() if len(panel.excluded) else True
+    defs = {v["id"]: v for v in cfg.universe.variable}
+    assert set(panel.X.columns) | set(panel.excluded["ticker"]) == {f"var:{i}" for i in defs}
+    r = panel.meta.loc["var:slope_2s10s"]
+    assert r["field"] == defs["slope_2s10s"]["expr"] and r["description"] == defs["slope_2s10s"]["description"]
+    assert r["lag_rule"] == "class:Market_Data/Government_Bond" and r["lag"] == 0 and r["freq"] == "D"
+
+    sys.path.insert(0, cfg.databank.toolkit_dir)
+    from data_query import DataQuery
+    q = DataQuery(db_path=db)
+    cal = panel.X.index
+
+    def al(tk, lag):
+        s = _fetch(q, [tk], "PX_LAST")[tk][0]
+        return align_to_calendar(s, cal, lag, STALE_LIMIT["D"])
+
+    lag = int(r["lag"])
+    exp = al("USGG10YR Index", lag) - al("USGG2YR Index", lag)
+    got = panel.X["var:slope_2s10s"]
+    m = exp.notna()
+    assert m.sum() > 1000
+    np.testing.assert_allclose(got[m].to_numpy(), exp[m].to_numpy(), rtol=0, atol=1e-12)
+    assert got[~m].isna().all()
+
+    lag = int(panel.meta.at["var:ff_3m", "lag"])
+    exp = al("FF1 Comdty", lag) - al("FF4 Comdty", lag)
+    got = panel.X["var:ff_3m"]
+    m = exp.notna()
+    assert m.sum() > 1000
+    np.testing.assert_allclose(got[m].to_numpy(), exp[m].to_numpy(), rtol=0, atol=1e-12)
+    assert got[~m].isna().all()
+
+
+def test_build_panel_variable_without_rule_is_excluded_with_leaf_named():
+    import dataclasses
+    from tsminer.databank import build_panel
+
+    cfg0, db = _db_cfg()
+    cfg = load_config(CONFIGS / "ty_vars.toml")
+    class_ = {k: v for k, v in cfg.lags.class_.items() if k != "Market_Data/Money_Market"}
+    cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_))
+    panel = build_panel(cfg2)
+    rej = panel.excluded[panel.excluded["reason"].str.startswith("no_availability_rule")]
+    assert "var:ff_3m" in set(rej["ticker"]) and "var:policy_path" in set(rej["ticker"])
+    reason = rej.set_index("ticker").at["var:ff_3m", "reason"]
+    assert "FF1 Comdty/PX_LAST" in reason and "FF4 Comdty/PX_LAST" in reason
+    assert "var:ff_3m" not in panel.X.columns and "var:slope_2s10s" in panel.X.columns
+    assert panel.excluded.groupby("ticker").size().max() == 1

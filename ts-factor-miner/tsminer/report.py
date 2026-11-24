@@ -89,7 +89,7 @@ def write_report(run_dir) -> None:
           f"已检验：{run['n_tested']}；因样本不足未检验：{run['n_skipped']}",
           f"- 已检验候选的样本内长度 n_is：最小 {ns['min']}，中位 {_num(ns['median'], 0)}，最大 {ns['max']}"]
     if len(excl):
-        cnt = excl["reason"].value_counts()
+        cnt = excl["reason"].astype(str).str.split(":").str[0].value_counts()   # "reason: leaf, ..." -> reason
         L.append(f"- 被剔除的序列：{int(cnt.sum())} 个（" + "，".join(f"{k}: {v}" for k, v in cnt.items()) + "）")
     else:
         L.append("- 被剔除的序列：0 个")
@@ -104,9 +104,11 @@ def write_report(run_dir) -> None:
     else:
         L.append("没有序列进入候选池。")
     L.append("")
-    rej = excl[excl["reason"] == "no_availability_rule"] if len(excl) else excl
+    rej = excl[excl["reason"].astype(str).str.startswith("no_availability_rule")] if len(excl) else excl
     if len(rej):
-        tk = rej["ticker"].astype(str).tolist()
+        # formula variables carry the leaves without a rule after the reason: "var:x [FF1 Comdty/PX_LAST]"
+        tk = [str(t) + (f" [{str(r).split(': ', 1)[1]}]" if ": " in str(r) else "")
+              for t, r in zip(rej["ticker"], rej["reason"])]
         L.append(f"因没有可得性规则被拒收的序列：{len(tk)} 个。" + ("前 20 个：" if len(tk) > 20 else "") + "、".join(tk[:20]))
     else:
         L.append("因没有可得性规则被拒收的序列：0 个。")
