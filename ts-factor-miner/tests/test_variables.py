@@ -166,7 +166,7 @@ def test_dlog_nonpositive_is_nan():
 def test_cumsum_nan_before_first_finite_then_nan_as_zero():
     x = {"C/PX_LAST": (S([nan, nan, 1, nan, 2, 3.0]), 0, "r", "D")}
     r = vals(ev("cumsum(ts('C'))", x))[:6]
-    np.testing.assert_array_equal(r, [nan, nan, 1, 1, 3, 6])
+    np.testing.assert_array_equal(r, [nan, nan, 1, nan, 3, 6])      # NaN row stays NaN, the sum carries on
     allnan = {"C/PX_LAST": (S([nan, nan, nan]), 0, "r", "D")}
     assert np.isnan(ev("cumsum(ts('C'))", allnan).series).all()
 
@@ -198,6 +198,9 @@ CAUSAL = [
     "ref('h') - rvol(ts('P'), 7)",
     "cumsum(nz(ref('h')) / (nz(ts('Q')) + 1))",
     "diff(ts('P')) + sign(ts('Q') - ts('P'))",
+    "clean(ts('P') - ts('Q'), 10, 3)",
+    "cumsum(clean(dlog(ts('P')), 8, 4)) + cumsum(ts('Q'))",
+    "nz(clean(ts('Q'), 6, 2)) + lag(ts('P'), 2)",
 ]
 
 
@@ -261,6 +264,35 @@ def test_flow_lag_and_no_lookahead():
         assert a.iloc[k + 1] != b.iloc[k + 1]
     with pytest.raises(ValueError):
         align_flow_to_calendar(x, cal, -1)
+
+
+def test_flow_drops_observations_before_calendar_start():
+    cal = pd.bdate_range("2020-01-06", periods=10)
+    x = pd.Series([100.0, 200.0, 1.0, 2.0], index=pd.DatetimeIndex(
+        ["2019-12-20", "2020-01-02", cal[0], cal[2]]))
+    out = align_flow_to_calendar(x, cal, 0)
+    assert out.iloc[0] == 1.0 and out.iloc[1] == 0.0 and out.iloc[2] == 2.0      # not 301 on row 0
+
+
+def test_flow_ends_after_stale_limit_but_gaps_inside_stay_zero():
+    cal = pd.bdate_range("2020-01-01", periods=30)
+    x = pd.Series([1.0, 1.0, 1.0], index=[cal[2], cal[3], cal[10]])             # gap 4..9 inside; last obs row 10
+    out = align_flow_to_calendar(x, cal, 0, stale_limit=5)
+    assert (out.iloc[4:10] == 0).all()
+    assert (out.iloc[11:16] == 0).all() and out.iloc[10] == 1
+    assert out.iloc[16:].isna().all()                                            # more than 5 rows after the last obs
+    out2 = align_flow_to_calendar(x, cal, 2, stale_limit=5)
+    assert out2.iloc[18:].isna().all() and (out2.iloc[13:18] == 0).all()
+    assert (align_flow_to_calendar(x, cal, 0, stale_limit=None).iloc[11:] == 0).all()
+
+
+def test_flow_cumsum_stops_showing_after_the_flow_ends():
+    cal = pd.bdate_range("2020-01-01", periods=20)
+    x = pd.Series([1.0, 2.0], index=[cal[2], cal[4]])
+    prov = Fake({"flow:E/F": (align_flow_to_calendar(x, cal, 0, 3), 0, "r", "D")}, calendar=cal)
+    r = Evaluator(prov, {"v": "cumsum(flow('E','F'))"}).evaluate("v").series
+    np.testing.assert_array_equal(r.iloc[:9].to_numpy(), [nan, nan, 1, 1, 3, 3, 3, 3, nan])
+    assert r.iloc[8:].isna().all()
 
 
 def test_flow_all_after_calendar_or_empty_is_nan():
@@ -439,3 +471,134 @@ def test_variable_through_real_provider_lag_is_max_of_leaves():
     b = align_to_calendar(s2, p.calendar, 3, 5)
     exp = (a - b).where(np.isfinite(a) & np.isfinite(b))
     pd.testing.assert_series_equal(res.series, exp)
+
+
+# ----------------------------------------------------------------- clean
+def _clean(values, n=10, k=3.0):
+    cal = pd.bdate_range("2020-01-01", periods=len(values))
+    x = {"X/PX_LAST": (pd.Series(np.asarray(values, dtype=float), index=cal), 0, "r", "D")}
+    return ev(f"clean(ts('X'), {n}, {k})", x, calendar=cal).series.to_numpy()
+
+
+def test_clean_removes_single_spike_only():
+    rng = np.random.default_rng(0)
+    v = rng.normal(0, 1, 40)
+    v[25] = 50.0
+    out = _clean(v, n=20, k=8.0)
+    assert np.isnan(out[25])
+    np.testing.assert_array_equal(np.delete(out, 25)[15:], np.delete(v, 25)[15:])
+    assert not np.isnan(out[26:]).any() and not np.isnan(out[:25]).any()
+
+
+def test_clean_needs_enough_history_and_nonzero_mad():
+    v = np.r_[np.random.default_rng(1).normal(0, 1, 3), 100.0, np.random.default_rng(2).normal(0, 1, 10)]
+    assert _clean(v, n=10)[3] == 100.0                      # only 3 previous obs < n // 2 = 5: kept
+    flat = np.r_[np.arange(12) * 0 + 5.0, 9.0, 5.0, 5.0]
+    out = _clean(flat)
+    assert not np.isnan(out).any()                           # all identical before -> MAD == 0 -> no filtering
+
+
+def test_clean_forward_filled_repeats_do_not_collapse_mad():
+    rng = np.random.default_rng(3)
+    base = rng.normal(0, 1, 40)
+    v = np.repeat(base, 5)                                   # a new value every 5 rows, then carried forward
+    v[102] = 30.0                                            # a genuine new value that is a spike (start of a block)
+    v[103:105] = 30.0
+    out = _clean(v, n=30, k=8.0)
+    assert np.isnan(out[102:105]).all()                      # the spike and its carried-forward copies are removed
+    ok = np.ones(len(v), bool)
+    ok[102:105] = False
+    # normal blocks survive: repeated values would have made MAD tiny and killed ordinary moves
+    assert np.isfinite(out[ok]).all()
+
+
+def test_clean_is_causal_and_validates_arguments():
+    rng = np.random.default_rng(4)
+    v = rng.normal(0, 1, 50)
+    v[30] = 40.0
+    full = _clean(v, k=4.0)
+    for t0 in (20, 30, 40):
+        np.testing.assert_array_equal(_clean(v[:t0 + 1], k=4.0), full[:t0 + 1])
+    for bad in ("clean(ts('X'), 1, 3)", "clean(ts('X'), 10, 0)", "clean(ts('X'), 10)", "clean(ts('X'), 10, -2)",
+                "clean(ts('X'), 10.5, 3)", "clean(ts('X'), 10, 'a')"):
+        with pytest.raises(ValueError):
+            parse_expr(bad, "v")
+    parse_expr("clean(ts('X') - ts('Y'), 60, 10)", "v")
+
+
+# ----------------------------------------------------------------- effective lag
+def test_effective_lag_explicit_lag_is_added():
+    d = {"A/PX_LAST": (S([1, 2, 3, 4, 5, 6.0]), 1, "class:X/Y", "D"),
+         "B/PX_LAST": (S([1, 2, 3, 4, 5, 6.0]), 3, "ticker:B", "D")}
+    r = ev("lag(ts('A'), 1)", d)
+    assert r.lag == 2 and r.lag_rule == "class:X/Y+expr_lag"
+    r = ev("lag(lag(ts('A'), 1), 2)", d)
+    assert r.lag == 4 and r.lag_rule.endswith("+expr_lag")
+    r = ev("lag(ts('A'), 1) + ts('B')", d)                # max(2, 3) = 3 = leaf max: nothing appended
+    assert r.lag == 3 and r.lag_rule == "class:X/Y+ticker:B"
+    r = ev("lag(ts('A'), 3) + ts('B')", d)                # 4 > 3
+    assert r.lag == 4 and r.lag_rule == "class:X/Y+ticker:B+expr_lag"
+    r = ev("cumsum(nz(lag(ts('A'), 0)))", d)
+    assert r.lag == 1 and r.lag_rule == "class:X/Y"
+
+
+def test_effective_lag_propagates_through_ref():
+    d = {"A/PX_LAST": (S([1, 2, 3, 4, 5, 6.0]), 1, "class:X/Y", "D"),
+         "B/PX_LAST": (S([1, 2, 3, 4, 5, 6.0]), 0, "ticker:B", "D")}
+    defs = {"h": "lag(ts('A'), 2)", "w": "ref('h') / ts('B')"}
+    r = ev("ref('w') - 1", d, defs=defs)
+    assert r.lag == 3 and r.lag_rule == "class:X/Y+ticker:B+expr_lag"
+    assert Evaluator(Fake(d), {"h": "lag(ts('B'), 1)", "v": "ref('h') + ts('A')"}).evaluate("v").lag == 1
+
+
+# ----------------------------------------------------------------- futures_oi
+class OIQ(FakeQ):
+    def __init__(self, ts_data, contracts):
+        super().__init__(ts_data)
+        self.contracts = contracts
+
+    def resolve(self, family, allow_multi=False, **attrs):
+        assert family == "BOND_FUTURE" and allow_multi and attrs == {"root": "TY"}
+        return self.contracts
+
+
+def _oi_provider(lags, idx_len=300):
+    idx = pd.bdate_range("2019-01-01", periods=idx_len)
+    a = pd.Series(100.0, index=idx[:200])
+    b = pd.Series(10.0, index=idx[150:])
+    c = pd.Series(7.0, index=idx)                                   # the generic series must never be summed
+    ts_data = {("TYH19 Comdty", "OPEN_INT"): a, ("TYM19 Comdty", "OPEN_INT"): b, ("TY1 Comdty", "OPEN_INT"): c}
+    contracts = [{"ticker": "TY1 Comdty", "attrs": {"position": "1", "root": "TY"}},
+                 {"ticker": "TY1 COMB Comdty", "attrs": {"root": "TY", "session": "COMB"}},
+                 {"ticker": "TYH19 Comdty", "attrs": {"contract": "H19", "root": "TY"}},
+                 {"ticker": "TYM19 Comdty", "attrs": {"contract": "M19", "root": "TY"}}]
+    cal = idx
+    cfg = type("C", (), {"lags": lags, "universe": type("U", (), {"fields": ["PX_LAST"]})()})()
+    return DBLeaves(OIQ(ts_data, contracts), cfg, cal, {}), idx
+
+
+def test_futures_oi_sums_concrete_contracts_with_at_least_one_value():
+    p, idx = _oi_provider(LagsConfig(chain=0, field_={"OPEN_INT": 1}))
+    leaf = p.futures_oi("TY")
+    assert leaf.info.rule == "field:OPEN_INT" and leaf.info.lag == 1 and leaf.info.name.startswith("futures_oi:TY")
+    s = leaf.series
+    assert np.isnan(s.iloc[0]) and s.iloc[1] == 100.0                 # one contract only (lag 1)
+    assert s.iloc[100] == 100.0
+    assert s.iloc[151] == 110.0                                      # both contracts (row 150 lagged by one)
+    assert s.iloc[160] == 110.0 and s.iloc[201] == 10.0               # first contract expired: still one value
+    assert not (s.dropna() == 117.0).any()                           # generic XX1 never included
+
+
+def test_futures_oi_without_field_rule_is_rejected_ticker_and_class_rules_do_not_apply():
+    p, _ = _oi_provider(LagsConfig(chain=0, class_={"Market_Data/VOL": 1}, ticker={"TYH19 Comdty": 1, "TY": 1}))
+    with pytest.raises(Rejected) as e:
+        p.futures_oi("TY")
+    assert e.value.reason == "no_availability_rule" and "futures_oi:TY" in e.value.leaf
+    r = Evaluator(p, {"v": "futures_oi('TY')"}).evaluate("v")
+    assert r.series is None and r.reason.startswith("no_availability_rule: futures_oi:TY")
+
+
+def test_futures_oi_expression_in_evaluator():
+    p, _ = _oi_provider(LagsConfig(chain=0, field_={"OPEN_INT": 2}))
+    r = Evaluator(p, {"v": "futures_oi('TY') / 10"}).evaluate("v")
+    assert r.lag == 2 and r.lag_rule == "field:OPEN_INT" and r.series.iloc[2] == 10.0

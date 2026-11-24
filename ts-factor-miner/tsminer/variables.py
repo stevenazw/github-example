@@ -23,8 +23,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 CHAIN_COLUMNS = ("return_index", "ret", "px_active", "calendar_spread", "oi_active", "oi_next")
 
 # name -> (kind, number of positional args allowed)
-_LEAF_ARITY = {"ts": (1, 2), "flow": (2, 2), "chain": (2, 2), "curve": (4, 4), "ref": (1, 1)}
-_SERIES_FUNCS = {"lag": 2, "diff": 1, "dlog": 1, "sign": 1, "nz": 1, "cumsum": 1, "rvol": 2}
+_LEAF_ARITY = {"ts": (1, 2), "flow": (2, 2), "chain": (2, 2), "curve": (4, 4), "futures_oi": (1, 1),
+               "ref": (1, 1)}
+_SERIES_FUNCS = {"lag": 2, "diff": 1, "dlog": 1, "sign": 1, "nz": 1, "cumsum": 1, "rvol": 2, "clean": 3}
 _BIN_OPS = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
 
 
@@ -75,29 +76,36 @@ def _ns(idx) -> np.ndarray:
     return pd.DatetimeIndex(idx).as_unit("ns").values
 
 
-def align_flow_to_calendar(x: pd.Series, calendar: pd.DatetimeIndex, lag: int) -> pd.Series:
+def align_flow_to_calendar(x: pd.Series, calendar: pd.DatetimeIndex, lag: int,
+                           stale_limit: int | None = 5) -> pd.Series:
     """Align a FLOW series (e.g. daily net inflow) to ``calendar``.
 
     Every observation is added to the first calendar row whose date is >= the observation date (several
-    observations landing on one row are summed). Rows without observations are 0 from the row of the first
-    observation on, and NaN before it. Nothing is carried forward. Observations after the last calendar
-    date are dropped. The result is shifted down by ``lag`` rows.
+    observations landing on one row are summed). Observations dated before the first calendar date are
+    dropped; observations after the last calendar date are dropped too. Rows without observations are 0 from
+    the row of the first observation on and NaN before it; nothing is carried forward. After the row of the
+    last observation, more than ``stale_limit`` rows without a new observation are NaN (the series has ended;
+    ``None`` disables this). The result is shifted down by ``lag`` rows.
     """
     if lag < 0:
         raise ValueError("lag must be >= 0")
     calendar = pd.DatetimeIndex(calendar)
     n = len(calendar)
     x = x.dropna()
+    nan_out = pd.Series(np.nan, index=calendar, dtype=float)
     if len(x) == 0 or n == 0:
-        return pd.Series(np.nan, index=calendar, dtype=float)
+        return nan_out
     cal = _ns(calendar)
-    pos = np.searchsorted(cal, _ns(x.index), side="left")      # first row with date >= obs date
-    keep = pos < n
+    xi = _ns(x.index)
+    pos = np.searchsorted(cal, xi, side="left")      # first row with date >= obs date
+    keep = (pos < n) & (xi >= cal[0])
     if not keep.any():
-        return pd.Series(np.nan, index=calendar, dtype=float)
+        return nan_out
     pos, vals = pos[keep], x.to_numpy(dtype=float)[keep]
     out = np.bincount(pos, weights=vals, minlength=n).astype(float)
     out[:pos.min()] = np.nan
+    if stale_limit is not None:
+        out[pos.max() + stale_limit + 1:] = np.nan
     s = pd.Series(out, index=calendar, dtype=float)
     return s.shift(lag) if lag else s
 
@@ -163,6 +171,12 @@ def _check(node, vid: str) -> None:
                 _check_int_arg(args[1], vid, fn, 0)
             elif fn == "rvol":
                 _check_int_arg(args[1], vid, fn, 2)
+            elif fn == "clean":
+                _check_int_arg(args[1], vid, fn, 2)
+                k = args[2]
+                if not (isinstance(k, ast.Constant) and isinstance(k.value, (int, float))
+                        and not isinstance(k.value, bool) and math.isfinite(float(k.value)) and k.value > 0):
+                    raise _err(vid, "clean() needs a positive numeric constant as its third argument")
             return
         raise _err(vid, f"unknown function {fn!r}")
     raise _err(vid, f"syntax not allowed: {type(node).__name__}")
@@ -254,12 +268,46 @@ def op_dlog(x: pd.Series) -> pd.Series:
 
 
 def op_cumsum(x: pd.Series) -> pd.Series:
+    """Running sum. NaN before the first finite value; afterwards NaN inputs add 0 but the row itself stays
+    NaN (the sum carries on in the next finite row). Causal: row t never looks at later rows."""
     fin = np.isfinite(x.to_numpy(dtype=float))
     if not fin.any():
         return pd.Series(np.nan, index=x.index, dtype=float)
     out = x.where(fin, 0.0).cumsum()
     out.iloc[:int(np.argmax(fin))] = np.nan
-    return out.astype(float)
+    return out.where(fin).astype(float)
+
+
+def op_clean(x: pd.Series, n: int, k: float) -> pd.Series:
+    """Causal outlier filter. For each row t the median ``med`` and MAD (median absolute deviation) of the
+    previous ``n`` finite observations (rows < t, raw values: the filter must be able to follow a level shift) are computed, and x[t] becomes NaN
+    when |x[t] - med| > k * MAD. No filtering (the value is kept) when MAD == 0 or fewer than n // 2 previous
+    observations exist.
+
+    Forward-filled values (a finite value identical to the previous row's value) are not new observations:
+    they are left out of the history, so slow series do not get a collapsed MAD, and they inherit the verdict
+    of the row they repeat (a flagged bad print stays NaN while it is carried forward).
+    """
+    v = x.to_numpy(dtype=float)
+    out = v.copy()
+    hist: list[float] = []
+    for t in range(len(v)):
+        cur = v[t]
+        if not np.isfinite(cur):
+            continue
+        if t > 0 and np.isfinite(v[t - 1]) and cur == v[t - 1]:
+            out[t] = out[t - 1]                              # repeat: same verdict, no new history
+            continue
+        h = hist[-n:]
+        bad = False
+        if len(h) >= n // 2:
+            med = float(np.median(h))
+            mad = float(np.median(np.abs(np.asarray(h) - med)))
+            bad = mad > 0 and abs(cur - med) > k * mad
+        if bad:
+            out[t] = np.nan
+        hist.append(cur)                                     # raw history, so the filter adapts to regime shifts
+    return pd.Series(out, index=x.index, dtype=float)
 
 
 def op_rvol(x: pd.Series, n: int) -> pd.Series:
@@ -311,7 +359,7 @@ class Evaluator:
         self._stack.append(vid)
         try:
             ctx = _Ctx(vid)
-            val = self._ev(self._trees[vid].body, ctx)
+            val, elag = self._ev(self._trees[vid].body, ctx)
         finally:
             self._stack.pop()
         if not isinstance(val, pd.Series):
@@ -320,40 +368,50 @@ class Evaluator:
             res = VarResult(series=None, leaves=ctx.leaves, rejected=ctx.rejected)
         else:
             freq = max((l.freq for l in ctx.leaves), key=lambda f: FREQ_RANK[f])
-            rule = "+".join(dict.fromkeys(l.rule for l in ctx.leaves))
-            res = VarResult(series=val.astype(float), lag=max(l.lag for l in ctx.leaves), freq=freq,
-                            lag_rule=rule, leaves=ctx.leaves)
+            rules = list(dict.fromkeys(l.rule for l in ctx.leaves))
+            if elag > max(l.lag for l in ctx.leaves):        # an explicit lag() pushes availability further out
+                rules.append("expr_lag")
+            res = VarResult(series=val.astype(float), lag=elag, freq=freq, lag_rule="+".join(rules),
+                            leaves=ctx.leaves)
         self._cache[vid] = res
         return res
 
-    # -- internals
+    # -- internals: _ev returns (value, effective lag in rows)
     def _ev(self, node, ctx: _Ctx):
         if isinstance(node, ast.Constant):
-            return float(node.value)
+            return float(node.value), 0
         if isinstance(node, ast.BinOp):
-            return _arith(self._ev(node.left, ctx), self._ev(node.right, ctx), _BIN_OPS[type(node.op)], ctx.vid)
+            a, la = self._ev(node.left, ctx)
+            b, lb = self._ev(node.right, ctx)
+            return _arith(a, b, _BIN_OPS[type(node.op)], ctx.vid), max(la, lb)
         if isinstance(node, ast.UnaryOp):
-            v = self._ev(node.operand, ctx)
-            return v if isinstance(node.op, ast.UAdd) else _arith(-1.0, v, "*", ctx.vid)
+            v, lv = self._ev(node.operand, ctx)
+            return (v if isinstance(node.op, ast.UAdd) else _arith(-1.0, v, "*", ctx.vid)), lv
         fn = node.func.id                                    # Call (validated by parse_expr)
         if fn == "ref":
             return self._ref(node.args[0].value, ctx)
         if fn in _LEAF_ARITY:
             return self._leaf(fn, [a.value for a in node.args], ctx)
-        x = _need_series(self._ev(node.args[0], ctx), ctx.vid, fn)
+        xv, lx = self._ev(node.args[0], ctx)
+        x = _need_series(xv, ctx.vid, fn)
         if fn == "lag":
-            return x.shift(int(node.args[1].value))
+            n = int(node.args[1].value)
+            return x.shift(n), lx + n
         if fn == "diff":
-            return (x - x.shift(1)).where(np.isfinite(x) & np.isfinite(x.shift(1)))
-        if fn == "dlog":
-            return op_dlog(x)
-        if fn == "sign":
-            return pd.Series(np.sign(x.to_numpy(dtype=float)), index=x.index, dtype=float)
-        if fn == "nz":
-            return x.where(np.isfinite(x), 0.0)
-        if fn == "cumsum":
-            return op_cumsum(x)
-        return op_rvol(x, int(node.args[1].value))           # rvol
+            r = (x - x.shift(1)).where(np.isfinite(x) & np.isfinite(x.shift(1)))
+        elif fn == "dlog":
+            r = op_dlog(x)
+        elif fn == "sign":
+            r = pd.Series(np.sign(x.to_numpy(dtype=float)), index=x.index, dtype=float)
+        elif fn == "nz":
+            r = x.where(np.isfinite(x), 0.0)
+        elif fn == "cumsum":
+            r = op_cumsum(x)
+        elif fn == "clean":
+            r = op_clean(x, int(node.args[1].value), float(node.args[2].value))
+        else:                                                # rvol
+            r = op_rvol(x, int(node.args[1].value))
+        return r, lx
 
     def _ref(self, rid: str, ctx: _Ctx):
         if rid not in self.defs:
@@ -361,8 +419,8 @@ class Evaluator:
         res = self.evaluate(rid)
         ctx.add(res.leaves, res.rejected)
         if res.series is None:                                # rejected upstream: keep evaluating with NaN
-            return pd.Series(np.nan, index=self.p.calendar, dtype=float)
-        return res.series
+            return pd.Series(np.nan, index=self.p.calendar, dtype=float), 0
+        return res.series, res.lag
 
     def _leaf(self, fn: str, args: list[str], ctx: _Ctx):
         what = f"{fn}({', '.join(repr(a) for a in args)})"
@@ -370,8 +428,8 @@ class Evaluator:
             leaf = getattr(self.p, fn)(*args)
         except Rejected as e:
             ctx.rejected.append((e.reason, e.leaf))
-            return pd.Series(np.nan, index=self.p.calendar, dtype=float)
+            return pd.Series(np.nan, index=self.p.calendar, dtype=float), 0
         except Exception as e:
             raise _err(ctx.vid, f"leaf {what}: {e}") from e
         ctx.add([leaf.info], [])
-        return leaf.series
+        return leaf.series, leaf.info.lag

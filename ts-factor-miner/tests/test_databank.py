@@ -453,7 +453,8 @@ def test_ty_vars_config_loads():
     assert cfg.universe.fields == ["PX_LAST", "CFTC_CONTRACTS"]
     ids = [v["id"] for v in cfg.universe.variable]
     assert len(set(ids)) == 63 and {"slope_2s10s", "ff_3m", "ty_oi"} <= set(ids)
-    assert cfg.lags.field_["FUND_FLOW"] == 1 and cfg.lags.field_["chain:oi_active"] == 1
+    assert cfg.lags.field_["FUND_FLOW"] == 1 and cfg.lags.field_["OPEN_INT"] == 1
+    assert "chain:oi_active" not in cfg.lags.field_
     assert cfg.lags.curve == {"USD_SOFR_OIS": 0} and cfg.lags.ticker == {"NFCIINDX Index": 6}
     base = load_config(CONFIGS / "ty.toml")
     assert cfg.lags.class_ == base.lags.class_ and cfg.target == base.target and cfg.verdict == base.verdict
@@ -537,3 +538,27 @@ def test_build_panel_variable_without_rule_is_excluded_with_leaf_named():
     assert "FF1 Comdty/PX_LAST" in reason and "FF4 Comdty/PX_LAST" in reason
     assert "var:ff_3m" not in panel.X.columns and "var:slope_2s10s" in panel.X.columns
     assert panel.excluded.groupby("ticker").size().max() == 1
+
+
+def test_futures_oi_matches_manual_sum_on_real_db():
+    cfg, db = _db_cfg()
+    from tsminer.databank import DBLeaves, _fetch
+
+    cfg = load_config(CONFIGS / "ty_vars.toml")
+    sys.path.insert(0, cfg.databank.toolkit_dir)
+    from data_query import DataQuery
+    q = DataQuery(db_path=db)
+    cal = pd.DatetimeIndex(q.get_futures_chain("TY").query("return_valid == 1")["trade_date"].pipe(pd.to_datetime))
+    leaf = DBLeaves(q, cfg, cal, {}).futures_oi("TY")
+    assert leaf.info.lag == 1 and leaf.info.rule == "field:OPEN_INT"
+    recs = q.resolve("BOND_FUTURE", allow_multi=True, root="TY")
+    conc = [r["ticker"] for r in recs if "contract" in r["attrs"]]
+    assert "TY1 Comdty" not in conc and "TY1 COMB Comdty" not in conc and len(conc) > 50
+    got = _fetch(q, conc, "OPEN_INT")
+    df = pd.DataFrame({k: v[0] for k, v in got.items()})
+    for day in ("2004-11-24", "2004-11-26", "2015-03-12", "2024-11-26"):
+        d = pd.Timestamp(day)
+        exp = df.loc[d].sum(min_count=1)
+        i = cal.get_loc(d)
+        assert leaf.series.iloc[i + 1] == pytest.approx(exp)          # lag 1: visible on the next calendar row
+        assert 1 <= int(df.loc[d].notna().sum()) <= 5

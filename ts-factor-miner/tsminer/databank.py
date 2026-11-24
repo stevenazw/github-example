@@ -240,6 +240,7 @@ class DBLeaves:
         self._ts: dict = {}
         self._chain: dict = {}
         self._curve: dict = {}
+        self._oi: dict = {}
 
     def _series(self, ticker: str, field: str) -> pd.Series:
         key = (ticker, field)
@@ -268,7 +269,7 @@ class DBLeaves:
         if freq == "other":
             raise Rejected("freq_not_daily_or_weekly", name)
         lag, rule = hit
-        out = (align_flow_to_calendar(s, self.calendar, lag) if flow
+        out = (align_flow_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]) if flow
                else align_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]))
         return Leaf(out, LeafInfo(name, lag, rule, freq))
 
@@ -277,6 +278,32 @@ class DBLeaves:
 
     def flow(self, ticker: str, field: str) -> Leaf:
         return self._stock_or_flow(ticker, field, flow=True)
+
+    def futures_oi(self, root: str) -> Leaf:
+        """Sum of OPEN_INT over every CONCRETE contract of ``root`` (never the generic ``XX1 Comdty`` / COMB /
+        ``XXA`` series); a day has a value when at least one contract has one. Rule: ``[lags.field]["OPEN_INT"]``."""
+        name = f"futures_oi:{root}/OPEN_INT"
+        if root not in self._oi:
+            res = self.q.resolve("BOND_FUTURE", allow_multi=True, root=root)
+            tickers = [r["ticker"] for r in (res or []) if "contract" in (r.get("attrs") or {})]
+            if not tickers:
+                raise ValueError(f"no concrete contracts found for root {root!r}")
+            got = _fetch(self.q, tickers, "OPEN_INT")
+            if not got:
+                raise ValueError(f"no OPEN_INT data for the contracts of {root!r}")
+            df = pd.DataFrame({tk: v[0] for tk, v in got.items()})
+            self._oi[root] = df.sum(axis=1, min_count=1).dropna()
+        s = self._oi[root]
+        if len(s) == 0:
+            raise ValueError(f"no OPEN_INT data for {root!r}")
+        if "OPEN_INT" not in self.lags.field_:
+            raise Rejected("no_availability_rule", name)
+        freq = infer_freq(s.index)
+        if freq == "other":
+            raise Rejected("freq_not_daily_or_weekly", name)
+        lag = int(self.lags.field_["OPEN_INT"])
+        return Leaf(align_to_calendar(s, self.calendar, lag, STALE_LIMIT[freq]),
+                    LeafInfo(name, lag, "field:OPEN_INT", freq))
 
     def chain(self, root: str, column: str) -> Leaf:
         if column not in CHAIN_COLUMNS:

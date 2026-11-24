@@ -62,14 +62,14 @@ chain = 0      # 期货连续合约: 不滞后
 "1M_PUT_IMP_VOL_25DELTA_DFLT" = 1
 "CONVENTIONAL_CTD_FORWARD_FRSK" = 1
 "VOLUME" = 0
-"chain:oi_active" = 1                 # 持仓量: 交易所次日公布, 起草为滞后 1 天, 待研究者确认
-"chain:oi_next" = 1
+"OPEN_INT" = 1                        # 持仓量(futures_oi 叶子): 交易所次日公布, 起草为滞后 1 天, 待研究者确认
 
 [lags.curve]
 "USD_SOFR_OIS" = 0
 
 # ---------------------------------------------------------------- helper（只供 ref() 引用，不是候选）
 # 缩写: PUT = 1M_PUT_IMP_VOL_25DELTA_DFLT, CALL = 1M_CALL_IMP_VOL_25DELTA_DFLT, FRSK = CONVENTIONAL_CTD_FORWARD_FRSK
+# oi_*: futures_oi(root) = 该品种所有具体合约持仓量之和(换月不断崖); skew_*: clean(x, 60, 10) 因果离群点过滤(只用于偏度: 已知坏点只体现在偏度上, 波动率水平不过滤以保留危机时期的真实行情)。
 # aum_*: ETF 规模取前一日 (lag(..., 1)); fl_*: ETF 资金流 (flow 叶子)。
 [[universe.helper]]
 id = "iv_ty"
@@ -85,19 +85,19 @@ expr = "(ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') + ts('US1 Comdty','1M_CA
 
 [[universe.helper]]
 id = "skew_ty"
-expr = "ts('TY1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TY1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+expr = "clean(ts('TY1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TY1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT'), 60, 10)"
 
 [[universe.helper]]
 id = "skew_tu"
-expr = "ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+expr = "clean(ts('TU1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('TU1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT'), 60, 10)"
 
 [[universe.helper]]
 id = "skew_fv"
-expr = "ts('FV1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('FV1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+expr = "clean(ts('FV1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('FV1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT'), 60, 10)"
 
 [[universe.helper]]
 id = "skew_us"
-expr = "ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT')"
+expr = "clean(ts('US1 Comdty','1M_PUT_IMP_VOL_25DELTA_DFLT') - ts('US1 Comdty','1M_CALL_IMP_VOL_25DELTA_DFLT'), 60, 10)"
 
 [[universe.helper]]
 id = "dur_ty"
@@ -117,19 +117,19 @@ expr = "ts('US1 Comdty','CONVENTIONAL_CTD_FORWARD_FRSK')"
 
 [[universe.helper]]
 id = "oi_ty"
-expr = "chain('TY','oi_active') + nz(chain('TY','oi_next'))"
+expr = "futures_oi('TY')"
 
 [[universe.helper]]
 id = "oi_tu"
-expr = "chain('TU','oi_active') + nz(chain('TU','oi_next'))"
+expr = "futures_oi('TU')"
 
 [[universe.helper]]
 id = "oi_fv"
-expr = "chain('FV','oi_active') + nz(chain('FV','oi_next'))"
+expr = "futures_oi('FV')"
 
 [[universe.helper]]
 id = "oi_us"
-expr = "chain('US','oi_active') + nz(chain('US','oi_next'))"
+expr = "futures_oi('US')"
 
 [[universe.helper]]
 id = "aum_ief"
@@ -639,7 +639,7 @@ description = "全曲线平均偏度"
 
 # ---- OI
 # ty_price_oi: 持仓量滞后 1 天, 所以对价格取 lag(..., 1), 让"当日涨跌方向"与"同一天的持仓变化"配对;
-# 若日后把持仓量(chain:oi_active / chain:oi_next)的滞后改为 0, 这里的 lag 也要去掉。
+# 若日后把持仓量(OPEN_INT)的滞后改为 0, 这里的 lag 也要去掉。
 [[universe.variable]]
 id = "ty_oi"
 group = "OI"

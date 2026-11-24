@@ -142,9 +142,9 @@ shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对�
 
 表达式用 `ast` 解析后按白名单求值，不用 `eval` / `exec`：只允许数字常量、字符串常量（仅作函数参数）、`+ - * /`、一元 `+ -`、括号和下列函数，其余语法都抛 `ValueError`（带变量 id）。
 
-- 叶子（取数，返回已对齐到标的日历并已滞后的序列）：`ts(ticker[, field])`（存量，as-of + 陈旧截断 + 滞后）；`flow(ticker, field)`（流量：观测累加到日期 ≥ 观测日的第一个日历行，没有观测的行为 0、首个观测之前为 NaN，不向前填充，再整体滞后）；`chain(root, column)`（期货连续合约的一列，`return_valid == 1` 的行）；`curve(name, measure, start_tenor, tenor)`（库内曲线点）；`ref(id)`（另一个变量或 helper 的未变换取值，循环引用报错）。
-- 运算（均因果）：`lag(x, n)`、`diff`、`dlog`（非正为 NaN）、`sign`、`nz`、`cumsum`（首个有限值之前为 NaN，之后把 NaN 当 0）、`rvol(x, n)`（`dlog` 的 n 日滚动标准差 × √252 × 100）。二元运算两侧都有限才有值，除以 0 为 NaN。
-- 可得性：每条底层叶子先各自对齐并滞后，再做公式运算。`ts` / `flow` 的优先级为 `[lags.ticker]` > `[lags.field]`（键为字段名）> `[lags.class]`；`chain` 先看 `[lags.field]` 里的 `"chain:<column>"`，再用 `lags.chain`；`curve` 看 `[lags.curve]`（键为曲线名）。任一叶子没有规则，该变量被拒收，`excluded` 里原因为 `no_availability_rule: <叶子>`，ticker 为 `var:<id>`。叶子取不到数据（未知 ticker / 字段、空数据）是配置错误，直接抛 `ValueError`。叶子的频率不是日频或周频则拒收（`freq_not_daily_or_weekly: <叶子>`）。变量的 `freq` 取各叶子最粗者，`lag` 取各叶子最大值，`lag_rule` 是各叶子规则键去重后用 `+` 连接。注意：`lag` 只汇总叶子的可得性滞后，表达式里显式的 `lag(x, n)` 不计入。
+- 叶子（取数，返回已对齐到标的日历并已滞后的序列）：`ts(ticker[, field])`（存量，as-of + 陈旧截断 + 滞后）；`flow(ticker, field)`（流量：观测累加到日期 ≥ 观测日的第一个日历行，没有观测的行为 0、首个观测之前为 NaN，早于日历首日的观测丢弃，最后一个观测之后超过陈旧上限仍无观测则为 NaN，不向前填充，再整体滞后）；`chain(root, column)`（期货连续合约的一列，`return_valid == 1` 的行）；`curve(name, measure, start_tenor, tenor)`（库内曲线点）；`futures_oi(root)`（该品种所有具体合约 `OPEN_INT` 之和，不含 `XX1` / COMB 连续合约；规则只看 `[lags.field]` 的 `"OPEN_INT"`）；`ref(id)`（另一个变量或 helper 的未变换取值，循环引用报错）。
+- 运算（均因果）：`lag(x, n)`、`diff`、`dlog`（非正为 NaN）、`sign`、`nz`、`cumsum`（首个有限值之前为 NaN，之后 NaN 输入当 0 累加，但该行本身输出 NaN）、`clean(x, n, k)`（用此前 n 个有限观测的中位数与 MAD 剔除离群点，MAD 为 0 或历史不足 n//2 不过滤，前向填充的重复值不进入历史）、`rvol(x, n)`（`dlog` 的 n 日滚动标准差 × √252 × 100）。二元运算两侧都有限才有值，除以 0 为 NaN。
+- 可得性：每条底层叶子先各自对齐并滞后，再做公式运算。`ts` / `flow` 的优先级为 `[lags.ticker]` > `[lags.field]`（键为字段名）> `[lags.class]`；`chain` 先看 `[lags.field]` 里的 `"chain:<column>"`，再用 `lags.chain`；`curve` 看 `[lags.curve]`（键为曲线名）。任一叶子没有规则，该变量被拒收，`excluded` 里原因为 `no_availability_rule: <叶子>`，ticker 为 `var:<id>`。叶子取不到数据（未知 ticker / 字段、空数据）是配置错误，直接抛 `ValueError`。叶子的频率不是日频或周频则拒收（`freq_not_daily_or_weekly: <叶子>`）。变量的 `freq` 取各叶子最粗者，`lag` 取各叶子最大值，`lag_rule` 是各叶子规则键去重后用 `+` 连接。`lag` 是沿表达式树传播的有效滞后：叶子取其规则 lag，`lag(x, n)` 加 n，其余取各子节点最大值，`ref` 取被引用表达式的有效滞后；有效滞后大于各叶子规则 lag 的最大值时，`lag_rule` 末尾追加 `+expr_lag`。
 
 ## 4. 快速开始
 
