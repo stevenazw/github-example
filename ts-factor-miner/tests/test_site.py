@@ -226,8 +226,19 @@ def test_formula_price_and_level(cfg):
 def test_formula_z_and_position_sign(cfg):
     t = "\n".join(formula_text(_meta(), "z_252", cfg, -1.0))
     assert "mean_252(" in t and "std_252(" in t
-    assert "pos[t] = −1 × s[t] ÷ σ[t]" in t
-    assert "pos[t] = +1 × s[t] ÷ σ[t]" in "\n".join(formula_text(_meta(), "z_60", cfg, 1.0))
+    assert "pos[t] = −1 × s[t−1] ÷ σ[t]" in t and "信号形成后第 1 个收盘成交" in t     # default execution_delay = 1
+    assert "pos[t] = +1 × s[t−1] ÷ σ[t]" in "\n".join(formula_text(_meta(), "z_60", cfg, 1.0))
+
+
+def test_formula_execution_delay_variants(tmp_path):
+    for d, want in ((0, "s[t]"), (1, "s[t−1]"), (2, "s[t−2]")):
+        p = tmp_path / f"c{d}.toml"
+        p.write_text(TOML + f"\n[position]\nexecution_delay = {d}\n")
+        t = "\n".join(formula_text(_meta(), "chg_5", load_config(p), 1.0))
+        assert f"pos[t] = +1 × {want} ÷ σ[t]" in t
+        assert ("信号形成后第" in t) == (d > 0)
+        if d:
+            assert f"信号形成后第 {d} 个收盘成交" in t and "s[t−" + str(d) + "]" in t
 
 
 def test_formula_follows_config(cfg_path, tmp_path):
@@ -294,7 +305,7 @@ def test_site_files(site_dir):
 def test_new_run_has_criteria_and_trade_keep(site_dir, run_dir, locked_data):
     vd = load_config(run_dir / "config.toml").verdict
     want = {"z_weak": vd.z_weak, "obs_min_retention": vd.obs_min_retention, "min_net_sharpe": vd.min_net_sharpe,
-            "is_min_net_sharpe": vd.is_min_net_sharpe, "dedupe_corr": vd.dedupe_corr}
+            "is_min_net_sharpe": vd.is_min_net_sharpe, "dedupe_corr": vd.dedupe_corr, "execution_delay": 1}
     assert want["min_net_sharpe"] == 0.3 and want["is_min_net_sharpe"] == 0.3
     assert locked_data["criteria"] == want
     run = json.loads((run_dir / "run.json").read_text())
@@ -326,6 +337,33 @@ def test_old_style_run_without_trade_keys(tmp_path, run_dir):
     assert d["funnel"]["n_final"] == len(pd.read_csv(old / "shortlist.csv"))
     assert d["criteria"]["z_weak"] == rj["config"]["verdict"]["z_weak"]
     assert d["factors"]
+
+
+def test_old_run_without_execution_delay(tmp_path, run_dir):
+    """A run from before execution_delay existed: counts as 0, no error, no execution text anywhere."""
+    old = tmp_path / "old"
+    shutil.copytree(run_dir, old)
+    rj = json.loads((old / "run.json").read_text())
+    del rj["config"]["position"]["execution_delay"]
+    (old / "run.json").write_text(json.dumps(rj))
+    out = tmp_path / "site"
+    build_site([old], out)                                           # must not raise
+    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
+    assert "execution_delay" not in d["criteria"] and d["factors"]
+    for f in d["factors"]:
+        t = "\n".join(f["formula"])
+        assert "pos[t] = " in t and "s[t−1]" not in t and "信号形成后第" not in t and " × s[t] ÷ σ[t]" in t
+    art = (out / "artifact.html").read_text(encoding="utf-8")
+    assert "成交：信号形成后第" in art and "execText" in art
+
+
+def test_new_run_site_shows_execution(site_dir, locked_data):
+    assert locked_data["criteria"]["execution_delay"] == 1
+    for f in locked_data["factors"]:
+        t = "\n".join(f["formula"])
+        assert "s[t−1] ÷ σ[t]" in t and "信号形成后第 1 个收盘成交" in t
+    d = json.loads((site_dir / "data" / "test.json").read_text(encoding="utf-8"))
+    assert d["criteria"]["execution_delay"] == 1
 
 
 def test_flag_text_has_no_cost_flag():
@@ -377,7 +415,7 @@ def test_formula_text_for_variable_series(cfg):
     row = _meta(ticker="var:ty_vrp", field=expr, kind="level", lag=1)
     lines = formula_text(row, "chg_20", cfg, 1.0)
     assert lines[0] == f"x[t] = {expr}"
-    assert lines[1] == "d[t] = x[t] − x[t−20]" and lines[-2] == "pos[t] = +1 × s[t] ÷ σ[t]"
+    assert lines[1] == "d[t] = x[t] − x[t−20]" and lines[-2] == "pos[t] = +1 × s[t−1] ÷ σ[t]"
     assert len(lines) == len(formula_text(_meta(), "chg_20", cfg, 1.0))          # the other lines are unchanged
     assert formula_text(row, "z_60", cfg, -1.0)[0] == f"x[t] = {expr}"
 

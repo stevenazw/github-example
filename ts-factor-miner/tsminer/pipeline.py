@@ -68,10 +68,20 @@ def split_rows(valid, is_frac, obs_frac, quantum=SPLIT_QUANTUM):
 def prepare(panel: Panel, cfg) -> dict:
     """Candidate signals on the full (causal) time axis plus each candidate's own IS / OBS / OOS rows.
 
+    ``S`` is the signal the strategy actually holds: the candidate signals formed after the close of day t are
+    filled ``execution_delay`` target trading days later, so row t of ``S`` is the candidate signal of row
+    t - execution_delay (``build_candidates`` output shifted down by that many rows). Row t then earns
+    ``y_fwd[t]`` = r[t+1] / sigma_t, i.e. the signal formed at t-d is filled at the close of t and the new
+    position bears the return from t to t+1. Everything downstream (split, tests, flags, backtests, de-duplication,
+    IC decay, dashboard net value) works on this shifted ``S``.
+
     ``rows`` are the calendar positions where y_fwd is finite; the masks (len(rows), N) and ``e1``, ``e2``
     (N,) are defined on those rows.
     """
     S, cand_meta = build_candidates(panel.X, panel.meta, cfg.signals.std_window, cfg.signals.clip)
+    d = int(cfg.position.execution_delay)
+    if d > 0:
+        S = S.shift(d)                       # signal formed at t-d is held on row t
     y_fwd, sigma = forward_target(panel.target, cfg.signals.vol_halflife)
     rows = np.flatnonzero(np.isfinite(y_fwd.to_numpy(dtype=float)))
     valid = np.isfinite(S.to_numpy(dtype=float)[rows])

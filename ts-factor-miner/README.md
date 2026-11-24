@@ -23,7 +23,7 @@
 - **短历史候选在自身有效数据内检验并各自切分。** 候选序列的历史可能比标的短（例如标的 TY 从 1999 年开始，某序列 2019 年才有）。三段按这个候选自己的有效行切分，而不是按标的日期一刀切。
 - **变换集合小而固定。** 日频 6 个、周频 4 个，不按变量类型区分，不做参数网格，不做公式搜索。
 - **仓位用连续比例，并考虑 IC 衰减。** 报告 IC 衰减与信号自相关；慢信号不必每天调仓，用缓冲带控制换手。
-- **防前视是数据层的职责。** 所有序列先 as-of 对齐到标的日历，再按可得性滞后；信号只用因果变换。
+- **防前视是数据层的职责。** 所有序列先 as-of 对齐到标的日历，再按可得性滞后；信号只用因果变换；成交在信号形成后第 `execution_delay` 个标的收盘（见 3.1）。
 - **逐候选隔离。** 候选 j 在 `mine` 中的任何输出都不依赖它自己 OOS 行（行号 ≥ `e2[j]`）的数据取值；IS 阶段的统计量（t、null_sd、z、flags 中的 half_flip / xlag_weak）不依赖行号 ≥ `e1[j]` 的数据取值。`confirm` 是唯一打开 OOS 的入口，用 lock 文件保证只看一次。
 - **判据在看数据前固定。** 门槛写在配置的 `[verdict]` 里。
 
@@ -37,33 +37,56 @@ databank.py        transforms.py      stats.py            pipeline.py           
 
 ### 3.1 时间约定
 
-信号 `s_t` 在 t 日收盘已知；目标 `y_fwd[t] = r[t+1] / σ_t`，其中 σ_t 是只用 ≤ t 数据的 EWMA 波动率（`vol_halflife`，默认 20）。目标是 futures_chain 时，`r` 取数据库连续合约的 `ret`；是 spot 时取 `PX_LAST` 的对数差。
+- **信号日**：候选信号 `c_t` 只用 t 日收盘及之前可得的数据（每条输入已按 3.2 的 `lag` 对齐），在 **t 日收盘后形成**（要等当日标的日线完成）。
+- **成交**：在其后第 `execution_delay`（`[position]`，非负整数，默认 1）个标的收盘成交，新仓从成交后才开始承担收益。默认 1 与生产策略的已验证口径一致；0 即信号形成当日收盘成交（旧口径）。
+- **实现**：`pipeline.prepare` 把 `build_candidates` 输出的信号矩阵整体后移 `execution_delay` 行：`s_t = c_{t−d}`（d = `execution_delay`）。行 t 的仓位由 t−d 日收盘时已可得的信息决定，承担 `y_fwd[t] = r[t+1] / σ_t`（σ_t 是只用 ≤ t 数据的 EWMA 波动率，`vol_halflife`，默认 20）。后移后的信号是 mine、confirm、看板共同使用的唯一信号：三段切分、检验、flags（含 `xlag_weak`：在已含成交延迟的信号上再多滞后一天）、回测、去重、IC 衰减、看板净值都基于它，所以当日收盘到次日收盘的那段收益吃不到当日信号。
+- 目标是 futures_chain 时，`r` 取数据库连续合约的 `ret`；是 spot 时取 `PX_LAST` 的对数差。
+- 没有 `execution_delay` 的旧 run（`run.json` 的配置快照里没有该键）按 0 处理（`config.load_run_config`），`confirm` 与看板都据此重建，所以旧 run 的数值不变。
 
 ### 3.2 数据层与可得性输入（`databank.py`）
 
-每条序列先 as-of 对齐到标的日历（取日期 ≤ 当天的最近一个观测，日频超过 5 个日历行、周频超过 10 个日历行视为过期，置 NaN），再向后移 `lag` 行。`lag` 的含义：t 日收盘的信号只能用日期 ≤ t−lag 的观测。数据库里的 `release_date` 不被使用。
+每条序列先 as-of 对齐到标的日历（取日期 ≤ 当天的最近一个观测，日频超过 5 个日历行、周频超过 10 个日历行视为过期，置 NaN），再向后移 `lag` 行。`lag` 的单位是**标的交易日（日历行）**，含义：t 日收盘的信号只能用日期 ≤ t−lag 的观测。数据库里的 `release_date` 不被使用。
 
 可得性完全来自配置的 `[lags]`，是由研究者确认的输入，没有频率默认值：
 
 - `chain`（必填）：期货链 `chain:*` 与 `carry:*` 的滞后。
 - `[lags.class]`：键为 `"class_one/class_two"`。
-- `[lags.ticker]`：按 ticker 精确指定，优先级高于 class。
-- 优先级：ticker 精确 > class；都没有则 `resolve_lag` 返回 None，该序列拒收（`excluded` 里原因 `no_availability_rule`）。`[lags]` 里出现 `D` / `W` 这类旧键按未知键报错。
+- `[lags.ticker]`：按 ticker 精确指定，优先级高于 field 与 class；`[lags.field]` / `[lags.curve]`：字段名 / 曲线名（公式变量的叶子用，见 3.12）。一个 ticker 有多个不同滞后的字段时（如 `TY1 Comdty`）不要写 ticker 规则，靠字段规则。
+- 优先级：ticker 精确 > field（仅公式变量叶子）> class；都没有则 `resolve_lag` 返回 None，该序列拒收（`excluded` 里原因 `no_availability_rule`）。`[lags]` 里出现 `D` / `W` 这类旧键按未知键报错。
 - 利差序列的两条腿各自对齐、滞后后再相减，滞后取两腿较大者；任一条腿没有可得性规则则 `build_panel` 直接报错（配置错误显性失败）。
 - `Panel.meta` 的 `lag_rule` 列记录每条序列实际命中的规则键（`ticker:<ticker>`、`class:<class_one/class_two>`、`chain`；利差写两条腿的规则并用 `+` 连接）。
 
-`configs/ty.toml` 的取值（`configs/eurusd.toml` 相同）。这些数值是研究者于 2026-11-23 确认的输入，不是系统推断：行情数据与期货连续合约不滞后，隐含波动率滞后 1 天；ETF 资金流应滞后 1 天（当前候选池未包含资金流字段，加入时需为其单独设规则）；其余类别沿用起草值。
+**规则出处分三档**，由 `[lags]` 里两个可选的字符串列表登记，元素是规则键，格式与 `meta.lag_rule` 相同（`"ticker:<ticker>"`、`"field:<field>"`、`"class:<c1>/<c2>"`、`"curve:<name>"`、`"chain"`）；列表里出现 `[lags]` 中不存在的规则键报 `ValueError`（防笔误）：
 
-| 序列类型 | lag | 依据 |
+- `verified`：**已验证**，来自 factor_bank《Duration Trading 底层因子配方与 EOD 可用时间》（2026-11-24）；
+- `confirmed`：**研究者确认**，研究者口头确认、文档未覆盖；
+- 不在两个列表里的规则：**起草，待确认**。
+
+报告的"可得性输入"表有一列"出处"；组合规则（利差两条腿 `a+b`、公式变量的多个叶子）取各组成部分里最弱的一档（起草 < 研究者确认 < 已验证，`+expr_lag` 不参与判断），表下方汇总各档的序列数。
+
+`configs/ty.toml`、`configs/eurusd.toml`、`configs/ty_vars.toml` 的 `[lags.class]` / `[lags.ticker]` 取值相同：
+
+| 规则 | lag | 出处 |
 |---|---|---|
-| `Market_Data/*`（债券、货币市场、互换/OIS、商品、股票、通胀挂钩、信用、MBS、外汇） | 0 | 行情数据，研究者确认不滞后 |
-| `Market_Data/VOL`（衍生品隐含波动率） | 1 | 研究者确认滞后 1 天 |
-| `Macro/Global`、`Macro/US` | 1 | 宏观日频指数，保持 1（研究者未改） |
-| CFTC 持仓 (`Positioning/CFTC_COT`) | 4 | 周二数据，周五盘后发布，下周一可用 |
-| Fed 资产负债表 (`FED/Balance_Sheet`) | 2 | 周三数据，周四发布，周五可用 |
-| 一级交易商 (`FED/Primary_Dealer`) | 8 | 周三数据，下周四发布，保守取 8 |
-| `NFCIINDX Index`（ticker 规则） | 6 | 周频发布 |
-| 期货连续合约 `chain`、`carry` | 0 | 研究者确认不滞后 |
+| `chain`（期货连续合约 `chain`、`carry`） | 0 | 研究者确认 |
+| `Market_Data/*` 十个类别（债券、货币市场、互换/OIS、商品、股票、通胀挂钩、信用、MBS、外汇） | 0 | 研究者确认（行情数据不滞后） |
+| `Market_Data/VOL` | 1 | 研究者确认 |
+| `Macro/Global`、`Macro/US`（类别键） | 1 | 起草，待确认 |
+| `Positioning/CFTC_COT` | 4 | 起草，待确认 |
+| `FED/Balance_Sheet` | 2 | 起草，待确认 |
+| `FED/Primary_Dealer` | 8 | 起草，待确认 |
+| `NFCIINDX Index`（ticker） | 6 | 起草，待确认 |
+| `CESIUSD Index`、`CESIG10 Index`（经济惊喜指数） | 1 | 已验证 |
+| `FEDL01 Index` | 1 | 已验证（文档目录记为 0，但证据显示纽约联储在下一营业日约 09:00 才发布，按发布时间取 1） |
+| `FDTR Index`、`FDTRFTRL Index` | 0 | 已验证 |
+| `FF1 Comdty` … `FF24 Comdty`（24 条，逐条 ticker 规则） | 0 | 已验证 |
+| 13 条商品总回报指数（`SPGSAGTR Index` 等）、6 条高盛股票风格指数（`GSPRHIMO Index` 等），逐条 ticker 规则 | 0 | 已验证 |
+| 字段 `FUND_FLOW`、`1M_CALL_IMP_VOL_25DELTA_DFLT`、`1M_PUT_IMP_VOL_25DELTA_DFLT`、`OPEN_INT` | 1 | 已验证 |
+| 曲线 `USD_SOFR_OIS` | 0 | 已验证 |
+| 字段 `EQY_SH_OUT`、`FUND_NET_ASSET_VAL`、`CONVENTIONAL_CTD_FORWARD_FRSK`（仅 `ty_vars.toml`） | 1 | 起草，待确认 |
+| 字段 `VOLUME`（仅 `ty_vars.toml`） | 0 | 起草，待确认 |
+
+`ty.toml` / `eurusd.toml` 也带上四个已验证字段和曲线规则，以便以后把这些序列加入候选池时规则已就位。
 
 另外：不是日频也不是周频的序列被剔除（原因 `freq_not_daily_or_weekly`）；对齐后有限值少于 250 个的序列被剔除（`too_few_obs`）。`kind` 由数据库的 unit/data_type 推断：price 类取对数差，其余（level）取差分。近月连续合约（`MM_Future`、`Commodity_Future`）的换月跳空无法在现有数据上修正，已移出候选池。
 
@@ -122,7 +145,7 @@ IS 上的 flags（不改变判决）：`half_flip`（IS 有效行按个数对半
 
 ### 3.9 仓位与回测
 
-仓位是连续比例：`target_t = sign × s_t`（NaN 记 0）。缓冲带 `buffer`（`[position]`，默认 0.5）：`pos_0 = target_0`；若 `|target_t − pos_{t−1}| > buffer` 则 `pos_t = target_t`，否则 `pos_t = pos_{t−1}`。`buffer = 0` 时 pos 等于 target。回测评估区间从信号第一个有限值起：`gross = pos × y_fwd`；名义仓位 `pos / σ`，成本 `cost_per_side × |Δ名义仓位|`（首行用 |名义仓位₀|）；`net = gross − cost`。输出毛/净 Sharpe（均值÷标准差×√252）与 `turnover`（mean |Δpos|）。`mine` 在各自 DEV 行上算（第 3 步，对所有第 2 步存活的候选），`confirm` 在各自 OOS 行上算（从 OOS 首行重新起仓）。
+仓位是连续比例：`target_t = sign × s_t`（NaN 记 0）。缓冲带 `buffer`（`[position]`，默认 0.5）：`pos_0 = target_0`；若 `|target_t − pos_{t−1}| > buffer` 则 `pos_t = target_t`，否则 `pos_t = pos_{t−1}`。`buffer = 0` 时 pos 等于 target。这里的 `s_t` 是已含成交延迟的持有信号（`prepare` 的输出，见 3.1）：行 t 的仓位由 t−`execution_delay` 日收盘形成的信号决定，承担 `y_fwd[t]`（t → t+1 的收益）。回测评估区间从信号第一个有限值起：`gross = pos × y_fwd`；名义仓位 `pos / σ`，成本 `cost_per_side × |Δ名义仓位|`（首行用 |名义仓位₀|）；`net = gross − cost`。输出毛/净 Sharpe（均值÷标准差×√252）与 `turnover`（mean |Δpos|）。`mine` 在各自 DEV 行上算（第 3 步，对所有第 2 步存活的候选），`confirm` 在各自 OOS 行上算（从 OOS 首行重新起仓）。
 
 ### 3.10 读 IC 衰减与信号自相关
 
@@ -235,8 +258,10 @@ python -m pytest -q
 | `[[universe.select]]` | 候选池选择，每条恰为三种形式之一：`class_one` / `class_two` / `class_three`（仅 `class_three` 可为列表）；`family` + `attrs`（如 CFTC）；`tickers`（显式列表） |
 | `[[universe.spread]]` | `id`、`a`、`b`：生成 `spread:<id>` = a − b（level） |
 | `[[universe.helper]]`, `[[universe.variable]]` | 公式变量，见 3.12 |
-| `[lags]` `chain`, `class`, `ticker`, `field`, `curve` | 可得性输入，见 3.2 与 3.12（`field`、`curve` 只用于公式变量的叶子）。`chain` 必填；`class` 的键形如 `"class_one/class_two"`；没有频率默认值，出现 `D` / `W` 报错 |
+| `[lags]` `chain`, `class`, `ticker`, `field`, `curve` | 可得性输入（单位：标的交易日），见 3.2 与 3.12（`field`、`curve` 只用于公式变量的叶子）。`chain` 必填；`class` 的键形如 `"class_one/class_two"`；没有频率默认值，出现 `D` / `W` 报错 |
+| `[lags]` `verified`, `confirmed` | 规则出处登记（可选的字符串列表，元素是规则键，见 3.2）；不在其中的规则为"起草，待确认"；含不存在的规则键报错 |
 | `[position]` `buffer` | 缓冲带宽度（默认 0.5，≥ 0），见 3.9 |
+| `[position]` `execution_delay` | 成交延迟（非负整数，默认 1）：信号在 t 日收盘后形成，在其后第 `execution_delay` 个标的收盘成交，新仓从成交后才承担收益；0 = 当日收盘成交。负数、非整数报错。见 3.1 |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 IS 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |
 | `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0` |
@@ -269,6 +294,8 @@ python -m pytest -q
 - **可得性输入**：`test_resolve_lag_priority_and_none`、`test_lags_section_is_an_input`、`test_build_panel_rejects_series_without_availability_rule`（需要本地数据库，否则 skip）。
 - **逐候选隔离**：`test_isolation_nothing_from_oos`（行号 ≥ `e2` 之后的 target 与该候选原始序列换成随机数，candidates.csv 与 shortlist.csv 的数值列逐值不变）、`test_isolation_is_stats_ignore_obs_and_oos`（行号 ≥ `e1` 之后换掉，IS 统计量逐值不变），长历史与短历史候选各验证一次。
 - **植入信号 / 观察期淘汰 / lock**：`test_planted_signal_survives_screens`、`test_planted_signal_confirmed`、`test_observation_period_drops_decayed_signal`、`test_lock_and_force`、`test_cli_locked_exit_code`、`test_nothing_to_confirm`。
+- **成交延迟**：`test_execution_delay_means_fill_at_next_close`（植入 x[t] 预测 r[t+2]：delay = 1 时 IC 显著、PASS，delay = 0 时 IC ≈ 0；植入 r[t+1] 的信号在 delay = 1 下 IC ≈ 0）、`test_prepare_shifts_candidates_by_execution_delay`、`test_execution_delay_config`、旧 run 缺省按 0（`test_old_run_*`）。合成面板构造函数 `make_panel(..., delay=1)` 把植入的信号对准 r[t+1+delay]。
+- **规则出处**：`test_lags_verified_confirmed_loading_and_validation`、`test_shipped_configs_final_lag_values_and_provenance`、`test_rule_provenance_tiers`、`test_report_availability_table_has_provenance_column`。
 - **仓位与回测**：`test_positions_*`、`test_backtest*`。
 - **可交易性筛选**：`test_high_turnover_signal_fails_tradability`（IC 显著但换手高、成本高 → DROP、不进 shortlist、`rep` 为空）、`test_gate_is_the_reason_for_the_drop`（同一份数据把 `min_net_sharpe` 设为 -1e9 后回到 shortlist）、`test_dedupe_after_screen_promotes_tradable_member`（簇内 t 最高的成员净 Sharpe 不达标时，同簇能交易的成员顶上来当代表）、`test_net_sharpe_gate_boundary_and_nonfinite`、`test_load_config_min_net_sharpe`。第 1 步的净 Sharpe 条件：`test_in_sample_net_sharpe_gate`、`test_final_verdict_boundary`、`test_load_config_is_min_net_sharpe`。
 - **IC 衰减 / 信号自相关 / 逐年命中**：`test_ic_decay_*`、`test_autocorr_and_half_life_of_random_walk_zscore`、`test_year_hit_*`。
@@ -311,6 +338,6 @@ python -m http.server -d site-out        # 本地打开 index.html
 | `runs.json` | 登记册，见上 |
 | `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`is_frac` / `obs_frac`（最新 run）、`created_at`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`oos_counts`（只统计 stage 4：`confirmed`、`consistent`、`failed`、`insufficient`、`unopened`）、`criteria`（`z_weak`、`obs_min_retention`、`min_net_sharpe`、`is_min_net_sharpe`（旧 run 无此键则缺省）、`dedupe_corr`）、`criteria_mixed`、`n_merged`（被合并掉的重复条数）、`skipped`、`runs`（纳入的 run 目录名，仅作追溯）与 `factors`（合并后的统一列表：`stage`、`stage_note`、`is_verdict`、`also_as`、`oos_opened`、净值、分段统计、公式、方向，stage 4 且样本外已打开的另有 `oos_verdict` 与 `oos_confirm`） |
 
-**净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
+**净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值用的信号是已含成交延迟的持有信号（见 3.1）；看板数据的 `criteria` 带 `execution_delay`（旧 run 缺省则不显示），资产页"净值定义"附近写"成交：信号形成后第 d 个收盘"，公式里的仓位行为 `pos[t] = ±1 × s[t−d] ÷ σ[t]`。净值点的日期取收益实现日（行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 
 **样本外何时显示。** 只有因子所在的 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值；否则不读取、不计算、不输出该 run 的任何样本外行，净值只到观察期末，页面标为"样本外未打开"。一个 run 已 confirm 不影响同一标的另一个 run。

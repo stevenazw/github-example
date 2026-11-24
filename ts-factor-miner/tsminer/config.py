@@ -62,17 +62,22 @@ VARIABLE_KINDS = {"level", "price"}
 
 @dataclass
 class LagsConfig:
-    """Availability INPUT: a signal at the close of day t may only use observations dated <= t - lag."""
+    """Availability INPUT: a signal at the close of day t may only use observations dated <= t - lag (lag in
+    target calendar rows). ``verified`` / ``confirmed`` list the rule keys (as in ``meta.lag_rule``) whose lag is
+    verified by the factor_bank document / confirmed by the researcher; any other rule is a draft."""
     chain: int                                              # futures chains ``chain:*`` and ``carry:*``
     class_: dict[str, int] = field(default_factory=dict)   # TOML key: "class"; keys "class_one/class_two"
     ticker: dict[str, int] = field(default_factory=dict)
     field_: dict[str, int] = field(default_factory=dict)   # TOML key: "field"; field name or "chain:<column>"
     curve: dict[str, int] = field(default_factory=dict)    # curve name
+    verified: list[str] = field(default_factory=list)      # rule keys verified by the documentation
+    confirmed: list[str] = field(default_factory=list)     # rule keys confirmed by the researcher
 
 
 @dataclass
 class PositionConfig:
     buffer: float = 0.5
+    execution_delay: int = 1   # target trading days between the signal (formed after the close of t) and the fill
 
 
 @dataclass
@@ -315,7 +320,7 @@ def load_config(path: str | os.PathLike) -> Config:
         raise ValueError("universe.fields must not be empty")
 
     # lags (availability input: required, no frequency defaults)
-    sec = _section(raw, "lags", {"chain", "class", "ticker", "field", "curve"}, {"chain"})
+    sec = _section(raw, "lags", {"chain", "class", "ticker", "field", "curve", "verified", "confirmed"}, {"chain"})
     _check_type(sec["chain"], (int,), "lags.chain")
     if sec["chain"] < 0:
         raise ValueError("lags.chain must be >= 0")
@@ -331,13 +336,24 @@ def load_config(path: str | os.PathLike) -> Config:
         lags_kwargs["field_"] = _int_map(sec["field"], "lags.field")
     if "curve" in sec:
         lags_kwargs["curve"] = _int_map(sec["curve"], "lags.curve")
+    for k in ("verified", "confirmed"):
+        if k in sec:
+            lags_kwargs[k] = _str_list(sec[k], f"lags.{k}")
     lags = LagsConfig(**lags_kwargs)
+    known = {"chain"} | {f"ticker:{k}" for k in lags.ticker} | {f"field:{k}" for k in lags.field_} \
+        | {f"class:{k}" for k in lags.class_} | {f"curve:{k}" for k in lags.curve}
+    for k in ("verified", "confirmed"):
+        bad = [r for r in getattr(lags, k) if r not in known]
+        if bad:
+            raise ValueError(f"lags.{k}: rule key(s) not defined in [lags]: {bad}")
 
     # position
-    sec = _section(raw, "position", {"buffer"})
-    position = _fill(PositionConfig, sec, "position", {"buffer": (int, float)})
+    sec = _section(raw, "position", {"buffer", "execution_delay"})
+    position = _fill(PositionConfig, sec, "position", {"buffer": (int, float), "execution_delay": (int,)})
     if position.buffer < 0:
         raise ValueError("position.buffer must be >= 0")
+    if position.execution_delay < 0:
+        raise ValueError("position.execution_delay must be >= 0")
 
     # signals / stats / verdict
     sec = _section(raw, "signals", {"std_window", "clip", "vol_halflife"})
@@ -356,3 +372,21 @@ def load_config(path: str | os.PathLike) -> Config:
 
     return Config(target=target, databank=databank, sample=sample, universe=universe,
                   lags=lags, position=position, signals=signals, stats=stats, verdict=verdict)
+
+
+def load_run_config(run_dir: str | os.PathLike) -> Config:
+    """Config of a finished run: ``run_dir/config.toml``, except that a run made before ``execution_delay``
+    existed (its ``run.json`` config snapshot has no such key) was mined with fills at the signal-day close, so
+    its delay is 0 rather than the current default."""
+    import json
+    from pathlib import Path
+
+    d = Path(run_dir)
+    cfg = load_config(d / "config.toml")
+    try:
+        snap = json.loads((d / "run.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return cfg
+    if "execution_delay" not in snap.get("config", {}).get("position", {}):
+        cfg.position.execution_delay = 0
+    return cfg

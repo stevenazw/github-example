@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import load_config
+from .config import load_run_config
 from .databank import Panel
 from .pipeline import _jsonable, backtest, prepare
 from .report import append_confirm
@@ -51,7 +51,7 @@ def confirm(run_dir, force_reason=None) -> dict:
     if len(short) == 0:
         return {"status": "NOTHING_TO_CONFIRM"}
 
-    cfg = load_config(d / "config.toml")
+    cfg = load_run_config(d)
     panel = Panel.load(d / "panel")
     prep = prepare(panel, cfg)
     S, y_fwd, sigma, rows = prep["S"], prep["y_fwd"], prep["sigma"], prep["rows"]

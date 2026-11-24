@@ -57,6 +57,43 @@ def _shortlist_table(df: pd.DataFrame) -> str:
     return _md_table(headers, rows)
 
 
+PROV_TEXT = {3: "已验证", 2: "研究者确认", 1: "起草待确认"}
+
+
+def rule_provenance(lag_rule, verified, confirmed) -> int:
+    """Provenance tier of a ``meta.lag_rule`` string: 3 verified, 2 researcher-confirmed, 1 draft. A combined rule
+    (``a+b``, spread legs, variable leaves) takes the weakest component; ``expr_lag`` does not take part."""
+    verified, confirmed = set(verified), set(confirmed)
+    tiers = []
+    for k in str(lag_rule).split("+"):
+        if k == "expr_lag" or not k:
+            continue
+        tiers.append(3 if k in verified else 2 if k in confirmed else 1)
+    return min(tiers) if tiers else 1
+
+
+def _provenance_lists(d: Path, snap_cfg: dict):
+    """(verified, confirmed) rule keys, read from the run's config.toml (fallback: the run.json snapshot)."""
+    try:
+        from .config import load_config
+        lg = load_config(d / "config.toml").lags
+        return list(lg.verified), list(lg.confirmed)
+    except Exception:
+        lg = snap_cfg.get("lags", {})
+        return list(lg.get("verified", [])), list(lg.get("confirmed", []))
+
+
+def _exec_text(ps) -> str:
+    """Execution rule sentence; runs made before ``execution_delay`` existed filled at the signal-day close."""
+    d = ps.get("execution_delay")
+    if d is None:
+        return ""
+    if int(d) == 0:
+        return "成交：信号在 t 日收盘形成，当日收盘成交（execution_delay = 0）。"
+    return (f"成交延迟 execution_delay = {int(d)}：信号在 t 日收盘后形成，在其后第 {int(d)} 个标的收盘成交，"
+            "新仓从成交后才开始承担收益。")
+
+
 def write_report(run_dir) -> None:
     d = Path(run_dir)
     run = json.loads((d / "run.json").read_text())
@@ -99,10 +136,14 @@ def write_report(run_dir) -> None:
 
     L += ["## 可得性输入", ""]
     if len(meta) and "lag_rule" in meta.columns:
+        ver, conf = _provenance_lists(d, cfg)
         g = meta.groupby("lag_rule").agg(lag=("lag", "max"), n=("lag", "size")).reset_index()
         g = g.sort_values(["n", "lag_rule"], ascending=[False, True])
-        L.append(_md_table(["规则键", "lag", "命中的序列数"], [[r["lag_rule"], int(r["lag"]), int(r["n"])]
-                                                            for _, r in g.iterrows()]))
+        g["tier"] = [rule_provenance(r, ver, conf) for r in g["lag_rule"]]
+        L.append(_md_table(["规则键", "lag", "出处", "命中的序列数"],
+                           [[r["lag_rule"], int(r["lag"]), PROV_TEXT[r["tier"]], int(r["n"])] for _, r in g.iterrows()]))
+        cnt = g.groupby("tier")["n"].sum()
+        L += ["", "出处汇总（序列数）：" + "，".join(f"{PROV_TEXT[t]} {int(cnt.get(t, 0))} 条" for t in (3, 2, 1)) + "。"]
     else:
         L.append("没有序列进入候选池。")
     L.append("")
@@ -114,7 +155,9 @@ def write_report(run_dir) -> None:
         L.append(f"因没有可得性规则被拒收的序列：{len(tk)} 个。" + ("前 20 个：" if len(tk) > 20 else "") + "、".join(tk[:20]))
     else:
         L.append("因没有可得性规则被拒收的序列：0 个。")
-    L += ["", "这些规则是输入，不是系统推断的结果：t 日收盘的信号只能用日期 ≤ t−lag 的观测，需研究者确认。", ""]
+    L += ["", "lag 的单位是标的交易日（日历行）：每条序列先 as-of 对齐到标的日历，再后移 lag 行，t 日收盘的信号只能用日期 ≤ t−lag 的观测。"
+              "这些规则是输入，不是系统推断的结果，需研究者确认；出处按组成规则里最弱的一档显示（起草 < 研究者确认 < 已验证），"
+              "`expr_lag` 不参与判断。", ""]
 
     L += ["## 判定标准", "",
           f"- 样本内（两个条件同时满足）：① |z| 达标：PASS：|z| ≥ {_num(zp, 2)}；WEAK_PASS：|z| ≥ {_num(zw, 2)}；"
@@ -128,7 +171,7 @@ def write_report(run_dir) -> None:
           f"- 去重：对通过可交易性筛选的候选按开发样本（样本内 + 观察期）上的 t_dev 从高到低贪心聚类，"
           f"相关系数绝对值 ≥ {_num(vd['dedupe_corr'], 2)} 归入同一代表。",
           f"- 仓位：连续比例，目标仓位 = 样本内符号 × 信号，按波动率缩放；缓冲带 buffer = {_num(ps['buffer'], 2)}，"
-          "目标与当前仓位之差超过 buffer 才调仓。",
+          "目标与当前仓位之差超过 buffer 才调仓。" + _exec_text(ps),
           "- 门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_is）：", ""]
     L.append(_md_table(["n_is", f"PASS 门槛 (z = {_num(zp, 2)}) 对应 IC", f"WEAK_PASS 门槛 (z = {_num(zw, 2)}) 对应 IC"],
                        [[n, _num(zp / np.sqrt(n), 4), _num(zw / np.sqrt(n), 4)] for n in (5000, 2000, 1000, 500)]))

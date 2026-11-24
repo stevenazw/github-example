@@ -29,40 +29,126 @@ obs_frac = 0.15
 fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: ts(ticker) 省略字段时取该 ticker 拥有的第一个
 
 [lags]
-# 可得性(availability)是【输入】, 由研究者确认, 系统不猜测、不套默认值。数值含义: t 日收盘的信号只能用日期 <= t-lag 的观测。
-# 优先级: ts / flow 叶子: [lags.ticker] 精确 ticker > [lags.field] 字段名 > [lags.class] 的 "class_one/class_two";
-#         chain 叶子: [lags.field] 里键 "chain:<column>" > chain; curve 叶子: [lags.curve] 的曲线名。
-chain = 0      # 期货连续合约: 不滞后
+# 可得性(availability)是【输入】, 不是系统推断的结果: 没有规则的序列会被拒收(no_availability_rule)。
+# 单位是【标的交易日】(标的日历的行): 每条序列先 as-of 对齐到标的日历(取日期 <= 当天的最近观测), 再向后移 lag 行,
+# 即 t 日收盘的信号只能用日期 <= t-lag 的观测。信号在 t 日收盘后形成, 在其后第 execution_delay 个标的收盘成交
+# (见 [position]), 新仓从成交后才承担收益。
+# 规则出处分三档, 由本段的 verified / confirmed 两个列表登记(元素是规则键, 格式同 meta.lag_rule):
+#   verified  = 已验证: 来自 factor_bank《Duration Trading 底层因子配方与 EOD 可用时间》(2026-11-24);
+#   confirmed = 研究者确认: 研究者口头确认, 文档未覆盖;
+#   不在两个列表里的规则 = 起草, 待确认。
+# 优先级: 一个 ticker 有多个不同滞后的字段时(如 TY1 Comdty)不写 ticker 规则, 靠字段规则。
+#   ts / flow 叶子: [lags.ticker] 精确 ticker > [lags.field] 字段名 > [lags.class] 的 "class_one/class_two";
+#   chain 叶子: [lags.field] 里键 "chain:<column>" > chain; curve 叶子: [lags.curve] 的曲线名。
+chain = 0
+verified = [
+  "field:FUND_FLOW", "field:1M_CALL_IMP_VOL_25DELTA_DFLT", "field:1M_PUT_IMP_VOL_25DELTA_DFLT",
+  "field:OPEN_INT", "curve:USD_SOFR_OIS", "ticker:CESIUSD Index",
+  "ticker:CESIG10 Index", "ticker:FDTR Index", "ticker:FDTRFTRL Index",
+  "ticker:FEDL01 Index", "ticker:FF1 Comdty", "ticker:FF2 Comdty",
+  "ticker:FF3 Comdty", "ticker:FF4 Comdty", "ticker:FF5 Comdty",
+  "ticker:FF6 Comdty", "ticker:FF7 Comdty", "ticker:FF8 Comdty",
+  "ticker:FF9 Comdty", "ticker:FF10 Comdty", "ticker:FF11 Comdty",
+  "ticker:FF12 Comdty", "ticker:FF13 Comdty", "ticker:FF14 Comdty",
+  "ticker:FF15 Comdty", "ticker:FF16 Comdty", "ticker:FF17 Comdty",
+  "ticker:FF18 Comdty", "ticker:FF19 Comdty", "ticker:FF20 Comdty",
+  "ticker:FF21 Comdty", "ticker:FF22 Comdty", "ticker:FF23 Comdty",
+  "ticker:FF24 Comdty", "ticker:SPGSAGTR Index", "ticker:SPGSALTR Index",
+  "ticker:SPGSCITR Index", "ticker:SPGSCLTR Index", "ticker:SPGSCRTR Index",
+  "ticker:SPGSENTR Index", "ticker:SPGSINTR Index", "ticker:SPGSNETR Index",
+  "ticker:SPGSPMTR Index", "ticker:SPGSRETR Index", "ticker:SPGSUETR Index",
+  "ticker:SPGSXNTR Index", "ticker:SPGSXPTR Index", "ticker:GSPRHIMO Index",
+  "ticker:GSPRHVMS Index", "ticker:GSXUCYCL Index", "ticker:GSXUDEFS Index",
+  "ticker:GSXUMFML Index", "ticker:GSXUMFMS Index",
+]
+confirmed = [
+  "chain", "class:Market_Data/Government_Bond", "class:Market_Data/Money_Market",
+  "class:Market_Data/Swap_OIS", "class:Market_Data/Commodity", "class:Market_Data/Equity",
+  "class:Market_Data/Inflation_Linked", "class:Market_Data/Credit", "class:Market_Data/MBS",
+  "class:Market_Data/FX", "class:Market_Data/VOL",
+]
 
 [lags.class]
 "Market_Data/Government_Bond" = 0
 "Market_Data/Money_Market" = 0
 "Market_Data/Swap_OIS" = 0
-"Market_Data/VOL" = 1
 "Market_Data/Commodity" = 0
 "Market_Data/Equity" = 0
 "Market_Data/Inflation_Linked" = 0
 "Market_Data/Credit" = 0
 "Market_Data/MBS" = 0
 "Market_Data/FX" = 0
+"Market_Data/VOL" = 1
 "Macro/Global" = 1
 "Macro/US" = 1
-"Positioning/CFTC_COT" = 4     # 周二数据、周五 15:30 ET 发布 -> 下周一可用
-"FED/Balance_Sheet" = 2        # 周三数据、周四 16:30 ET 发布 -> 周五可用
-"FED/Primary_Dealer" = 8       # 周三数据、下周四发布 -> 保守取 8
+"Positioning/CFTC_COT" = 4
+"FED/Balance_Sheet" = 2
+"FED/Primary_Dealer" = 8
 
 [lags.ticker]
 "NFCIINDX Index" = 6
+# —— 以下为文档已验证的逐 ticker 条目 ——
+"CESIUSD Index" = 1
+"CESIG10 Index" = 1
+"FEDL01 Index" = 1          # 文档目录记为 0, 但其证据显示纽约联储在下一营业日约 09:00 才发布; 按发布时间取 1
+"FDTR Index" = 0
+"FDTRFTRL Index" = 0
+# FF1 Comdty ... FF24 Comdty, 均为 0
+"FF1 Comdty" = 0
+"FF2 Comdty" = 0
+"FF3 Comdty" = 0
+"FF4 Comdty" = 0
+"FF5 Comdty" = 0
+"FF6 Comdty" = 0
+"FF7 Comdty" = 0
+"FF8 Comdty" = 0
+"FF9 Comdty" = 0
+"FF10 Comdty" = 0
+"FF11 Comdty" = 0
+"FF12 Comdty" = 0
+"FF13 Comdty" = 0
+"FF14 Comdty" = 0
+"FF15 Comdty" = 0
+"FF16 Comdty" = 0
+"FF17 Comdty" = 0
+"FF18 Comdty" = 0
+"FF19 Comdty" = 0
+"FF20 Comdty" = 0
+"FF21 Comdty" = 0
+"FF22 Comdty" = 0
+"FF23 Comdty" = 0
+"FF24 Comdty" = 0
+# 13 条商品总回报指数, 均为 0
+"SPGSAGTR Index" = 0
+"SPGSALTR Index" = 0
+"SPGSCITR Index" = 0
+"SPGSCLTR Index" = 0
+"SPGSCRTR Index" = 0
+"SPGSENTR Index" = 0
+"SPGSINTR Index" = 0
+"SPGSNETR Index" = 0
+"SPGSPMTR Index" = 0
+"SPGSRETR Index" = 0
+"SPGSUETR Index" = 0
+"SPGSXNTR Index" = 0
+"SPGSXPTR Index" = 0
+# 6 条高盛股票风格指数, 均为 0
+"GSPRHIMO Index" = 0
+"GSPRHVMS Index" = 0
+"GSXUCYCL Index" = 0
+"GSXUDEFS Index" = 0
+"GSXUMFML Index" = 0
+"GSXUMFMS Index" = 0
 
 [lags.field]
-"FUND_FLOW" = 1                       # ETF 资金流: 滞后 1 天(研究者确认)
+"FUND_FLOW" = 1
 "EQY_SH_OUT" = 1
 "FUND_NET_ASSET_VAL" = 1
-"1M_CALL_IMP_VOL_25DELTA_DFLT" = 1    # 隐含波动率: 滞后 1 天(研究者确认)
+"1M_CALL_IMP_VOL_25DELTA_DFLT" = 1
 "1M_PUT_IMP_VOL_25DELTA_DFLT" = 1
 "CONVENTIONAL_CTD_FORWARD_FRSK" = 1
 "VOLUME" = 0
-"OPEN_INT" = 1                        # 持仓量(futures_oi 叶子): 交易所次日公布, 起草为滞后 1 天, 待研究者确认
+"OPEN_INT" = 1
 
 [lags.curve]
 "USD_SOFR_OIS" = 0
@@ -679,6 +765,9 @@ description = "换手强度（成交量÷总持仓）"
 # 连续仓位 = sign * 信号(按波动率缩放的 y 单位); 缓冲带: 目标与当前仓位之差的绝对值 > buffer 才调仓,
 # 否则维持原仓位。buffer = 0 即每天跟随目标; 慢信号不必每天调仓。
 buffer = 0.5
+# 成交延迟: 信号在 t 日收盘后形成, 在其后第 1 个标的收盘成交, 新仓从成交后开始承担收益(与生产口径一致)。
+# 即 t 日的信号决定 t+1 日收盘起的仓位, 承担 t+1 -> t+2 的收益。设为 0 即信号当日收盘成交。
+execution_delay = 1
 
 [signals]
 std_window = 252

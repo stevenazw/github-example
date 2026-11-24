@@ -455,7 +455,7 @@ def test_ty_vars_config_loads():
     assert len(set(ids)) == 63 and {"slope_2s10s", "ff_3m", "ty_oi"} <= set(ids)
     assert cfg.lags.field_["FUND_FLOW"] == 1 and cfg.lags.field_["OPEN_INT"] == 1
     assert "chain:oi_active" not in cfg.lags.field_
-    assert cfg.lags.curve == {"USD_SOFR_OIS": 0} and cfg.lags.ticker == {"NFCIINDX Index": 6}
+    assert cfg.lags.curve == {"USD_SOFR_OIS": 0} and cfg.lags.ticker["NFCIINDX Index"] == 6
     base = load_config(CONFIGS / "ty.toml")
     assert cfg.lags.class_ == base.lags.class_ and cfg.target == base.target and cfg.verdict == base.verdict
     assert cfg.signals == base.signals and cfg.stats == base.stats and cfg.sample == base.sample
@@ -465,8 +465,69 @@ def test_ty_vars_config_loads():
 def test_old_configs_have_no_variables_and_unchanged_lags(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     assert cfg.universe.variable == [] and cfg.universe.helper == []
-    assert cfg.lags.field_ == {} and cfg.lags.curve == {}
+    # only the documentation-verified fields / curve are present (rules in place for later candidates)
+    assert cfg.lags.field_ == {"FUND_FLOW": 1, "1M_CALL_IMP_VOL_25DELTA_DFLT": 1, "1M_PUT_IMP_VOL_25DELTA_DFLT": 1,
+                               "OPEN_INT": 1}
+    assert cfg.lags.curve == {"USD_SOFR_OIS": 0}
     assert len(cfg.universe.select) > 0 and len(cfg.universe.spread) == 3
+
+
+FF = [f"FF{i} Comdty" for i in range(1, 25)]
+COMMODITY = [f"{c} Index" for c in ("SPGSAGTR SPGSALTR SPGSCITR SPGSCLTR SPGSCRTR SPGSENTR SPGSINTR SPGSNETR "
+                                    "SPGSPMTR SPGSRETR SPGSUETR SPGSXNTR SPGSXPTR").split()]
+GS = [f"{c} Index" for c in "GSPRHIMO GSPRHVMS GSXUCYCL GSXUDEFS GSXUMFML GSXUMFMS".split()]
+
+
+@pytest.mark.parametrize("name", ["ty", "eurusd", "ty_vars"])
+def test_shipped_configs_final_lag_values_and_provenance(name):
+    cfg = load_config(CONFIGS / f"{name}.toml")
+    lg = cfg.lags
+    assert lg.chain == 0
+    assert lg.class_ == {
+        "Market_Data/Government_Bond": 0, "Market_Data/Money_Market": 0, "Market_Data/Swap_OIS": 0,
+        "Market_Data/Commodity": 0, "Market_Data/Equity": 0, "Market_Data/Inflation_Linked": 0,
+        "Market_Data/Credit": 0, "Market_Data/MBS": 0, "Market_Data/FX": 0, "Market_Data/VOL": 1,
+        "Macro/Global": 1, "Macro/US": 1, "Positioning/CFTC_COT": 4, "FED/Balance_Sheet": 2,
+        "FED/Primary_Dealer": 8}
+    t = lg.ticker
+    assert t["NFCIINDX Index"] == 6 and t["CESIUSD Index"] == 1 and t["CESIG10 Index"] == 1
+    assert t["FEDL01 Index"] == 1 and t["FDTR Index"] == 0 and t["FDTRFTRL Index"] == 0
+    for tk in FF + COMMODITY + GS:
+        assert t[tk] == 0, tk
+    assert t["FF1 Comdty"] == t["FF13 Comdty"] == t["FF24 Comdty"] == 0
+    assert t["SPGSINTR Index"] == 0 and t["GSPRHVMS Index"] == 0
+    assert len(t) == 49
+    assert lg.field_["FUND_FLOW"] == 1 and lg.field_["OPEN_INT"] == 1 and lg.curve == {"USD_SOFR_OIS": 0}
+    assert lg.field_["1M_CALL_IMP_VOL_25DELTA_DFLT"] == lg.field_["1M_PUT_IMP_VOL_25DELTA_DFLT"] == 1
+    # provenance lists: every key exists, researcher-confirmed = chain + the ten Market_Data classes
+    ver = set(lg.verified)
+    assert {"field:FUND_FLOW", "field:OPEN_INT", "field:1M_CALL_IMP_VOL_25DELTA_DFLT",
+            "field:1M_PUT_IMP_VOL_25DELTA_DFLT", "curve:USD_SOFR_OIS", "ticker:CESIUSD Index",
+            "ticker:CESIG10 Index", "ticker:FDTR Index", "ticker:FDTRFTRL Index", "ticker:FEDL01 Index"} <= ver
+    assert {f"ticker:{x}" for x in FF + COMMODITY + GS} <= ver
+    assert set(lg.confirmed) == {"chain"} | {f"class:{k}" for k in lg.class_ if k.startswith("Market_Data/")}
+    assert len(lg.confirmed) == 11 and not (ver & set(lg.confirmed))
+    drafts = {"class:Macro/Global", "class:Macro/US", "class:Positioning/CFTC_COT", "class:FED/Balance_Sheet",
+              "class:FED/Primary_Dealer", "ticker:NFCIINDX Index"}
+    assert not (drafts & (ver | set(lg.confirmed)))
+    if name == "ty_vars":
+        assert not ({"field:EQY_SH_OUT", "field:FUND_NET_ASSET_VAL", "field:CONVENTIONAL_CTD_FORWARD_FRSK",
+                     "field:VOLUME"} & (ver | set(lg.confirmed)))
+    assert json.loads(json.dumps(cfg.to_dict()))["lags"]["verified"] == lg.verified
+
+
+def test_lags_verified_confirmed_loading_and_validation(tmp_path):
+    base = MINIMAL.split("[lags]")[0]
+    ok = load_config(_write(tmp_path, base + (
+        '[lags]\nchain = 1\nverified = ["field:F", "ticker:T", "curve:C"]\nconfirmed = ["chain", "class:A/B"]\n'
+        '[lags.class]\n"A/B" = 1\n[lags.ticker]\n"T" = 0\n[lags.field]\n"F" = 1\n[lags.curve]\n"C" = 0\n')))
+    assert ok.lags.verified == ["field:F", "ticker:T", "curve:C"] and ok.lags.confirmed == ["chain", "class:A/B"]
+    assert load_config(_write(tmp_path, MINIMAL)).lags.verified == []
+    assert load_config(_write(tmp_path, MINIMAL)).lags.confirmed == []
+    for bad in ('verified = ["ticker:NOPE"]', 'confirmed = ["class:X/Y"]', 'verified = ["field:F"]',
+                'confirmed = ["curve:C"]', 'verified = ["NFCIINDX Index"]', 'verified = "chain"', "verified = [1]"):
+        with pytest.raises(ValueError):
+            load_config(_write(tmp_path, base + f"[lags]\nchain = 1\n{bad}\n[lags.ticker]\n\"T\" = 0\n"))
 
 
 def test_resolve_lag_rule_field_priority():
@@ -496,6 +557,12 @@ def test_build_panel_ty_vars_integration():
     r = panel.meta.loc["var:slope_2s10s"]
     assert r["field"] == defs["slope_2s10s"]["expr"] and r["description"] == defs["slope_2s10s"]["description"]
     assert r["lag_rule"] == "class:Market_Data/Government_Bond" and r["lag"] == 0 and r["freq"] == "D"
+    assert len(panel.X.columns) == 63
+    # ticker rule beats the class rule; a formula of two FF legs is made of two ticker rules
+    cesi = panel.meta.loc["var:cesi_us"]
+    assert cesi["lag_rule"] == "ticker:CESIUSD Index" and cesi["lag"] == 1
+    ff = panel.meta.loc["var:ff_3m"]
+    assert ff["lag_rule"] == "ticker:FF1 Comdty+ticker:FF4 Comdty" and ff["lag"] == 0
 
     sys.path.insert(0, cfg.databank.toolkit_dir)
     from data_query import DataQuery
@@ -530,7 +597,10 @@ def test_build_panel_variable_without_rule_is_excluded_with_leaf_named():
     cfg0, db = _db_cfg()
     cfg = load_config(CONFIGS / "ty_vars.toml")
     class_ = {k: v for k, v in cfg.lags.class_.items() if k != "Market_Data/Money_Market"}
-    cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_))
+    # the FF / policy-rate leaves now have ticker rules (which beat the class rule): drop those as well
+    ticker = {k: v for k, v in cfg.lags.ticker.items() if not k.startswith(("FF", "FDTR", "FEDL01"))}
+    assert len(ticker) < len(cfg.lags.ticker)
+    cfg2 = dataclasses.replace(cfg, lags=dataclasses.replace(cfg.lags, class_=class_, ticker=ticker))
     panel = build_panel(cfg2)
     rej = panel.excluded[panel.excluded["reason"].str.startswith("no_availability_rule")]
     assert "var:ff_3m" in set(rej["ticker"]) and "var:policy_path" in set(rej["ticker"])

@@ -55,10 +55,13 @@ OLD_FLAG = "cost" + "_negative"          # removed: replaced by the min_net_shar
 HIGH_COST = 0.001                        # sig|chg_1: gross Sharpe ~2.3, net ~ -0.9 at this cost
 
 
-def make_panel(seed, plant=False, short=False, dup=False, n=N, ic_sig=None, flip_at=None):
+def make_panel(seed, plant=False, short=False, dup=False, n=N, ic_sig=None, flip_at=None, delay=1):
     """Synthetic panel. plant: long series 'sig' (IC 0.15, or ``ic_sig``: scalar / per-row array); short: series
     'short' observed only in the last SHORT_LEN rows (IC 0.2); dup: 'sig2', a near copy of 'sig'.
-    flip_at: calendar position from which the 'sig' relation is reversed (IC -> -IC)."""
+    flip_at: calendar position from which the 'sig' relation is reversed (IC -> -IC).
+    delay: the execution delay the planted signals are built for: x[t] predicts r[t+1+delay], so that after the
+    pipeline shifts the signal down by ``execution_delay`` rows (default 1) the held signal at row t predicts
+    r[t+1]. ``delay=1`` matches the default config; ``delay=0`` is the old "fill at the signal-day close" world."""
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2010-01-01", periods=n)
     d = rng.normal(0, 1, (n, N_SERIES + 1))
@@ -74,7 +77,9 @@ def make_panel(seed, plant=False, short=False, dup=False, n=N, ic_sig=None, flip
     ics = 0.2 if short else 0.0
     if plant or short:
         sig = ic0[:-1] * d[:-1, 0] / d[:, 0].std() + ics * d[:-1, N_SERIES] / d[:, N_SERIES].std()
-        r[1:] = 0.005 * sig + np.sqrt(1 - ic0[:-1] ** 2 - ics**2) * noise[1:]
+        r[1:] = 0.005 * sig + np.sqrt(1 - ic0[:-1] ** 2 - ics**2) * noise[1:]      # x[t] -> r[t+1]
+        if delay:                                   # the target lags by `delay` rows: x[t] -> r[t+1+delay]; the held
+            r = np.r_[noise[:delay], r[:n - delay]]  # (shifted) signal vs y_fwd is the old relationship exactly
     X = pd.DataFrame(np.cumsum(d[:, :N_SERIES], axis=0), index=idx, columns=[f"s{i}" for i in range(N_SERIES)])
     if plant:
         X = X.rename(columns={"s0": "sig"})
@@ -190,6 +195,136 @@ def test_prepare_shapes(cfg, planted_panel):
     assert prep["is_mask"].shape == prep["obs_mask"].shape == prep["oos_mask"].shape == shape
     assert prep["e1"].shape == prep["e2"].shape == (shape[1],)
     assert set(prep) == {"S", "cand_meta", "y_fwd", "sigma", "rows", "is_mask", "obs_mask", "oos_mask", "e1", "e2"}
+
+
+def _cfg_delay(tmp_path, d):
+    p = tmp_path / f"d{d}.toml"
+    p.write_text(TOML + f"\n[position]\nexecution_delay = {d}\n")
+    return p, load_config(p)
+
+
+def _is_ic(panel, cfg, cid="sig|chg_1"):
+    """Signed in-sample IC of one candidate (corr of the held signal with y_fwd on its own IS rows)."""
+    prep = prepare(panel, cfg)
+    j = list(prep["S"].columns).index(cid)
+    rows = prep["rows"]
+    m = prep["is_mask"][:, j]
+    s = prep["S"].to_numpy(dtype=float)[rows][m, j]
+    y = prep["y_fwd"].to_numpy(dtype=float)[rows][m]
+    return float(np.corrcoef(s, y)[0, 1])
+
+
+def test_execution_delay_means_fill_at_next_close(tmp_path):
+    """x[t] predicts r[t+2]: only a fill one close later (execution_delay = 1) can harvest it; with the fill at the
+    signal-day close (0) the held signal is 1 day too early. A signal that predicts r[t+1] is unusable at delay 1."""
+    p0, cfg0 = _cfg_delay(tmp_path, 0)
+    p1, cfg1 = _cfg_delay(tmp_path, 1)
+    late = make_panel(61, plant=True, delay=1)          # x[t] -> r[t+2]
+    early = make_panel(61, plant=True, delay=0)         # x[t] -> r[t+1]
+    ic_late_1, ic_late_0 = _is_ic(late, cfg1), _is_ic(late, cfg0)
+    ic_early_1, ic_early_0 = _is_ic(early, cfg1), _is_ic(early, cfg0)
+    print("IC x->r[t+2]: delay=1", round(ic_late_1, 4), "delay=0", round(ic_late_0, 4),
+          "| IC x->r[t+1]: delay=1", round(ic_early_1, 4), "delay=0", round(ic_early_0, 4))
+    assert ic_late_1 > 0.10 and abs(ic_late_0) < 0.05
+    assert ic_early_0 > 0.10 and abs(ic_early_1) < 0.05
+    mine(cfg1, tmp_path / "late1", panel=late, config_path=p1)
+    mine(cfg0, tmp_path / "late0", panel=late, config_path=p0)
+    c1 = pd.read_csv(tmp_path / "late1" / "candidates.csv").set_index("id").loc["sig|chg_1"]
+    c0 = pd.read_csv(tmp_path / "late0" / "candidates.csv").set_index("id").loc["sig|chg_1"]
+    assert c1["verdict"] == "PASS" and c1["z"] > 5 and abs(c0["z"]) < 2.0 and c0["verdict"] == "REJECT"
+    mine(cfg1, tmp_path / "early1", panel=early, config_path=p1)
+    e1 = pd.read_csv(tmp_path / "early1" / "candidates.csv").set_index("id").loc["sig|chg_1"]
+    assert e1["verdict"] == "REJECT" and abs(e1["z"]) < 2.0
+
+
+@pytest.mark.parametrize("d", [0, 1, 3])
+def test_prepare_shifts_candidates_by_execution_delay(tmp_path, planted_panel, d):
+    from tsminer.transforms import build_candidates
+    _, cfg_d = _cfg_delay(tmp_path, d)
+    S0, _ = build_candidates(planted_panel.X, planted_panel.meta, cfg_d.signals.std_window, cfg_d.signals.clip)
+    prep = prepare(planted_panel, cfg_d)
+    pd.testing.assert_frame_equal(prep["S"], S0.shift(d))
+    if d:
+        assert prep["S"].iloc[:d].isna().all().all()
+    np.testing.assert_array_equal(prep["S"].to_numpy()[d:], S0.to_numpy()[:len(S0) - d])
+    first = S0.apply(lambda c: c.first_valid_index())
+    first_held = prep["S"].apply(lambda c: c.first_valid_index())
+    cal = planted_panel.target.index
+    for c in S0.columns[:5]:
+        assert cal.get_loc(first_held[c]) == cal.get_loc(first[c]) + d
+
+
+def test_execution_delay_config(tmp_path):
+    base = TOML
+    assert load_config(_write_cfg(tmp_path, base)).position.execution_delay == 1
+    assert load_config(_write_cfg(tmp_path, base + "\n[position]\nbuffer = 0.2\n")).position.execution_delay == 1
+    for v in (0, 1, 5):
+        c = load_config(_write_cfg(tmp_path, base + f"\n[position]\nexecution_delay = {v}\n"))
+        assert c.position.execution_delay == v and c.to_dict()["position"]["execution_delay"] == v
+    for bad in ("-1", "1.0", "0.5", "true", '"1"', "[1]"):
+        with pytest.raises(ValueError):
+            load_config(_write_cfg(tmp_path, base + f"\n[position]\nexecution_delay = {bad}\n"))
+    for name in ("ty", "eurusd", "ty_vars"):
+        assert load_config(ROOT / "configs" / f"{name}.toml").position.execution_delay == 1
+        assert "execution_delay = 1" in (ROOT / "configs" / f"{name}.toml").read_text(encoding="utf-8")
+
+
+def test_old_run_without_execution_delay_counts_as_zero(tmp_path, planted_run):
+    from tsminer.config import load_run_config
+    assert load_run_config(planted_run).position.execution_delay == 1
+    old = tmp_path / "old"
+    shutil.copytree(planted_run, old)
+    rj = json.loads((old / "run.json").read_text())
+    del rj["config"]["position"]["execution_delay"]
+    (old / "run.json").write_text(json.dumps(rj))
+    assert load_run_config(old).position.execution_delay == 0
+    assert "成交延迟" not in "".join(_exec_lines(old))
+
+
+def _exec_lines(d):
+    from tsminer.report import write_report
+    write_report(d)
+    return [l for l in (d / "report.md").read_text(encoding="utf-8").splitlines() if "成交" in l]
+
+
+def test_rule_provenance_tiers():
+    from tsminer.report import PROV_TEXT, rule_provenance
+    ver, conf = ["field:F", "ticker:T"], ["chain", "class:A/B"]
+    assert rule_provenance("field:F", ver, conf) == 3 and rule_provenance("chain", ver, conf) == 2
+    assert rule_provenance("class:X/Y", ver, conf) == 1
+    assert rule_provenance("field:F+class:X/Y", ver, conf) == 1                  # verified + draft -> draft
+    assert rule_provenance("field:F+class:A/B", ver, conf) == 2                  # verified + confirmed -> confirmed
+    assert rule_provenance("field:F+ticker:T", ver, conf) == 3
+    assert rule_provenance("field:F+expr_lag", ver, conf) == 3                   # expr_lag takes no part
+    assert rule_provenance("class:X/Y+expr_lag", ver, conf) == 1
+    assert [PROV_TEXT[k] for k in (3, 2, 1)] == ["已验证", "研究者确认", "起草待确认"]
+
+
+def test_report_availability_table_has_provenance_column(tmp_path):
+    txt = TOML.replace("chain = 1", 'chain = 1\nverified = ["field:F"]\nconfirmed = ["chain"]') + (
+        '\n[lags.field]\n"F" = 1\n[lags.class]\n"Rates/Z" = 2\n')
+    p = _write_cfg(tmp_path, txt)
+    cfg_ = load_config(p)
+    panel = make_panel(5)
+    panel.meta["lag_rule"] = (["chain", "field:F", "class:Rates/Z", "field:F+class:Rates/Z",
+                               "field:F+class:Rates/Z+expr_lag"] * 10)[:panel.meta.shape[0]]
+    mine(cfg_, tmp_path / "r", panel=panel, config_path=p)
+    sec = (tmp_path / "r" / "report.md").read_text(encoding="utf-8").split("## 可得性输入")[1].split("## 判定标准")[0]
+    assert "| 规则键 | lag | 出处 | 命中的序列数 |" in sec
+    rows = {l.split("|")[1].strip(): l.split("|")[3].strip() for l in sec.splitlines()
+            if l.startswith("| ") and "规则键" not in l}
+    assert rows == {"chain": "研究者确认", "field:F": "已验证", "class:Rates/Z": "起草待确认",
+                    "field:F+class:Rates/Z": "起草待确认", "field:F+class:Rates/Z+expr_lag": "起草待确认"}
+    assert "出处汇总" in sec and "已验证 " in sec and "研究者确认 " in sec and "起草待确认 " in sec
+
+
+def test_report_states_execution_delay(planted_run, tmp_path):
+    rep = (planted_run / "report.md").read_text(encoding="utf-8")
+    assert "execution_delay = 1" in rep and "第 1 个标的收盘成交" in rep
+    d0 = tmp_path / "r0"
+    p, cfg0 = _cfg_delay(tmp_path, 0)
+    mine(cfg0, d0, panel=make_panel(3, plant=True, delay=0), config_path=p)
+    assert "当日收盘成交" in (d0 / "report.md").read_text(encoding="utf-8")
 
 
 def _cut_panel(panel, cfg, cid, seed, which):

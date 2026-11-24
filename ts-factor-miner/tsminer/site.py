@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import load_config
+from .config import load_run_config
 from .databank import Panel
 from .confirm import OOS_MIN_OBS, oos_verdict
 from .pipeline import _corr, _jsonable, dedupe, positions, prepare
@@ -98,9 +98,14 @@ def formula_text(meta_row, transform: str, cfg, sign: float = 1.0) -> list[str]:
     else:
         lines.append(f"s[t] = {transform}(x)")
     sg = "+1" if sign > 0 else "−1"
-    lines.append(f"pos[t] = {sg} × s[t] ÷ σ[t]")
-    lines.append(f"σ[t]：标的日收益的 EWMA 波动率（半衰期 {int(cfg.signals.vol_halflife)} 日）；"
-                 f"目标仓位变化超过缓冲带 {_g(cfg.position.buffer)} 才调仓")
+    d = int(getattr(cfg.position, "execution_delay", 0) or 0)     # runs from before execution_delay: fill at t
+    s_t = f"s[t−{d}]" if d > 0 else "s[t]"
+    lines.append(f"pos[t] = {sg} × {s_t} ÷ σ[t]")
+    note = (f"σ[t]：标的日收益的 EWMA 波动率（半衰期 {int(cfg.signals.vol_halflife)} 日）；"
+            f"目标仓位变化超过缓冲带 {_g(cfg.position.buffer)} 才调仓")
+    if d > 0:
+        note += f"；信号形成后第 {d} 个收盘成交"
+    lines.append(note)
     return lines
 
 
@@ -281,6 +286,9 @@ def _criteria_of(run: dict) -> dict:
         c["is_min_net_sharpe"] = vd["is_min_net_sharpe"]
     if "dedupe_corr" in vd:
         c["dedupe_corr"] = vd["dedupe_corr"]
+    ps = run["config"].get("position", {})
+    if "execution_delay" in ps:                      # runs made before the execution delay lack it: nothing shown
+        c["execution_delay"] = ps["execution_delay"]
     return c
 
 
@@ -289,7 +297,7 @@ def _load_run(run_dir, idx: int) -> dict:
     the existence of ``confirm.json`` alone and only then are OOS rows used."""
     d = Path(run_dir)
     run = _read_run(d)
-    cfg = load_config(d / "config.toml")
+    cfg = load_run_config(d)                         # a run without execution_delay in run.json counts as 0
     panel = Panel.load(d / "panel")
     opened = (d / "confirm.json").exists()
     cand = pd.read_csv(d / "candidates.csv")
@@ -792,6 +800,11 @@ function criteriaEl(a) {
   return dl('入选条件', [txt], 'wide');
 }
 
+function execText(c) {
+  if (!c || c.execution_delay == null) return '';
+  return c.execution_delay > 0 ? '；成交：信号形成后第 ' + c.execution_delay + ' 个收盘' : '；成交：信号形成当日收盘';
+}
+
 function stageDesc(k, c) {
   if (k === 4) return '过了样本内门槛、观察期保留' + (c.min_net_sharpe != null ? '、扣成本后净 Sharpe 达标' : '') + '，并在去重后作为代表留下。只有这一层的因子有样本外结论。';
   if (k === 3) return '通过了前几层，但与另一个代表高度相关' + (c.dedupe_corr != null ? '（相关 ≥ ' + c.dedupe_corr + '）' : '') + '，去重时并入该代表。';
@@ -832,7 +845,7 @@ function renderAsset(a) {
     dl('数据截止日', [h('span', {class: 'mono', text: a.sample_end})]),
     dl('标的样本', [h('span', {class: 'mono', text: a.sample_start + ' 至 ' + a.sample_end})]),
     dl('数据库发布', [h('span', {class: 'mono', text: (a.db_published_at || '–').slice(0, 10)})]),
-    dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%']),
+    dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%' + execText(a.criteria)]),
     dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < a.factors.length)])
   ]));
   var info = [criteriaEl(a),
