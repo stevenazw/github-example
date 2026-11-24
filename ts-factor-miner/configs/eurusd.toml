@@ -22,7 +22,9 @@ obs_frac = 0.15
 fields = ["PX_LAST", "CFTC_CONTRACTS"]   # 字段优先级: 每个 ticker 取它拥有的第一个
 chains = ["TY","TU","FV","US","RX","OE","DU","G","OAT","IK"]
 carry_chains = []
-exclude_tickers = []
+# USYC2Y10 Index: 2000-2004 年的日期标注可疑 (日变化与两天后的 TY 收益相关 0.19), 先剔除;
+# 2s10s 由 ty_vars.toml 里的 slope_2s10s (10Y - 2Y 自行相减) 覆盖。
+exclude_tickers = ["USYC2Y10 Index"]
 
 [[universe.select]]
 class_two = "FX"
