@@ -2,12 +2,12 @@
 import numpy as np
 import pandas as pd
 
-TRANSFORM_NAMES = ("chg_1", "chg_5", "chg_20", "chg_60", "z_60", "z_252")
+TRANSFORM_NAMES = ("chg_1", "chg_5", "chg_20", "chg_60", "chg_252", "z_60", "z_252")
 
 _ALLOWED = {
     "D": TRANSFORM_NAMES,
-    "W": ("chg_5", "chg_20", "chg_60", "z_252"),
-    "M": ("chg_20", "chg_60", "z_252"),
+    "W": ("chg_5", "chg_20", "chg_60", "chg_252", "z_252"),
+    "M": ("chg_20", "chg_60", "chg_252", "z_252"),
 }
 
 
@@ -26,6 +26,14 @@ def _raw_change(x, k, kind):
     return x - x.shift(k)
 
 
+def chg_std_window(k, std_window=252):
+    """Window of the rolling std that standardizes a k-day change: at least 3 non-overlapping k-day spans.
+
+    Adjacent k-day changes overlap heavily, so a window shorter than ~3k gives an unstable std.
+    """
+    return max(int(std_window), 3 * int(k))
+
+
 def _finish(z, clip):
     z = z.where(np.isfinite(z))
     return z.clip(-clip, clip)
@@ -41,7 +49,8 @@ def make_signal(x, name, kind, std_window=252, clip=4.0):
     k = int(num)
     if prefix == "chg":
         d = _raw_change(x, k, kind)
-        sd = d.rolling(std_window, min_periods=std_window // 2).std()
+        w = chg_std_window(k, std_window)
+        sd = d.rolling(w, min_periods=w // 2).std()
         out = d / sd.where(sd > 0)
     else:
         r = x.rolling(k, min_periods=k)

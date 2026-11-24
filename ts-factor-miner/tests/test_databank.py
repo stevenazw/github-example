@@ -240,11 +240,11 @@ def test_position_and_verdict_new_keys(tmp_path):
 
 def test_verdict_fields(tmp_path):
     v = load_config(_write(tmp_path, MINIMAL)).verdict
-    assert (v.z_pass, v.z_weak, v.dedupe_corr, v.extra_lag_t_min) == (2.5, 2.0, 0.7, 2.0)
+    assert (v.z_pass, v.z_weak, v.dedupe_corr, v.extra_lag_t_min) == (2.5, 1.5, 0.7, 2.0)
     v = load_config(_write(tmp_path, MINIMAL + '\n[verdict]\nz_pass = 3\nz_weak = 1.5\n')).verdict
     assert (v.z_pass, v.z_weak) == (3, 1.5)
     for bad in ('mode = "per_factor"', 'fwer_alpha = 0.05', 'fdr_q = 0.1', 'z_pass = 2.0\nz_weak = 2.0',
-                'z_pass = 1.5\nz_weak = 2.0', 'z_weak = 0', 'z_weak = -1', 'z_pass = 2.0', 'z_pass = "x"'):
+                'z_pass = 1.5\nz_weak = 2.0', 'z_weak = 0', 'z_weak = -1', 'z_pass = 1.5', 'z_pass = "x"'):
         with pytest.raises(ValueError):
             load_config(_write(tmp_path, MINIMAL + f"\n[verdict]\n{bad}\n"))
 
@@ -253,7 +253,7 @@ def test_verdict_fields(tmp_path):
 def test_shipped_configs_verdict_fields(name):
     cfg = load_config(CONFIGS / f"{name}.toml")
     v = cfg.verdict
-    assert (v.z_pass, v.z_weak) == (2.5, 2.0)
+    assert (v.z_pass, v.z_weak) == (2.5, 1.5)
     assert cfg.stats.min_obs == 250
 
 

@@ -16,7 +16,7 @@ from tsminer.confirm import confirm
 from tsminer.pipeline import mine, prepare
 from tsminer.site import (SEG_NAMES, build_asset_data, build_site, direction_text, downsample_idx, factor_nav,
                           choose_keeper, factor_stage, flag_texts, formula_text, group_same_factors, is_same_factor, slugify,
-                          stage_note)
+                          stage_note, transform_label)
 from tsminer.databank import Panel
 
 from test_pipeline import HIGH_COST, TOML, _cut_panel, make_panel
@@ -28,7 +28,7 @@ ALLOWED_HOSTS = {"cdnjs.cloudflare.com", "cdn.jsdelivr.net", "unpkg.com", "fonts
 @pytest.fixture(scope="module")
 def cfg_path(tmp_path_factory):
     p = tmp_path_factory.mktemp("sitecfg") / "test.toml"
-    p.write_text(TOML)
+    p.write_text(TOML + "\n[verdict]\nz_weak = 2.0\n")      # pin the pre-1.5 bar: the fixtures' funnel stays as designed
     return p
 
 
@@ -221,6 +221,15 @@ def test_formula_price_and_level(cfg):
     assert "ln(x[t] / x[t−60])" in t and "USGG2YR Index" in t and "滞后 1 日可得" in t
     t = "\n".join(formula_text(_meta(kind="level"), "chg_5", cfg, 1.0))
     assert "ln(" not in t and "x[t] − x[t−5]" in t
+
+
+def test_formula_chg_std_window_follows_k(cfg):
+    t = "\n".join(formula_text(_meta(), "chg_252", cfg, 1.0))
+    assert "ln(x[t] / x[t−252])" in t and "std_756(r)" in t and "std_252" not in t
+    t = "\n".join(formula_text(_meta(kind="level"), "chg_252", cfg, 1.0))
+    assert "std_756(d)" in t
+    assert "std_252(r)" in "\n".join(formula_text(_meta(), "chg_60", cfg, 1.0))
+    assert transform_label("chg_252") == "252 日变化"
 
 
 def test_formula_z_and_position_sign(cfg):

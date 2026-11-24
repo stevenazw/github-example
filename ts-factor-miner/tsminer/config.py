@@ -99,7 +99,7 @@ class StatsConfig:
 @dataclass
 class VerdictConfig:
     z_pass: float = 2.5
-    z_weak: float = 2.0
+    z_weak: float = 1.5
     dedupe_corr: float = 0.7
     extra_lag_t_min: float = 2.0
     obs_min_retention: float = 0.5

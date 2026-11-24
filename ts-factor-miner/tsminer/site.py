@@ -19,6 +19,7 @@ from .databank import Panel
 from .confirm import OOS_MIN_OBS, oos_verdict
 from .pipeline import _corr, _jsonable, dedupe, positions, prepare
 from .stats import hac_t, norm_sf
+from .transforms import chg_std_window
 
 TARGET_VOL = 0.10          # in-sample annualised vol the net value is scaled to
 MAX_POINTS = 1500
@@ -87,6 +88,7 @@ def formula_text(meta_row, transform: str, cfg, sign: float = 1.0) -> list[str]:
     prefix, _, num = str(transform).partition("_")
     clip, win = _g(cfg.signals.clip), int(cfg.signals.std_window)
     if prefix == "chg":
+        win = chg_std_window(int(num), win)
         if kind == "price":
             lines.append(f"r[t] = ln(x[t] / x[t−{num}])")
             lines.append(f"s[t] = clip(r[t] / std_{win}(r), ±{clip})")

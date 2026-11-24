@@ -230,13 +230,15 @@ seed = 20261122
 [verdict]
 # 每个候选都是独立的单因子检验:
 #   z = HAC t ÷ 该候选自身循环平移零分布的标准差, 只用该候选自己的样本内(IS)行。
-#   |z| >= z_pass 为 PASS; z_weak <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT。
+#   |z| >= z_pass(2.5) 为 PASS; z_weak(1.5) <= |z| < z_pass 为 WEAK_PASS; 其余为 REJECT; PASS 与 WEAK_PASS 都进入后续筛选。
+#   z_weak 取 1.5 的依据: 第 1 步之后还有样本内净 Sharpe、观察期、可交易、样本外四道筛选,
+#   第 1 步适度放宽以减少对真实弱因子的漏检 (研究者 2026-11-24 决定)。
 #   门槛不随样本长度变: 同样的 z 在短样本上对应更高的 IC (IC ≈ z ÷ sqrt(n_is))。
 # 通过门槛的候选进入观察期(OBS)筛选, 未被淘汰的再按开发样本净 Sharpe(min_net_sharpe)筛选可交易性,
 # 通过的再按相关性去重, 代表组成 shortlist;
 # 样本外(OOS)由 confirm 确认(只打开一次, 不据此再调整)。
 z_pass = 2.5
-z_weak = 2.0
+z_weak = 1.5
 dedupe_corr = 0.7        # 去重: 开发样本(IS+OBS)共同行上信号相关系数绝对值 >= 此值归入同一代表
 extra_lag_t_min = 2.0    # xlag_weak 提示: 信号再多滞后一天后 |t| 低于此值(或变号)
 obs_min_retention = 0.5  # 观察期保留条件: 按样本内符号的观察期 IC ÷ |样本内 IC| >= 此值; confirm 的 CONSISTENT 也用它

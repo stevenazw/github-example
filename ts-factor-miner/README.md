@@ -19,9 +19,9 @@
 
 - **三段切分，各有用途。** IS 用于单因子检验与过门槛；观察期可以用来淘汰和挑选；样本外只看一次，不得据此再做任何调整。
 - **可得性是进入系统前给定的输入。** 系统不猜测、不套默认值：配置的 `[lags]` 里没有规则的序列被拒收（`no_availability_rule`）并在报告里列出。
-- **逐候选的单因子检验。** 每个候选都是一次独立检验，没有跨候选的校正或组合。门槛（|z| ≥ 2.5 为 PASS，2.0–2.5 为 WEAK_PASS，< 2 为 REJECT）事先固定。
+- **逐候选的单因子检验。** 每个候选都是一次独立检验，没有跨候选的校正或组合。门槛（|z| ≥ 2.5 为 PASS，1.5–2.5 为 WEAK_PASS，< 1.5 为 REJECT）事先固定。
 - **短历史候选在自身有效数据内检验并各自切分。** 候选序列的历史可能比标的短（例如标的 TY 从 1999 年开始，某序列 2019 年才有）。三段按这个候选自己的有效行切分，而不是按标的日期一刀切。
-- **变换集合小而固定。** 日频 6 个、周频 4 个，不按变量类型区分，不做参数网格，不做公式搜索。
+- **变换集合小而固定。** 日频 7 个、周频 5 个，不按变量类型区分，不做参数网格，不做公式搜索。
 - **仓位用连续比例，并考虑 IC 衰减。** 报告 IC 衰减与信号自相关；慢信号不必每天调仓，用缓冲带控制换手。
 - **防前视是数据层的职责。** 所有序列先 as-of 对齐到标的日历，再按可得性滞后；信号只用因果变换；成交在信号形成后第 `execution_delay` 个标的收盘（见 3.1）。
 - **逐候选隔离。** 候选 j 在 `mine` 中的任何输出都不依赖它自己 OOS 行（行号 ≥ `e2[j]`）的数据取值；IS 阶段的统计量（t、null_sd、z、flags 中的 half_flip / xlag_weak）不依赖行号 ≥ `e1[j]` 的数据取值。`confirm` 是唯一打开 OOS 的入口，用 lock 文件保证只看一次。
@@ -92,7 +92,9 @@ databank.py        transforms.py      stats.py            pipeline.py           
 
 ### 3.3 候选信号（`transforms.py`）
 
-6 个变换：`chg_1`、`chg_5`、`chg_20`、`chg_60`（k 日变化）和 `z_60`、`z_252`（相对滚动均值与标准差的 z-score）。k 日变化除以其自身在 `std_window`（默认 252）上的滚动标准差，最后截尾到 ±`clip`（默认 4）。日频序列用全部 6 个，周频序列只用 `chg_5`、`chg_20`、`chg_60`、`z_252`，因为周频序列再取 1 日变化或 60 日 z 没有意义。变换集合只由频率决定，不按变量类型区分。候选 id 形如 `<series>|<transform>`。所有变换只用 ≤ t 的数据。
+7 个变换：`chg_1`、`chg_5`、`chg_20`、`chg_60`、`chg_252`（k 日变化）和 `z_60`、`z_252`（相对滚动均值与标准差的 z-score）。k 日变化除以其自身在 `max(std_window, 3k)` 个观测上的滚动标准差（`std_window` 默认 252，故 k ≤ 60 仍用 252，`chg_252` 用 756；`min_periods` 为窗口的一半），最后截尾到 ±`clip`（默认 4）。日频序列用全部 7 个，周频序列只用 `chg_5`、`chg_20`、`chg_60`、`chg_252`、`z_252`，因为周频序列再取 1 日变化或 60 日 z 没有意义。变换集合只由频率决定，不按变量类型区分。候选 id 形如 `<series>|<transform>`。所有变换只用 ≤ t 的数据。
+
+标准化窗口取 `max(std_window, 3k)` 的原因：k 日变化序列相邻取值高度重叠，窗口至少要覆盖 3 个互不重叠的 k 日区间，标准差才稳定。`chg_252` 需要 252 日的变化再加至少 378 个观测（756 的一半）的标准差，所以约需两年半（约 630 个交易日）数据才有第一个信号。
 
 ### 3.4 逐候选三段切分（`pipeline.split_rows`）
 
@@ -110,7 +112,7 @@ databank.py        transforms.py      stats.py            pipeline.py           
 
 零分布标准差 `null_sd`：对候选 j，把 y 在 `[0, e1[j])` 上做循环平移（平移量在 `min_shift`..`e-min_shift` 间均匀取），重复 `n_boot` 次重算 t*，取其标准差。这保留各自的自相关，只打断对齐；厚尾信号的 t 天然更分散，除以自身的 null_sd 才公平。具有相同 `e1` 的候选共用一次计算。`e1 − 2×min_shift < 1` 的候选样本太短无法平移，同样计入 `n_skipped`。
 
-`z = t / null_sd`；`p` 是由 |z| 按正态近似得到的双侧 p，仅供展示。判决：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（2.0）为 `WEAK_PASS`，否则 `REJECT`（这个仅按 z 的结论记为 `z_verdict`）。门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_is）。
+`z = t / null_sd`；`p` 是由 |z| 按正态近似得到的双侧 p，仅供展示。判决：`|z| ≥ z_pass`（2.5）为 `PASS`，`|z| ≥ z_weak`（1.5）为 `WEAK_PASS`，否则 `REJECT`（这个仅按 z 的结论记为 `z_verdict`）。门槛不随样本长度变，同样的 z 在短样本上对应更高的 IC（IC ≈ z ÷ √n_is）。
 
 **样本内净 Sharpe 条件。** 对 `z_verdict` 非 REJECT 的候选，在它自己的 IS 行（行号 < `e1`）上用 3.9 的回测（方向取 IS 上 t 的符号）算 `sharpe_gross_is`、`sharpe_net_is`；`sharpe_net_is` 非有限或 ≤ `is_min_net_sharpe`（严格大于才通过）则最终 `verdict` 改为 `REJECT`。后续步骤、flags 与看板仍以 `verdict != REJECT` 为准。这是样本内统计量，不读行号 ≥ `e1` 的数据。
 
@@ -264,7 +266,7 @@ python -m pytest -q
 | `[position]` `execution_delay` | 成交延迟（非负整数，默认 1）：信号在 t 日收盘后形成，在其后第 `execution_delay` 个标的收盘成交，新仓从成交后才承担收益；0 = 当日收盘成交。负数、非整数报错。见 3.1 |
 | `[signals]` `std_window`, `clip`, `vol_halflife` | 滚动标准化窗口、截尾幅度、EWMA 波动率半衰期 |
 | `[stats]` `hac_lags`, `min_obs`, `n_boot`, `min_shift`, `seed` | HAC 滞后阶数、候选 IS 段最少观测数（默认 250）、零分布重复次数、循环平移的最小位移、随机种子 |
-| `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 2.0），要求 `z_pass > z_weak > 0` |
+| `[verdict]` `z_pass`, `z_weak` | PASS / WEAK_PASS 门槛（默认 2.5 / 1.5），要求 `z_pass > z_weak > 0` |
 | `[verdict]` `dedupe_corr`, `extra_lag_t_min` | 去重的相关阈值（默认 0.7）；`xlag_weak` 的 \|t\| 阈值（默认 2.0） |
 | `[verdict]` `is_min_net_sharpe` | 样本内（IS）扣成本后年化净 Sharpe 的下限（默认 0.3，严格大于），与 |z| 门槛同时满足才算通过第 1 步；任意有限实数，设为很小的负数（如 -1e9）即关闭 |
 | `[verdict]` `min_net_sharpe` | 开发样本（IS+OBS）上扣成本后的年化净 Sharpe 下限（默认 0.3），低于此值的候选在去重前被淘汰（第 3 步）；任意有限实数，设为很小的负数（如 -1e9）即关闭 |
