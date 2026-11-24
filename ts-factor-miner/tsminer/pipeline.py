@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .databank import Panel, build_panel
+from .engine import simulate
 from .stats import hac_t, null_sd, two_sided_p
 from .transforms import build_candidates, forward_target
 
@@ -178,10 +179,7 @@ def backtest(s, y_fwd, sigma, sign, cost, buffer) -> dict:
     i0 = fin[0]
     s, y, sg = s[i0:], y[i0:], sg[i0:]
     pos = positions(s, sign, buffer)
-    gross = pos * y
-    notional = pos / sg
-    cost_t = cost * np.abs(np.diff(notional, prepend=0.0))
-    net = gross - cost_t
+    gross, net = simulate(pos, y, sg, cost)
     turnover = float(np.mean(np.abs(np.diff(pos)))) if len(pos) > 1 else nan
     return {"sharpe_gross": _sharpe(gross), "sharpe_net": _sharpe(net), "turnover": turnover}
 

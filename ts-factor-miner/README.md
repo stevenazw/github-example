@@ -175,7 +175,7 @@ shortlist 为空时直接返回 `NOTHING_TO_CONFIRM`，不建 lock。否则对�
 
 ## 4. 快速开始
 
-**依赖**：Python ≥ 3.11（用到标准库 `tomllib`），`pip install -r requirements.txt`。
+**依赖**：Python ≥ 3.11（用到标准库 `tomllib`），`pip install -r requirements.txt`。损益由 vectorbt 模拟（`tsminer/engine.py`，首次回测需 numba 编译）。
 
 **数据前提**：先按 DataBank 的 START_HERE 说明把数据库还原到本地。配置里 `[databank]` 的 `toolkit_dir` 和 `cache_dir` 分别指向工具包（提供 `data_query`）与缓存目录（含 `current.json`），也可用环境变量 `DATABANK_TOOLKIT`、`DATABANK_CACHE` 覆盖。数据库本身和任何行情数据都不进仓库。
 

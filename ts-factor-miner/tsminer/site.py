@@ -16,6 +16,7 @@ import pandas as pd
 
 from .config import load_run_config
 from .databank import Panel
+from .engine import simulate
 from .confirm import OOS_MIN_OBS, oos_verdict
 from .pipeline import _corr, _jsonable, dedupe, positions, prepare
 from .stats import hac_t, norm_sf
@@ -135,8 +136,7 @@ def factor_nav(s, y, sig, seg, dates, sign, buffer, cost, target_vol=TARGET_VOL)
     s, y, sig = (np.asarray(a, dtype=float) for a in (s, y, sig))
     seg, dates = np.asarray(seg), np.asarray(dates)
     pos = positions(s, sign, buffer)
-    notional = pos / sig
-    net = pos * y - cost * np.abs(np.diff(notional, prepend=0.0))
+    _, net = simulate(pos, y, sig, cost)
     ins = seg == 0
     sd = float(np.std(net[ins], ddof=1)) if ins.sum() > 1 else float("nan")
     if not np.isfinite(sd) or sd <= 0:
@@ -847,7 +847,7 @@ function renderAsset(a) {
     dl('数据截止日', [h('span', {class: 'mono', text: a.sample_end})]),
     dl('标的样本', [h('span', {class: 'mono', text: a.sample_start + ' 至 ' + a.sample_end})]),
     dl('数据库发布', [h('span', {class: 'mono', text: (a.db_published_at || '–').slice(0, 10)})]),
-    dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%' + execText(a.criteria)]),
+    dl('净值定义', ['单利累计；vectorbt 模拟损益并扣除交易成本；样本内年化波动标定为 10%' + execText(a.criteria)]),
     dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < a.factors.length)])
   ]));
   var info = [criteriaEl(a),
