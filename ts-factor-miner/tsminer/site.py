@@ -24,6 +24,7 @@ from .transforms import chg_std_window
 
 TARGET_VOL = 0.10          # in-sample annualised vol the net value is scaled to
 MAX_POINTS = 1500
+RIC_WINDOW = 252           # trading days of the rolling IC shown under the net value
 SEG_NAMES = ("样本内", "观察期", "样本外")
 VERDICT_ORDER = {"CONFIRMED": 0, "CONSISTENT": 1, "INSUFFICIENT": 2, "FAILED": 3}
 FLAG_TEXT = {
@@ -149,6 +150,25 @@ def factor_nav(s, y, sig, seg, dates, sign, buffer, cost, target_vol=TARGET_VOL)
         st = _seg_stats(s, y, ret, nav, dates, seg == i, sign)
         segs.append({"seg": i, "name": name, "opened": True, **st})
     return {"ret": ret, "nav": nav, "k": float(k), "segments": segs}
+
+
+def rolling_ic(s, y, sign, window=RIC_WINDOW) -> np.ndarray:
+    """Trailing ``window``-row Pearson correlation of signal and target times ``sign`` (positive: the factor pointed
+    the right way). Row t uses rows t-window+1..t only; NaN until a full window is available or if a window holds a
+    non-finite value or has no variance. Display only: nothing in the screening reads it."""
+    s, y = np.asarray(s, dtype=float), np.asarray(y, dtype=float)
+    out = np.full(len(s), np.nan)
+    if len(s) < window:
+        return out
+    ws = np.lib.stride_tricks.sliding_window_view(s, window)
+    wy = np.lib.stride_tricks.sliding_window_view(y, window)
+    ws, wy = ws - ws.mean(axis=1, keepdims=True), wy - wy.mean(axis=1, keepdims=True)
+    den = np.sqrt((ws * ws).sum(axis=1) * (wy * wy).sum(axis=1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        c = (ws * wy).sum(axis=1) / den
+    c[~(den > 0)] = np.nan
+    out[window - 1:] = sign * c
+    return out
 
 
 def downsample_idx(seg, max_points=MAX_POINTS) -> np.ndarray:
@@ -347,11 +367,15 @@ def _factor_nav(ctx, j, sign):
     if not opened:
         segments[2] = {"seg": 2, "name": SEG_NAMES[2], "opened": False}
     keep = downsample_idx(seg)
+    # rolling IC over exactly the rows of the net value (an unopened OOS is not in ``idx``, so it is neither
+    # shown nor inside any window); stored at the net-value points, so it shares their dates
+    ric = rolling_ic(ctx["S_np"][idx, j], ctx["y"][idx], sign)[keep]
     return {"segments": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in sg.items()}
                          for sg in segments],
             "nav": {"dates": [str(x) for x in real_dates[idx][keep]],
                     "values": [round(float(v), 4) for v in res["nav"][keep]],
-                    "seg": [int(v) for v in seg[keep]]}}
+                    "seg": [int(v) for v in seg[keep]],
+                    "ric": [round(float(v), 3) if np.isfinite(v) else None for v in ric]}}
 
 
 def _oos_conclusion(ctx, j, sign, ic_is):
@@ -687,6 +711,8 @@ svg .xh { stroke: var(--fg-2); stroke-width: 1; }
 svg path.ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .s0 { stroke: var(--seg-is); } .s1 { stroke: var(--seg-obs); } .s2 { stroke: var(--seg-oos); }
 .f0 { fill: var(--seg-is); } .f1 { fill: var(--seg-obs); } .f2 { fill: var(--seg-oos); }
+.ctitle { font-size: 12px; color: var(--fg-2); margin: 10px 0 2px; }
+svg path.ln.thin { stroke-width: 1.5; }
 .empty { padding: 24px 0; color: var(--fg-2); }
 @media (max-width: 520px) { body { font-size: 14px; } article.card { padding: 12px 12px 10px; }
   .top .shell { gap: 12px; } }
@@ -848,6 +874,7 @@ function renderAsset(a) {
     dl('标的样本', [h('span', {class: 'mono', text: a.sample_start + ' 至 ' + a.sample_end})]),
     dl('数据库发布', [h('span', {class: 'mono', text: (a.db_published_at || '–').slice(0, 10)})]),
     dl('净值定义', ['单利累计；vectorbt 模拟损益并扣除交易成本；样本内年化波动标定为 10%' + execText(a.criteria)]),
+    dl('滚动 IC', ['过去 252 个交易日信号与次日收益的相关系数，按交易方向调整，正值表示方向正确；窗口跨越分段时包含前一段数据；仅作展示，不参与筛选'], 'wide'),
     dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < a.factors.length)])
   ]));
   var info = [criteriaEl(a),
@@ -1077,8 +1104,93 @@ function drawChart(box, f, opened) {
     else if (e.key === 'Escape') hide();
   });
   svg.addEventListener('blur', hide);
-  box.appendChild(svg); box.appendChild(tip);
+  box.appendChild(svg);
+  drawRic(box, f, {W: W, ml: ml, mr: mr, pw: pw, t0: t0, tEnd: tEnd, opened: opened, tip: tip});
+  box.appendChild(tip);
   box._w = W;
+}
+
+/* rolling IC under the net value: same x scale, margins and segment boundaries as the net-value chart */
+function drawRic(box, f, g) {
+  var T = f._t, G = f.nav.seg, R = f.nav.ric, n = T.length, W = g.W, ml = g.ml, mr = g.mr, pw = g.pw, t0 = g.t0, tEnd = g.tEnd;
+  box.appendChild(h('div', {class: 'ctitle', text: '滚动 IC（252 日，按交易方向调整）'}));
+  var fin = R ? R.filter(function (v) { return v != null; }) : [];
+  if (!fin.length) { box.appendChild(h('div', {class: 'muted', style: 'font-size:12px', text: '有效数据不足 252 个交易日，无滚动 IC。'})); return; }
+  var H = 100, mt = 8, mb = 20, ph = H - mt - mb;
+  var lo = Math.min(0, Math.min.apply(null, fin)), hi = Math.max(0, Math.max.apply(null, fin)), pad = (hi - lo) * 0.1 || 0.02;
+  lo -= pad; hi += pad;
+  var nt = niceTicks(lo, hi, 4);
+  function X(t) { return ml + (t - t0) / (tEnd - t0) * pw; }
+  function Y(v) { return mt + (hi - v) / (hi - lo) * ph; }
+  var svg = sv('svg', {viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', tabindex: '0',
+    'aria-label': f.title + ' 滚动 IC，末值 ' + fx(R[n - 1], 2)});
+  nt.ticks.forEach(function (v) {
+    svg.appendChild(sv('line', {x1: ml, x2: W - mr, y1: Y(v), y2: Y(v), class: 'grid-l'}));
+    svg.appendChild(sv('text', {x: ml - 6, y: Y(v) + 4, 'text-anchor': 'end'}, v.toFixed(2)));
+  });
+  svg.appendChild(sv('line', {x1: ml, x2: W - mr, y1: Y(0), y2: Y(0), class: 'axis-l'}));
+  var y0 = new Date(t0).getUTCFullYear(), y1 = new Date(tEnd).getUTCFullYear(), span = y1 - y0 + 1;
+  var ystep = 1; [1, 2, 5, 10, 20].some(function (s) { ystep = s; return span / s * 46 <= pw; });
+  for (var yr = Math.ceil((y0 + 1) / ystep) * ystep; yr <= y1; yr += ystep) {
+    var tt = Date.UTC(yr, 0, 1);
+    if (tt < t0 || tt > (g.opened ? T[n - 1] : tEnd)) continue;
+    svg.appendChild(sv('line', {x1: X(tt), x2: X(tt), y1: mt + ph, y2: mt + ph + 4, class: 'axis-l'}));
+    svg.appendChild(sv('text', {x: X(tt), y: H - 4, 'text-anchor': 'middle'}, String(yr)));
+  }
+  svg.appendChild(sv('line', {x1: ml, x2: W - mr, y1: mt + ph, y2: mt + ph, class: 'axis-l'}));
+  var starts = [0, -1, -1], i, s, j;
+  for (i = 0; i < n; i++) { if (starts[G[i]] < 0) starts[G[i]] = i; }
+  [1, 2].forEach(function (k) {
+    if (starts[k] >= 0) svg.appendChild(sv('line', {x1: X(T[starts[k]]), x2: X(T[starts[k]]), y1: mt, y2: mt + ph, class: 'div-l'}));
+  });
+  for (s = 0; s < 3; s++) {
+    var d = '', first = true;
+    for (j = 0; j < n; j++) {
+      if (R[j] != null && (G[j] === s || (G[j] === s - 1 && (j + 1 < n && G[j + 1] === s)))) {
+        d += (first ? 'M' : 'L') + X(T[j]).toFixed(1) + ' ' + Y(R[j]).toFixed(1); first = false;
+      } else first = true;
+    }
+    if (d) svg.appendChild(sv('path', {d: d, class: 'ln thin s' + s}));
+  }
+  var xh = sv('line', {y1: mt, y2: mt + ph, class: 'xh', visibility: 'hidden'});
+  var dot = sv('circle', {r: 4, class: 'ring', visibility: 'hidden'});
+  svg.appendChild(xh); svg.appendChild(dot);
+  var tip = g.tip, cur = n - 1;
+  function show(k) {
+    cur = Math.max(0, Math.min(n - 1, k));
+    var x = X(T[cur]);
+    xh.setAttribute('x1', x); xh.setAttribute('x2', x); xh.setAttribute('visibility', 'visible');
+    tip.textContent = '';
+    tip.appendChild(h('div', {class: 'tl', text: f.nav.dates[cur]}));
+    tip.appendChild(h('div', {class: 'tv', text: R[cur] == null ? '–' : R[cur].toFixed(3)}));
+    tip.appendChild(h('div', {class: 'tl'}, [h('i', {class: 'tk', style: 'color:var(--seg-' + ['is', 'obs', 'oos'][G[cur]] + ')'}), SEGN[G[cur]] + ' · 滚动 IC']));
+    var y = svg.offsetTop;
+    if (R[cur] != null) { y += Y(R[cur]); dot.setAttribute('cx', x); dot.setAttribute('cy', Y(R[cur])); dot.setAttribute('class', 'ring f' + G[cur]); dot.setAttribute('visibility', 'visible'); }
+    else { y += mt + ph / 2; dot.setAttribute('visibility', 'hidden'); }
+    tip.style.display = 'block';
+    var tw = tip.offsetWidth, left = x + 12;
+    if (left + tw > W) left = x - 12 - tw;
+    tip.style.left = Math.max(0, left) + 'px'; tip.style.top = Math.max(0, y - 54) + 'px';
+  }
+  function hide() { xh.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); tip.style.display = 'none'; }
+  function nearest(clientX) {
+    var r = svg.getBoundingClientRect(), tx = t0 + ((clientX - r.left) * (W / r.width) - ml) / pw * (tEnd - t0);
+    var a = 0, b = n - 1;
+    while (b - a > 1) { var m = (a + b) >> 1; if (T[m] < tx) a = m; else b = m; }
+    return Math.abs(T[a] - tx) <= Math.abs(T[b] - tx) ? a : b;
+  }
+  var hit = sv('rect', {x: ml, y: mt, width: pw, height: ph, fill: 'transparent'});
+  svg.appendChild(hit);
+  hit.addEventListener('pointermove', function (e) { show(nearest(e.clientX)); });
+  hit.addEventListener('pointerdown', function (e) { show(nearest(e.clientX)); });
+  hit.addEventListener('pointerleave', hide);
+  svg.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowLeft') { show(cur - Math.max(1, Math.round(n / 60))); e.preventDefault(); }
+    else if (e.key === 'ArrowRight') { show(cur + Math.max(1, Math.round(n / 60))); e.preventDefault(); }
+    else if (e.key === 'Escape') hide();
+  });
+  svg.addEventListener('blur', hide);
+  box.appendChild(svg);
 }
 
 /* ------------------------------------------------------------ routing */

@@ -14,7 +14,8 @@ import pytest
 from tsminer.config import load_config
 from tsminer.confirm import confirm
 from tsminer.pipeline import mine, prepare
-from tsminer.site import (SEG_NAMES, build_asset_data, build_site, direction_text, downsample_idx, factor_nav,
+from tsminer import site as site_mod
+from tsminer.site import (SEG_NAMES, RIC_WINDOW, rolling_ic, build_asset_data, build_site, direction_text, downsample_idx, factor_nav,
                           choose_keeper, factor_stage, flag_texts, formula_text, group_same_factors, is_same_factor, slugify,
                           stage_note, transform_label)
 from tsminer.databank import Panel
@@ -207,6 +208,110 @@ def test_downsampled_json(opened_data):
             assert s["start"] in d and s["end"] in d
         assert d[-1] == segs[2]["end"]
         assert all(round(v, 4) == v for v in nav["values"])
+
+
+# ------------------------------------------------------------------ 3b. rolling IC (display only)
+def _ric_inputs(n=400, seed=3):
+    rng = np.random.default_rng(seed)
+    s = rng.normal(size=n)
+    y = 0.5 * s + rng.normal(size=n)                    # planted: the signal points the right way
+    return s, y
+
+
+def test_rolling_ic_window_and_value():
+    s, y = _ric_inputs()
+    r = rolling_ic(s, y, 1.0)
+    assert RIC_WINDOW == 252 and len(r) == len(s)
+    assert np.isnan(r[:251]).all() and np.isfinite(r[251:]).all()       # full window only
+    for t in (251, 300, 399):
+        assert r[t] == pytest.approx(np.corrcoef(s[t - 251:t + 1], y[t - 251:t + 1])[0, 1], abs=1e-12)
+    # hand-checkable: a perfectly linear window correlates to exactly +1, its mirror to -1
+    a = np.arange(300.0)
+    assert rolling_ic(a, 2 * a + 1, 1.0)[251:] == pytest.approx(1.0)
+    assert rolling_ic(a, -a, 1.0)[251:] == pytest.approx(-1.0)
+    assert np.isnan(rolling_ic(a[:251], a[:251], 1.0)).all()            # fewer rows than a window
+    assert np.isnan(rolling_ic(np.ones(300), a, 1.0)).all()             # no variance: NaN, no warning
+
+
+def test_rolling_ic_is_causal():
+    s, y = _ric_inputs()
+    base = rolling_ic(s, y, 1.0)
+    t = 330
+    s2, y2 = s.copy(), y.copy()
+    rng = np.random.default_rng(9)
+    s2[t + 1:], y2[t + 1:] = rng.normal(size=len(s) - t - 1) * 50, rng.normal(size=len(s) - t - 1) * 50
+    alt = rolling_ic(s2, y2, 1.0)
+    np.testing.assert_array_equal(alt[:t + 1], base[:t + 1])           # rows up to t are untouched by later rows
+    assert not np.array_equal(alt[t + 1:], base[t + 1:])
+
+
+def test_rolling_ic_direction():
+    s, y = _ric_inputs()
+    pos, neg = rolling_ic(s, y, 1.0), rolling_ic(s, y, -1.0)
+    np.testing.assert_array_equal(neg[251:], -pos[251:])
+    assert np.isnan(neg[:251]).all()
+    assert np.nanmean(pos) > 0.3 and np.nanmin(pos) > 0.15              # planted relationship, sign +1: clearly positive
+    assert np.nanmax(neg) < -0.15
+
+
+def test_rolling_ic_in_site_data_matches_direct_computation(locked_data, opened_data, run_dir, opened_dir, cfg, panel):
+    """At the last stored point the value is the sign-adjusted correlation of the trailing 252 rows of the factor's
+    visible rows; for an unopened run those are in-sample + observation rows only (no OOS row inside the window)."""
+    prep = prepare(panel, cfg)
+    cols = list(prep["S"].columns)
+    S = prep["S"].to_numpy(dtype=float)[prep["rows"]]
+    y = prep["y_fwd"].to_numpy(dtype=float)[prep["rows"]]
+    for data, opened in ((locked_data, False), (opened_data, True)):
+        checked = 0
+        for f in data["factors"]:
+            nav = f["nav"]
+            assert len(nav["ric"]) == len(nav["dates"]) == len(nav["values"])      # shares the net value's points
+            assert all(v is None or round(v, 3) == v for v in nav["ric"])
+            j = cols.index(f["id"])
+            m = prep["is_mask"][:, j] | prep["obs_mask"][:, j] | (prep["oos_mask"][:, j] if opened else False)
+            idx = np.flatnonzero(m)
+            if len(idx) < RIC_WINDOW:
+                assert all(v is None for v in nav["ric"])
+                continue
+            w = idx[-RIC_WINDOW:]
+            want = f["sign"] * np.corrcoef(S[w, j], y[w])[0, 1]
+            assert nav["ric"][-1] == pytest.approx(want, abs=6e-4)
+            first = next(i for i, v in enumerate(nav["ric"]) if v is not None)
+            assert first >= 1 and all(v is None for v in nav["ric"][:first])      # the first year is blank
+            checked += 1
+        assert checked
+
+
+def test_rolling_ic_hides_unopened_segment(locked_data, tmp_path, run_dir, cfg, panel):
+    """An unopened OOS exposes no rolling IC: no point of segment 2 and no window that reaches into it (altering
+    the OOS rows changes nothing, also not the rolling IC)."""
+    for f in locked_data["factors"]:
+        assert 2 not in f["nav"]["seg"] and len(f["nav"]["ric"]) == len(f["nav"]["seg"])
+        assert f["segments"][2] == {"seg": 2, "name": "样本外", "opened": False}
+    cid = locked_data["factors"][0]["id"]
+    p2, c = _cut_panel(panel, cfg, cid, 4242, "e2")
+    d2 = tmp_path / "run2"
+    shutil.copytree(run_dir, d2)
+    p2.save(d2 / "panel")
+    b = build_asset_data(d2)
+    fa = next(f for f in locked_data["factors"] if f["id"] == cid)
+    fb = next(f for f in b["factors"] if f["id"] == cid)
+    assert any(v is not None for v in fa["nav"]["ric"]) and fa["nav"]["ric"] == fb["nav"]["ric"]
+
+
+def test_rolling_ic_is_display_only(opened_dir, opened_data, monkeypatch):
+    """With the rolling IC switched off (all NaN) everything else is identical: stage, verdict, order, net value."""
+    monkeypatch.setattr(site_mod, "rolling_ic", lambda s, y, sign, window=RIC_WINDOW: np.full(len(s), np.nan))
+    off = build_asset_data(opened_dir)
+    assert all(v is None for f in off["factors"] for v in f["nav"]["ric"])
+    assert any(v is not None for f in opened_data["factors"] for v in f["nav"]["ric"])
+
+    def strip(d):
+        d = _strip(d)
+        return {**d, "factors": [{**f, "nav": {k: v for k, v in f["nav"].items() if k != "ric"}} for f in d["factors"]]}
+    assert strip(off) == strip(opened_data)
+    assert [(f["id"], f["stage"], f["oos_verdict"]) for f in off["factors"]] == \
+           [(f["id"], f["stage"], f["oos_verdict"]) for f in opened_data["factors"]]
 
 
 # ------------------------------------------------------------------ 4. formulas
