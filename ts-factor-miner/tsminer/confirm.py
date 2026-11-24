@@ -22,12 +22,16 @@ class OosLockedError(RuntimeError):
     """The OOS of this run was already opened."""
 
 
-def _verdict(t_signed, p_one, ic_oos_signed, retention_oos, min_retention) -> str:
-    if not np.isfinite(t_signed):
+def oos_verdict(t_signed, ic_oos_signed, ic_is, min_retention, sufficient=True) -> str:
+    """OOS conclusion from the signed OOS t, the signed OOS IC and the in-sample IC (pure; shared with the
+    dashboard). CONFIRMED: one-sided p <= P_CONFIRMED; CONSISTENT: right sign and retention >= min_retention;
+    INSUFFICIENT: no usable t (too few OOS observations); otherwise FAILED."""
+    if not sufficient or not np.isfinite(t_signed):
         return "INSUFFICIENT"
-    if p_one <= P_CONFIRMED:
+    if float(norm_sf(t_signed)) <= P_CONFIRMED:
         return "CONFIRMED"
-    if ic_oos_signed > 0 and retention_oos >= min_retention:
+    retention = ic_oos_signed / abs(float(ic_is))
+    if ic_oos_signed > 0 and retention >= min_retention:
         return "CONSISTENT"
     return "FAILED"
 
@@ -79,7 +83,7 @@ def confirm(run_dir, force_reason=None) -> dict:
                          "oos_start": str(cal[pos[0]].date()) if len(pos) else "",
                          "oos_end": str(cal[pos[-1]].date()) if len(pos) else "",
                          "t_signed": t_signed, "ic_oos_signed": ic_signed, "retention_oos": retention,
-                         "p_one": p_one, "verdict": _verdict(t_signed, p_one, ic_signed, retention, min_ret),
+                         "p_one": p_one, "verdict": oos_verdict(t_signed, ic_signed, r["ic"], min_ret),
                          "sharpe_gross": bt["sharpe_gross"], "sharpe_net": bt["sharpe_net"]})
     df = pd.DataFrame(out_rows)
 

@@ -15,7 +15,8 @@ from tsminer.config import load_config
 from tsminer.confirm import confirm
 from tsminer.pipeline import mine, prepare
 from tsminer.site import (SEG_NAMES, build_asset_data, build_site, direction_text, downsample_idx, factor_nav,
-                          factor_stage, flag_texts, formula_text, infer_source_name, slugify, stage_note)
+                          choose_keeper, factor_stage, flag_texts, formula_text, group_same_factors, is_same_factor, slugify,
+                          stage_note)
 from tsminer.databank import Panel
 
 from test_pipeline import HIGH_COST, TOML, _cut_panel, make_panel
@@ -60,12 +61,12 @@ def opened_dir(tmp_path_factory, run_dir):
 @pytest.fixture(scope="module")
 def locked_data(run_dir):
     """The single source of a single-run asset (the per-source dict)."""
-    return build_asset_data(run_dir)["sources"][0]
+    return build_asset_data(run_dir)
 
 
 @pytest.fixture(scope="module")
 def opened_data(opened_dir):
-    return build_asset_data(opened_dir)["sources"][0]
+    return build_asset_data(opened_dir)
 
 
 @pytest.fixture(scope="module")
@@ -82,7 +83,9 @@ def site_dir(tmp_path_factory, run_dir, opened_dir):
 
 # ------------------------------------------------------------------ 1. isolation
 def test_unopened_has_no_oos(run_dir, locked_data, cfg, panel):
-    assert locked_data["oos_opened"] is False and locked_data["oos_counts"] is None
+    assert not any(f["oos_opened"] for f in locked_data["factors"])
+    assert locked_data["oos_counts"] == {"confirmed": 0, "consistent": 0, "failed": 0, "insufficient": 0,
+                                         "unopened": locked_data["funnel"]["n_final"]}
     assert locked_data["factors"]
     prep = prepare(panel, cfg)
     cal = panel.target.index
@@ -110,14 +113,14 @@ def test_unopened_output_ignores_oos_rows(tmp_path, run_dir, locked_data, cfg, p
     d2 = tmp_path / "run2"
     shutil.copytree(run_dir, d2)
     p2.save(d2 / "panel")
-    b = build_asset_data(d2)["sources"][0]
+    b = build_asset_data(d2)
     fa = next(f for f in locked_data["factors"] if f["id"] == cid)
     fb = next(f for f in b["factors"] if f["id"] == cid)
     assert fa == fb
 
 
 def test_opened(opened_dir, opened_data):
-    assert opened_data["oos_opened"] is True
+    assert all(f["oos_opened"] for f in opened_data["factors"])
     cf = pd.read_csv(opened_dir / "confirm.csv").set_index("id")
     assert opened_data["factors"]
     for f in opened_data["factors"]:
@@ -279,8 +282,8 @@ def test_site_files(site_dir):
     for slug in ("test", "other-1"):
         assert slug in idx and slug in art
         data = json.loads((site_dir / "data" / f"{slug}.json").read_text(encoding="utf-8"))
-        assert data["slug"] == slug and len(data["sources"]) == 1 and data["sources"][0]["factors"]
-        assert data["summary"]["n_factors"] == len(data["sources"][0]["factors"])
+        assert data["slug"] == slug and data["factors"] and "sources" not in data
+        assert len(data["runs"]) == 1 and data["funnel"]["n_is"] == len(data["factors"])
     # same template: the page content of both files is identical
     style = art[art.index("<style>"):art.index("</style>")]
     assert style in idx and art[art.index('<div id="app">'):] in idx
@@ -297,7 +300,7 @@ def test_new_run_has_criteria_and_trade_keep(site_dir, run_dir, locked_data):
     run = json.loads((run_dir / "run.json").read_text())
     assert locked_data["funnel"]["n_final"] == run["funnel"]["shortlist"]
     for slug in ("test", "other-1"):
-        d = json.loads((site_dir / "data" / f"{slug}.json").read_text(encoding="utf-8"))["sources"][0]
+        d = json.loads((site_dir / "data" / f"{slug}.json").read_text(encoding="utf-8"))
         assert d["criteria"] == want and d["funnel"]["n_final"] == run["funnel"]["shortlist"]
     art = (site_dir / "artifact.html").read_text(encoding="utf-8")
     assert "入选条件" in art and "criteria" in art
@@ -316,7 +319,7 @@ def test_old_style_run_without_trade_keys(tmp_path, run_dir):
     cdf.drop(columns=["trade_status", "sharpe_gross_dev", "sharpe_net_dev"]).to_csv(old / "candidates.csv", index=False)
     out = tmp_path / "site"
     build_site([old], out)                                           # must not raise
-    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))["sources"][0]
+    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
     assert "min_net_sharpe" not in d["criteria"] and all(f["stage"] != 2 for f in d["factors"])
     assert d["funnel"]["n_final"] == len(pd.read_csv(old / "shortlist.csv"))
     assert d["criteria"]["z_weak"] == rj["config"]["verdict"]["z_weak"]
@@ -347,22 +350,23 @@ def test_publish_constraints(site_dir):
 
 
 # ------------------------------------------------------------------ 7. duplicates and CLI
-def test_duplicate_source_name_raises(tmp_path, run_dir, opened_dir):
-    """Same target and same (inferred) source name: refuse, and say how to tell the runs apart."""
-    with pytest.raises(ValueError, match=r"duplicate source name.*universe"):
-        build_site([run_dir, opened_dir], tmp_path / "o")
-    assert not (tmp_path / "o" / "artifact.html").exists()
+def _cli(*args, cwd=ROOT):
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    return subprocess.run([sys.executable, "-m", "tsminer", "site", *map(str, args)], cwd=cwd, env=env,
+                          capture_output=True, text=True)
 
 
 def test_cli(tmp_path, run_dir, opened_dir):
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    ok = subprocess.run([sys.executable, "-m", "tsminer", "site", str(run_dir), "--out", str(tmp_path / "s")],
-                        cwd=ROOT, env=env, capture_output=True, text=True)
+    out = tmp_path / "s"
+    ok = _cli(run_dir, "--out", out)
     assert ok.returncode == 0, ok.stderr
-    assert (tmp_path / "s" / "index.html").exists() and (tmp_path / "s" / "data" / "test.json").exists()
-    dup = subprocess.run([sys.executable, "-m", "tsminer", "site", str(run_dir), str(opened_dir), "--out",
-                          str(tmp_path / "s2")], cwd=ROOT, env=env, capture_output=True, text=True)
-    assert dup.returncode != 0 and "duplicate source name" in dup.stderr and "universe" in dup.stderr
+    assert (out / "index.html").exists() and (out / "data" / "test.json").exists()
+    again = _cli(opened_dir, "--out", out)                               # appended to the registry: one library
+    assert again.returncode == 0, again.stderr
+    assert len(json.loads((out / "runs.json").read_text())) == 2
+    assert _cli("--out", out).returncode == 0                            # rebuild from the registry alone
+    empty = _cli("--out", tmp_path / "none")
+    assert empty.returncode != 0 and "no run directories" in empty.stderr
 
 
 # ------------------------------------------------------------- 8. formula variables
@@ -384,7 +388,7 @@ def test_variable_card_title_and_formula_wraps(tmp_path, cfg, cfg_path):
     panel.meta.loc["var:sig", ["ticker", "field", "description"]] = ["var:sig", expr, "信号变量"]
     d = tmp_path / "run"
     mine(cfg, d, panel=panel, config_path=cfg_path)
-    data = build_asset_data(d)["sources"][0]
+    data = build_asset_data(d)
     cards = [f for f in data["factors"] if f["series"] == "var:sig"]
     assert cards
     for f in cards:
@@ -398,149 +402,19 @@ def test_variable_card_title_and_formula_wraps(tmp_path, cfg, cfg_path):
     assert "信号变量" in rep.split("## Shortlist")[1].split("## IC 衰减")[0]
 
 
-# ------------------------------------------------------------- 9. several sources per target
-def _named(src, dst, name):
-    """Copy of run directory ``src`` whose config.toml carries ``[universe] name``."""
-    shutil.copytree(src, dst)
-    cp = dst / "config.toml"
-    cp.write_text(cp.read_text(encoding="utf-8") + f'\n[universe]\nname = "{name}"\n', encoding="utf-8")
-    return dst
-
-
-@pytest.fixture(scope="module")
-def ab_dirs(tmp_path_factory, run_dir, opened_dir):
-    """A: confirmed, B: not confirmed; same target and same factor ids."""
-    base = tmp_path_factory.mktemp("ab")
-    return _named(opened_dir, base / "a", "A"), _named(run_dir, base / "b", "B")
-
-
-def test_source_name_inference():
-    assert infer_source_name("自定义", ["var:x"]) == "自定义"
-    assert infer_source_name("  ", ["var:x"]) == "变量清单"
-    assert infer_source_name("", ["a", "var:x"]) == "变量清单"
-    assert infer_source_name(None, ["a", "chain:TY"]) == "原始序列扫描"
-    assert infer_source_name("", []) == "原始序列扫描"
-
-
-def test_two_sources_one_target(tmp_path, ab_dirs, run_dir):
-    a, b = ab_dirs
-    ref = build_asset_data(run_dir)["sources"][0]
-    for order in ([a, b], [b, a]):
-        out = tmp_path / "".join(p.name for p in order)
-        build_site(order, out)
-        files = sorted(p.name for p in (out / "data").iterdir())
-        assert files == ["test.json"]
-        d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
-        assert [s["name"] for s in d["sources"]] == [p.name.upper() for p in order]
-        assert [s["run_dir"] for s in d["sources"]] == [p.name for p in order]
-        assert d["summary"]["n_factors"] == sum(len(s["factors"]) for s in d["sources"])
-        for s in d["sources"]:
-            assert s["funnel"] == ref["funnel"] and s["criteria"] == ref["criteria"]
-            assert {f["id"] for f in s["factors"]} == {f["id"] for f in ref["factors"]}
-            if not s["oos_opened"]:                                # same order as the run on its own
-                assert s["factors"] == ref["factors"]
-            assert (s["is_frac"], s["obs_frac"]) == (ref["is_frac"], ref["obs_frac"])
-        man = json.loads(re.search(r"var MANIFEST = (.*?);\n", (out / "artifact.html").read_text(encoding="utf-8")).group(1))
-        assert [s["name"] for s in man["assets"][0]["sources"]] == [p.name.upper() for p in order]
-
-
-def test_sources_are_isolated_from_each_other(tmp_path, ab_dirs, run_dir, opened_dir):
-    a, b = ab_dirs
-    d = build_asset_data([a, b])
-    sa, sb = d["sources"]
-    assert sa["oos_opened"] is True and sb["oos_opened"] is False
-    assert sa["oos_counts"] is not None and sb["oos_counts"] is None
-    assert all(set(f["nav"]["seg"]) == {0, 1, 2} and bool(f["oos_verdict"]) == (f["stage"] == 4) for f in sa["factors"])
-    assert sb["factors"] and all(2 not in f["nav"]["seg"] and f["oos_verdict"] is None and f["oos_confirm"] is None
-                                 and f["segments"][2] == {"seg": 2, "name": "样本外", "opened": False}
-                                 for f in sb["factors"])
-    # each source equals what it is on its own: an opened neighbour changes nothing
-    nokey = lambda src: {k: v for k, v in src.items() if k != "key"}
-    assert nokey(sb) == nokey(build_asset_data(b)["sources"][0]) and nokey(sa) == nokey(build_asset_data(a)["sources"][0])
-    # asset-level totals only count the opened source
-    assert d["summary"]["oos_counts"] == sa["oos_counts"] and d["summary"]["n_opened"] == 1
-    assert d["summary"]["n_factors"] == len(sa["factors"]) + len(sb["factors"])
-
-
-def test_unconfirmed_source_ignores_random_oos_rows(tmp_path, ab_dirs, cfg, panel):
-    a, b = ab_dirs
-    before = build_asset_data([a, b])["sources"][1]
-    prep = prepare(panel, cfg)
-    cols = list(prep["S"].columns)
-    cdf = pd.read_csv(b / "candidates.csv")
-    ids = cdf.loc[cdf["verdict"] != "REJECT", "id"]            # every factor shown, not just the shortlist
-    c = max(int(prep["rows"][int(prep["e2"][cols.index(i)])]) for i in ids)     # from here on: OOS for every factor
-    assert c < len(panel.target) - 5
-    rng = np.random.default_rng(31337)
-    tgt, X = panel.target.copy(), panel.X.copy()
-    tgt.iloc[c + 1:] = rng.normal(0, 0.005, len(tgt) - c - 1)
-    for col in X.columns:
-        fin = np.isfinite(X[col].to_numpy()) & (np.arange(len(X)) >= c)
-        X.loc[fin, col] = rng.normal(0, 50, int(fin.sum()))
-    Panel(target=tgt, X=X, meta=panel.meta, excluded=panel.excluded, info=panel.info).save(b / "panel")
-    try:
-        after = build_asset_data([a, b])["sources"][1]
-    finally:
-        panel.save(b / "panel")
-    assert after["oos_opened"] is False and after == before
-    assert any(f["stage"] < 4 for f in after["factors"])        # dropped factors are part of the comparison
-    assert all(2 not in f["nav"]["seg"] for f in after["factors"])
-
-
-def test_same_factor_ids_in_two_sources(tmp_path, ab_dirs):
-    a, b = ab_dirs
-    out = tmp_path / "s"
-    build_site([a, b], out)                                              # must not raise
-    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
-    ids = [{f["id"] for f in s["factors"]} for s in d["sources"]]
-    assert ids[0] & ids[1]                                                # the same ids do occur twice
-    keys = [s["key"] for s in d["sources"]]
-    assert len(set(keys)) == 2
-    assert len({(s["key"], f["id"]) for s in d["sources"] for f in s["factors"]}) == d["summary"]["n_factors"]
-    art = (out / "artifact.html").read_text(encoding="utf-8")
-    man = json.loads(re.search(r"var MANIFEST = (.*?);\n", art).group(1))
-    assert [s["key"] for s in man["assets"][0]["sources"]] == keys
-    assert "'card-' + a.slug + '-' + s.key + '-'" in art                  # DOM ids carry the source key
-
-
-def test_variable_source_name_from_var_series(tmp_path, cfg, cfg_path, run_dir):
-    panel = make_panel(1, plant=True, short=True)
-    panel.X = panel.X.rename(columns={"sig": "var:sig"})
-    panel.meta = panel.meta.rename(index={"sig": "var:sig"})
-    panel.meta.loc["var:sig", ["ticker", "field", "description"]] = ["var:sig", "ts('A')", "信号变量"]
-    d = tmp_path / "vars"
-    mine(cfg, d, panel=panel, config_path=cfg_path)
-    out = tmp_path / "o"
-    build_site([run_dir, d], out)
-    data = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
-    assert [s["name"] for s in data["sources"]] == ["原始序列扫描", "变量清单"]
-    assert all(f["series"] != "var:sig" for f in data["sources"][0]["factors"])
-
-
-def test_two_targets_with_sources(tmp_path, ab_dirs, opened_dir):
-    a, b = ab_dirs
-    other = tmp_path / "other"
-    shutil.copytree(opened_dir, other)
-    rj = json.loads((other / "run.json").read_text())
-    rj["target"] = "OTHER-1"
-    (other / "run.json").write_text(json.dumps(rj))
-    out = tmp_path / "s"
-    r = build_site([a, other, b], out)
-    assert [x["slug"] for x in r["assets"]] == ["test", "other-1"]
-    assert [len(x["sources"]) for x in r["assets"]] == [2, 1]
 
 
 # ------------------------------------------------------------- 10. layers: every factor that passed the IS bar
 def test_factor_stage_cases():
-    base = {"id": "a", "obs_status": "KEEP", "trade_status": "KEEP", "rep": "a"}
-    assert factor_stage({**base, "obs_status": "DROP", "trade_status": "", "rep": ""}, {"a"}) == 1
-    assert factor_stage({**base, "trade_status": "DROP", "rep": ""}, set()) == 2
-    assert factor_stage({**base, "rep": "b"}, {"b"}) == 3
-    assert factor_stage(base, {"a"}) == 4
-    assert factor_stage({**base, "obs_status": "INSUFFICIENT"}, {"a"}) == 4
-    old = {"id": "a", "obs_status": "KEEP", "rep": "b"}                 # run from before the tradability screen
-    assert factor_stage(old, {"b"}) == 3 and factor_stage({**old, "rep": "a"}, {"a"}) == 4
-    assert factor_stage({"id": "a", "obs_status": "DROP"}, set()) == 1
+    base = {"id": "a", "obs_status": "KEEP", "trade_status": "KEEP"}
+    assert factor_stage({**base, "obs_status": "DROP", "trade_status": ""}, False) == 1
+    assert factor_stage({**base, "trade_status": "DROP"}, False) == 2
+    assert factor_stage(base, False) == 3
+    assert factor_stage(base, True) == 4
+    assert factor_stage({**base, "obs_status": "INSUFFICIENT"}, True) == 4
+    old = {"id": "a", "obs_status": "KEEP"}                             # run from before the tradability screen
+    assert factor_stage(old, False) == 3 and factor_stage(old, True) == 4
+    assert factor_stage({"id": "a", "obs_status": "DROP"}, True) == 1
 
 
 def test_stage_note_numbers():
@@ -548,32 +422,32 @@ def test_stage_note_numbers():
     assert stage_note({"retention": 0.2345}, 1, crit, {}) == "观察期 IC 保留比例 0.23，低于 0.5"
     assert stage_note({"retention": -0.3}, 1, crit, {}) == "观察期方向相反（保留比例 -0.30）"
     assert stage_note({"sharpe_net_dev": 0.0549}, 2, crit, {}) == "扣成本后净 Sharpe 0.05，低于 0.3"
-    assert stage_note({"rep": "r|chg_1"}, 3, crit, {"r|chg_1": "名称 · 20 日变化"}) == "与「名称 · 20 日变化」高度相关，去重时并入"
+    assert stage_note({}, 3, crit, "名称 · 20 日变化") == "与「名称 · 20 日变化」高度相关，去重时并入"
     assert stage_note({}, 4, crit, {}) == ""
 
 
-def test_factors_are_all_non_reject_candidates(ab_dirs, run_dir, opened_dir):
+def test_factors_are_all_non_reject_candidates(run_dir, opened_dir):
     for d_ in (run_dir, opened_dir):
-        src = build_asset_data(d_)["sources"][0]
+        src = build_asset_data(d_)
         cand = pd.read_csv(d_ / "candidates.csv")
         want = sorted(cand.loc[cand["verdict"] != "REJECT", "id"])
-        assert sorted(f["id"] for f in src["factors"]) == want                  # each exactly once
-        assert not src["skipped"]
+        ids = [f["id"] for f in src["factors"]]
+        assert len(ids) == len(set(ids)) and set(ids) <= set(want)         # each at most once
+        assert len(ids) + src["n_merged"] == len(want) and not src["skipped"]
         fn = src["funnel"]
         assert fn["n_is"] >= fn["n_obs"] >= fn["n_trade"] >= fn["n_final"]
-        assert fn["n_final"] == len(pd.read_csv(d_ / "shortlist.csv"))
         by = pd.Series([f["stage"] for f in src["factors"]]).value_counts()
-        assert fn == {"n_is": len(want), "n_obs":
-                      int(sum(by.get(k, 0) for k in (2, 3, 4))),
+        assert fn == {"n_is": len(ids), "n_obs": int(sum(by.get(k, 0) for k in (2, 3, 4))),
                       "n_trade": int(sum(by.get(k, 0) for k in (3, 4))), "n_final": int(by.get(4, 0))}
-        keys = ("tested", "is_pass", "is_weak", "obs_drop")
-        assert not any(k in src["funnel"] for k in keys)
+        assert not any(k in fn for k in ("tested", "is_pass", "is_weak", "obs_drop"))
         assert [f["stage"] for f in src["factors"]] == sorted((f["stage"] for f in src["factors"]), reverse=True)
         assert any(f["stage"] < 4 for f in src["factors"]) and all(f["is_verdict"] in ("PASS", "WEAK_PASS")
                                                                      for f in src["factors"])
         for f in src["factors"]:
             assert f["nav"]["values"] and f["segments"][0]["n"] > 0 and f["formula"]
             assert bool(f["stage_note"]) == (f["stage"] < 4)
+        shortlist = set(pd.read_csv(d_ / "shortlist.csv")["id"])
+        assert {f["id"] for f in src["factors"] if f["stage"] == 4} == shortlist   # single run: same de-duplication
 
 
 @pytest.fixture(scope="module")
@@ -601,7 +475,7 @@ def costly_run(tmp_path_factory, panel):
 
 
 def test_dropped_by_observation_period(obs_flip_run):
-    src = build_asset_data(obs_flip_run)["sources"][0]
+    src = build_asset_data(obs_flip_run)
     f = next(x for x in src["factors"] if x["id"] == "sig|chg_1")
     r = pd.read_csv(obs_flip_run / "candidates.csv").set_index("id").loc["sig|chg_1"]
     assert f["stage"] == 1 and r["obs_status"] == "DROP" and r["retention"] < 0
@@ -612,7 +486,7 @@ def test_dropped_by_observation_period(obs_flip_run):
 
 
 def test_dropped_by_tradability(costly_run):
-    src = build_asset_data(costly_run)["sources"][0]
+    src = build_asset_data(costly_run)
     r = pd.read_csv(costly_run / "candidates.csv").set_index("id")
     f = next(x for x in src["factors"] if x["id"] == "sig|chg_1")
     assert f["stage"] == 2 and r.loc["sig|chg_1", "trade_status"] == "DROP"
@@ -623,19 +497,18 @@ def test_dropped_by_tradability(costly_run):
 
 
 def test_merged_factor_note_names_the_representative(run_dir):
-    src = build_asset_data(run_dir)["sources"][0]
+    src = build_asset_data(run_dir)
     merged = [f for f in src["factors"] if f["stage"] == 3]
     assert merged                                                   # the synthetic panel has a near copy of 'sig'
-    titles = {f["id"]: f["title"] for f in src["factors"]}
-    rep = pd.read_csv(run_dir / "candidates.csv").set_index("id")["rep"]
+    final_titles = {f["title"] for f in src["factors"] if f["stage"] == 4}
     for f in merged:
-        assert f["stage_note"] == f"与「{titles[rep[f['id']]]}」高度相关，去重时并入"
+        assert f["stage_note"].startswith("与「") and f["stage_note"][2:].split("」")[0] in final_titles
 
 
 def test_dropped_factor_in_unopened_run_ignores_oos(tmp_path, costly_run, cfg, panel):
     """A dropped factor of an unconfirmed run: no OOS row, and random OOS data changes nothing."""
     ccfg = load_config(costly_run / "config.toml")
-    before = build_asset_data(costly_run)["sources"][0]
+    before = build_asset_data(costly_run)
     dropped = [f for f in before["factors"] if f["stage"] == 2]
     assert dropped and all(2 not in f["nav"]["seg"] and f["segments"][2] == {"seg": 2, "name": "样本外", "opened": False}
                            for f in before["factors"])
@@ -652,14 +525,280 @@ def test_dropped_factor_in_unopened_run_ignores_oos(tmp_path, costly_run, cfg, p
     d2 = tmp_path / "run2"
     shutil.copytree(costly_run, d2)
     Panel(target=tgt, X=X, meta=panel.meta, excluded=panel.excluded, info=panel.info).save(d2 / "panel")
-    after = build_asset_data(d2)["sources"][0]
-    assert {**after, "run_dir": ""} == {**before, "run_dir": ""}
+    after = build_asset_data(d2)
+    assert _strip(after) == _strip(before)
 
 
-def test_no_candidate_totals_anywhere(tmp_path, ab_dirs):
+# ------------------------------------------------------------- 11. one library per target, no sources
+def _strip(d):
+    return {k: v for k, v in d.items() if k not in ("created_at", "runs")}
+
+
+def _series(rng, n=400, start="2015-01-01"):
+    return pd.Series(rng.normal(0, 1, n), index=pd.bdate_range(start, periods=n))
+
+
+def test_identity_of_signals():
+    rng = np.random.default_rng(3)
+    a = _series(rng)
+    noisy = a + rng.normal(0, 0.0316, len(a))
+    assert 0.999 < np.corrcoef(a, noisy)[0, 1] < 0.9999
+    assert is_same_factor("chg_20", a, "chg_20", a.copy())
+    assert is_same_factor("chg_20", a, "chg_20", -a)                      # reversed sign: still the same factor
+    assert is_same_factor("chg_20", a, "chg_20", noisy)
+    loose = a + rng.normal(0, 0.1425, len(a))
+    assert 0.985 < np.corrcoef(a, loose)[0, 1] < 0.995
+    assert not is_same_factor("chg_20", a, "chg_20", loose)               # 0.99: different
+    assert not is_same_factor("chg_20", a, "z_60", a.copy())              # transform names differ
+    late = a.copy()
+    late.index = late.index + pd.offsets.BDay(200)                        # only 200 common dates
+    assert len(a.index.intersection(late.index)) < 250
+    assert not is_same_factor("chg_20", a, "chg_20", late)
+    mid = pd.Series(a.to_numpy(), index=pd.bdate_range("2015-01-01", periods=len(a)))
+    assert is_same_factor("chg_20", a, "chg_20", mid.iloc[:260])          # 260 common dates are enough
+
+
+def test_identity_is_transitive():
+    rng = np.random.default_rng(11)
+    a = _series(rng, 2000)
+    b = a + rng.normal(0, 0.0345, len(a))
+    c = b + rng.normal(0, 0.0345, len(a))
+    r = lambda x, y: abs(np.corrcoef(x, y)[0, 1])
+    assert r(a, b) >= 0.999 and r(b, c) >= 0.999 and r(a, c) < 0.999       # a-c alone would not merge
+    other = _series(rng, 2000)
+    es = [{"transform": "chg_5", "dev": s} for s in (a, other, b, c)]
+    assert group_same_factors(es) == [[0, 2, 3], [1]]
+
+
+def test_choose_keeper_rules():
+    m = lambda **kw: {"opened": False, "run_idx": 0, "z": 3.0, "id": "x", **kw}
+    assert choose_keeper([m(run_idx=0), m(run_idx=1)]) == 1                        # newer run
+    assert choose_keeper([m(run_idx=2), m(run_idx=1)]) == 0
+    assert choose_keeper([m(run_idx=0, opened=True), m(run_idx=1)]) == 0           # opened OOS beats newer
+    assert choose_keeper([m(run_idx=0, opened=True), m(run_idx=1, opened=True)]) == 1
+    assert choose_keeper([m(z=-4.0), m(z=3.0)]) == 0                               # same run: larger |z|
+
+
+@pytest.fixture(scope="module")
+def alias_dirs(tmp_path_factory, cfg, cfg_path):
+    """Run B: the same data as run_dir, but the planted series 'sig' is called 'alias' (identical values) and the
+    near copy 'sig2' is absent. Unopened, and an opened copy."""
+    base = tmp_path_factory.mktemp("alias")
+    pb = make_panel(1, plant=True, short=True)
+    pb.X = pb.X.rename(columns={"sig": "alias"})
+    pb.meta = pb.meta.rename(index={"sig": "alias"})
+    pb.meta.loc["alias", ["ticker", "description"]] = ["alias", "desc alias"]
+    mine(cfg, base / "b", panel=pb, config_path=cfg_path)
+    shutil.copytree(base / "b", base / "b_open")
+    confirm(base / "b_open")
+    return base / "b", base / "b_open"
+
+
+@pytest.fixture(scope="module")
+def noisy_run(tmp_path_factory, cfg, cfg_path):
+    """Run C: 'alias' is 'sig' plus noise (corr of the signals ~0.86: related, not the same)."""
+    base = tmp_path_factory.mktemp("noisy")
+    pc = make_panel(1, plant=True, short=True)
+    rng = np.random.default_rng(99)
+    pc.X["sig"] = pc.X["sig"] + np.cumsum(rng.normal(0, 0.6, len(pc.X)))
+    pc.X = pc.X.rename(columns={"sig": "noisy"})
+    pc.meta = pc.meta.rename(index={"sig": "noisy"})
+    pc.meta.loc["noisy", ["ticker", "description"]] = ["noisy", "desc noisy"]
+    mine(cfg, base / "c", panel=pc, config_path=cfg_path)
+    assert "noisy|chg_1" in set(pd.read_csv(base / "c" / "shortlist.csv")["id"])
+    return base / "c"
+
+
+def _by_id(data):
+    return {f["id"]: f for f in data["factors"]}
+
+
+def test_same_underlying_signal_appears_once(run_dir, alias_dirs):
+    b, _ = alias_dirs
+    for order in ([run_dir, b], [b, run_dir]):
+        d = build_asset_data(order)
+        ids = [f["id"] for f in d["factors"]]
+        assert len(ids) == len(set(ids))
+        keeper = "alias|chg_1" if order[-1] == b else "sig|chg_1"              # both unopened: the newer run wins
+        other = "sig|chg_1" if keeper == "alias|chg_1" else "alias|chg_1"
+        assert keeper in ids and other not in ids
+        assert other in _by_id(d)[keeper]["also_as"]
+        assert not any(i in _by_id(d)[keeper]["also_as"] for i in [keeper])
+        assert d["n_merged"] >= 1
+        cands = [pd.read_csv(p / "candidates.csv") for p in order]
+        total = sum(int((c["verdict"] != "REJECT").sum()) for c in cands)
+        assert len(ids) + d["n_merged"] == total                              # merged ones are accounted for
+
+
+def test_opened_run_wins_the_merge(run_dir, alias_dirs, opened_dir):
+    b, b_open = alias_dirs
+    d = build_asset_data([b_open, run_dir])                    # opened run first (older), unopened run is newer
+    f = _by_id(d)
+    assert "alias|chg_1" in f and "sig|chg_1" not in f and "sig|chg_1" in f["alias|chg_1"]["also_as"]
+    assert f["alias|chg_1"]["oos_opened"] is True and set(f["alias|chg_1"]["nav"]["seg"]) == {0, 1, 2}
+    d = build_asset_data([run_dir, b_open])
+    assert "alias|chg_1" in _by_id(d) and "sig|chg_1" not in _by_id(d)
+    d = build_asset_data([opened_dir, b])                       # the opened one is the older run and still wins
+    f = _by_id(d)
+    assert "sig|chg_1" in f and "alias|chg_1" not in f and "alias|chg_1" in f["sig|chg_1"]["also_as"]
+    assert f["sig|chg_1"]["oos_opened"] is True
+
+
+def test_pooled_dedupe_across_runs(run_dir, noisy_run):
+    d = build_asset_data([run_dir, noisy_run])
+    f = _by_id(d)
+    assert "noisy|chg_1" in f and "sig|chg_1" in f                   # related but not the same: both are kept ...
+    n, s = f["noisy|chg_1"], f["sig|chg_1"]
+    finals = {x["title"]: x for x in d["factors"] if x["stage"] == 4}
+    assert n["stage"] == 3 and n["t_dev"] < s["t_dev"]                # ... and the weaker one is merged into a stronger
+    rep_title = n["stage_note"][2:].split("」")[0]
+    assert n["stage_note"] == f"与「{rep_title}」高度相关，去重时并入" and rep_title in finals
+    assert finals[rep_title]["t_dev"] > n["t_dev"]
+    assert d["funnel"]["n_final"] == len(finals)
+
+
+def test_pooled_verdicts_match_confirm_csv(opened_dir, alias_dirs, run_dir):
+    b, _ = alias_dirs
+    cf = pd.read_csv(opened_dir / "confirm.csv").set_index("id")
+    d = build_asset_data([opened_dir, b])
+    hit = 0
+    for f in d["factors"]:
+        if f["stage"] == 4 and f["id"] in cf.index:
+            assert f["oos_opened"] and f["oos_verdict"] == cf.loc[f["id"], "verdict"]
+            c = f["oos_confirm"]
+            assert c["t_signed"] == pytest.approx(cf.loc[f["id"], "t_signed"], rel=1e-9)
+            assert c["retention_oos"] == pytest.approx(cf.loc[f["id"], "retention_oos"], rel=1e-9)
+            hit += 1
+    assert hit >= 2
+    for f in d["factors"]:
+        if f["stage"] == 4 and not f["oos_opened"]:
+            assert f["oos_verdict"] is None and f["oos_confirm"] is None
+        if f["stage"] < 4:
+            assert f["oos_verdict"] is None
+    oc = d["oos_counts"]
+    assert oc["unopened"] == sum(1 for f in d["factors"] if f["stage"] == 4 and not f["oos_opened"])
+    assert oc["confirmed"] + oc["consistent"] + oc["failed"] + oc["insufficient"] + oc["unopened"] == d["funnel"]["n_final"]
+
+
+def test_oos_verdict_function():
+    from tsminer.confirm import oos_verdict
+    assert oos_verdict(float("nan"), 0.1, 0.1, 0.5) == "INSUFFICIENT"
+    assert oos_verdict(3.0, 0.1, 0.1, 0.5) == "CONFIRMED"
+    assert oos_verdict(0.2, 0.06, 0.1, 0.5) == "CONSISTENT"
+    assert oos_verdict(0.2, 0.04, 0.1, 0.5) == "FAILED"
+    assert oos_verdict(0.2, -0.06, 0.1, 0.5) == "FAILED"
+    assert oos_verdict(3.0, 0.1, 0.1, 0.5, sufficient=False) == "INSUFFICIENT"
+
+
+def test_unopened_runs_stay_isolated_in_the_pool(tmp_path, panel, cfg, opened_dir, noisy_run):
+    b = noisy_run                                               # its factors are not copies of the opened run's
+    before = build_asset_data([opened_dir, b])
+    unopened = [f for f in before["factors"] if not f["oos_opened"]]
+    assert unopened and all(2 not in f["nav"]["seg"] for f in unopened)
+    assert any(f["oos_opened"] for f in before["factors"])
+    b2 = tmp_path / "b2"
+    shutil.copytree(b, b2)
+    pb = Panel.load(b / "panel")
+    prep = prepare(pb, load_config(b / "config.toml"))
+    cols = list(prep["S"].columns)
+    cdf = pd.read_csv(b / "candidates.csv")
+    c = max(int(prep["rows"][int(prep["e2"][cols.index(i)])]) for i in cdf.loc[cdf["verdict"] != "REJECT", "id"])
+    assert c < len(pb.target) - 5
+    rng = np.random.default_rng(8)
+    tgt, X = pb.target.copy(), pb.X.copy()
+    tgt.iloc[c + 1:] = rng.normal(0, 0.005, len(tgt) - c - 1)
+    for col in X.columns:
+        fin = np.isfinite(X[col].to_numpy()) & (np.arange(len(X)) >= c)
+        X.loc[fin, col] = rng.normal(0, 50, int(fin.sum()))
+    Panel(target=tgt, X=X, meta=pb.meta, excluded=pb.excluded, info=pb.info).save(b2 / "panel")
+    after = build_asset_data([opened_dir, b2])
+    assert _strip(after) == _strip(before)                      # the opened run's factors too are unaffected
+
+
+def test_counts_and_uniqueness(run_dir, alias_dirs, noisy_run, opened_dir):
+    b, _ = alias_dirs
+    runs = [run_dir, b, noisy_run, opened_dir]
+    d = build_asset_data(runs)
+    ids = [f["id"] for f in d["factors"]]
+    assert len(ids) == len(set(ids))
+    fn = d["funnel"]
+    assert fn["n_is"] >= fn["n_obs"] >= fn["n_trade"] >= fn["n_final"]
+    total = sum(int((pd.read_csv(p / "candidates.csv")["verdict"] != "REJECT").sum()) for p in runs)
+    assert fn["n_is"] + d["n_merged"] == total and fn["n_is"] == len(ids)
+    assert d["runs"] == [p.name for p in runs] and not d["criteria_mixed"]
+
+
+def test_criteria_mixed_flag(tmp_path, run_dir):
+    other = tmp_path / "other"
+    shutil.copytree(run_dir, other)
+    rj = json.loads((other / "run.json").read_text())
+    rj["config"]["verdict"]["z_weak"] = 1.9
+    (other / "run.json").write_text(json.dumps(rj))
+    assert build_asset_data([run_dir, other])["criteria_mixed"] is True        # the newest run's gates are used
+    assert build_asset_data([other, run_dir])["criteria"]["z_weak"] == json.loads(
+        (run_dir / "run.json").read_text())["config"]["verdict"]["z_weak"]
+
+
+def test_registry(tmp_path, run_dir, alias_dirs):
+    b, _ = alias_dirs
+    out = tmp_path / "site"
+    build_site([run_dir], out)
+    ids_a = {f["id"] for f in json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))["factors"]}
+    build_site([b], out)                                              # only the new run is given
+    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
+    reg = json.loads((out / "runs.json").read_text())
+    assert reg == [str(run_dir.resolve()), str(b.resolve())]
+    assert d["runs"] == [run_dir.name, b.name] and "alias|chg_1" in {f["id"] for f in d["factors"]} \
+        and {i for i in ids_a if not i.startswith("sig|")} <= {f["id"] for f in d["factors"]}
+    build_site([run_dir], out)                                        # known run: no duplicate registry entry
+    assert len(json.loads((out / "runs.json").read_text())) == 2
+    build_site([b], out, reset=True)
+    d = json.loads((out / "data" / "test.json").read_text(encoding="utf-8"))
+    assert json.loads((out / "runs.json").read_text()) == [str(b.resolve())] and d["runs"] == [b.name]
+    assert not any(f["series"] == "sig" for f in d["factors"])
+    # a registered directory that is gone: error naming it
+    gone = tmp_path / "gone"
+    shutil.copytree(b, gone)
+    out2 = tmp_path / "site2"
+    build_site([gone], out2)
+    shutil.rmtree(gone)
+    with pytest.raises(ValueError, match=str(gone.resolve())):
+        build_site([run_dir], out2)
+    build_site([run_dir], out2, reset=True)
+    with pytest.raises(ValueError, match="no run directories"):
+        build_site([], tmp_path / "empty")
+    r = _cli(run_dir, "--out", out2)
+    assert r.returncode == 0
+    shutil.rmtree(gone, ignore_errors=True)
+    reg2 = json.loads((out2 / "runs.json").read_text())
+    assert reg2 == [str(run_dir.resolve())]
+
+
+def test_cli_missing_registered_run_fails(tmp_path, run_dir, alias_dirs):
+    b, _ = alias_dirs
+    gone = tmp_path / "gone"
+    shutil.copytree(b, gone)
     out = tmp_path / "s"
-    build_site(list(ab_dirs), out)
+    assert _cli(gone, "--out", out).returncode == 0
+    shutil.rmtree(gone)
+    r = _cli(run_dir, "--out", out)
+    assert r.returncode == 1 and str(gone.resolve()) in r.stderr and "--reset" in r.stderr
+
+
+def test_no_sources_and_no_candidate_totals(tmp_path, run_dir, alias_dirs):
+    b, _ = alias_dirs
+    out = tmp_path / "s"
+    build_site([run_dir, b], out)
     data = (out / "data" / "test.json").read_text(encoding="utf-8")
-    assert '"tested"' not in data and "检" + "验" not in data
+    assert '"sources"' not in data and '"tested"' not in data and "检" + "验" not in data
+    assert "来源" not in data
     for name in ("artifact.html", "index.html"):
-        assert "检" + "验" not in (out / name).read_text(encoding="utf-8")
+        html = (out / name).read_text(encoding="utf-8")
+        assert "检" + "验" not in html and "来源" not in html and "sources" not in html
+
+
+def test_universe_name_is_not_a_config_key(tmp_path, cfg_path):
+    p = tmp_path / "c.toml"
+    p.write_text(TOML + '\n[universe]\nname = "x"\n')
+    with pytest.raises(ValueError, match="unknown key"):
+        load_config(p)

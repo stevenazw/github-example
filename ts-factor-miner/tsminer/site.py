@@ -16,7 +16,9 @@ import pandas as pd
 
 from .config import load_config
 from .databank import Panel
-from .pipeline import _corr, _jsonable, positions, prepare
+from .confirm import OOS_MIN_OBS, oos_verdict
+from .pipeline import _corr, _jsonable, dedupe, positions, prepare
+from .stats import hac_t, norm_sf
 
 TARGET_VOL = 0.10          # in-sample annualised vol the net value is scaled to
 MAX_POINTS = 1500
@@ -156,32 +158,77 @@ def downsample_idx(seg, max_points=MAX_POINTS) -> np.ndarray:
 
 
 # --------------------------------------------------------------- per-asset data
-DEFAULT_SOURCE = "原始序列扫描"
-VARIABLE_SOURCE = "变量清单"
-
-
-def infer_source_name(universe_name, series_ids) -> str:
-    """Source label of one run: ``universe.name`` if set, else "变量清单" when a ``var:`` series is present
-    (in the shortlist or in the panel meta), else "原始序列扫描"."""
-    name = str(universe_name or "").strip()
-    if name:
-        return name
-    if any(str(x).startswith("var:") for x in series_ids):
-        return VARIABLE_SOURCE
-    return DEFAULT_SOURCE
+STAGE_NAMES = {4: "去重后留下", 3: "去重时被合并", 2: "可交易筛选未通过", 1: "观察期未保留"}
+IDENTITY_CORR = 0.999          # |corr| of two signals of the same transform on their common DEV dates: same factor
+IDENTITY_MIN_OVERLAP = 250     # fewer common DEV dates than this: never the same factor
+DEDUPE_MIN_OVERLAP = 100       # same as pipeline.dedupe
 
 
 def _read_run(run_dir: Path) -> dict:
     return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
 
 
-STAGE_NAMES = {4: "去重后留下", 3: "去重时被合并", 2: "可交易筛选未通过", 1: "观察期未保留"}
+def _common_abs_corr(a: pd.Series, b: pd.Series, min_overlap: int) -> float:
+    """|Pearson corr| of two date-indexed series on their common finite dates; NaN if fewer than min_overlap."""
+    idx = a.index.intersection(b.index)
+    if len(idx) < min_overlap:
+        return float("nan")
+    x, y = a.loc[idx].to_numpy(dtype=float), b.loc[idx].to_numpy(dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < min_overlap:
+        return float("nan")
+    x, y = x[m] - x[m].mean(), y[m] - y[m].mean()
+    den = float(np.sqrt((x * x).sum() * (y * y).sum()))
+    return abs(float((x * y).sum()) / den) if den > 0 else float("nan")
 
 
-def factor_stage(row, shortlist_ids) -> int:
-    """Furthest layer an IS-passing candidate reached: 1 observation period dropped it, 2 tradability screen
-    dropped it, 3 merged into another representative at de-duplication, 4 kept (in the shortlist).
-    Runs from before the tradability screen have no ``trade_status``: that layer is then passed by everyone."""
+def is_same_factor(transform_a, dev_a: pd.Series, transform_b, dev_b: pd.Series,
+                   thresh=IDENTITY_CORR, min_overlap=IDENTITY_MIN_OVERLAP) -> bool:
+    """Same factor: same transform name and |corr| >= thresh of the DEV signals on their common dates (the sign
+    of the correlation does not matter); fewer than ``min_overlap`` common dates: not the same."""
+    if str(transform_a) != str(transform_b):
+        return False
+    c = _common_abs_corr(dev_a, dev_b, min_overlap)
+    return bool(np.isfinite(c) and c >= thresh)
+
+
+def group_same_factors(entries) -> list[list[int]]:
+    """Transitive grouping (union-find) of entries (dicts with ``transform`` and ``dev``) by ``is_same_factor``.
+    Returns groups of indices, each in ascending order, groups ordered by their first member."""
+    parent = list(range(len(entries)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    by_t: dict[str, list[int]] = {}
+    for i, e in enumerate(entries):
+        by_t.setdefault(str(e["transform"]), []).append(i)
+    for idx in by_t.values():
+        for x, i in enumerate(idx):
+            for j in idx[x + 1:]:
+                if find(i) != find(j) and is_same_factor(entries[i]["transform"], entries[i]["dev"],
+                                                         entries[j]["transform"], entries[j]["dev"]):
+                    parent[find(j)] = find(i)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(entries)):
+        groups.setdefault(find(i), []).append(i)
+    return sorted(groups.values(), key=lambda g: g[0])
+
+
+def choose_keeper(members) -> int:
+    """Index (into ``members``: dicts with ``opened``, ``run_idx``, ``z``, ``id``) of the entry that represents a
+    group of identical factors: a run whose OOS is open first, then the newer run (later in registry order),
+    then the larger |z|."""
+    return max(range(len(members)), key=lambda k: (bool(members[k]["opened"]), members[k]["run_idx"],
+                                                    abs(float(members[k]["z"])), str(members[k]["id"])))
+
+
+def factor_stage(row, is_representative) -> int:
+    """Furthest layer a factor reached: 1 the observation period dropped it, 2 the tradability screen dropped
+    it, 3 merged into another representative at de-duplication, 4 kept. Runs from before the tradability
+    screen have no ``trade_status``: that layer is then passed by everyone."""
     def get(k):
         v = row.get(k, "")
         return "" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v)
@@ -189,11 +236,12 @@ def factor_stage(row, shortlist_ids) -> int:
         return 1
     if get("trade_status") == "DROP":
         return 2
-    return 4 if row["id"] in shortlist_ids else 3
+    return 4 if is_representative else 3
 
 
-def stage_note(row, stage, criteria, titles) -> str:
-    """One sentence naming the gate that stopped the candidate, with the numbers (from the CSV and the config)."""
+def stage_note(row, stage, criteria, rep_title=None) -> str:
+    """One sentence naming the gate that stopped the factor, with the numbers (from the CSV row and the config
+    of the run it was tested in)."""
     if stage == 1:
         r, lim = row.get("retention"), criteria.get("obs_min_retention")
         if r is None or not np.isfinite(float(r)):
@@ -205,8 +253,7 @@ def stage_note(row, stage, criteria, titles) -> str:
         shs = f"{float(sh):.2f}" if sh is not None and np.isfinite(float(sh)) else "无法计算"
         return f"扣成本后净 Sharpe {shs}，低于 {_g(criteria.get('min_net_sharpe'))}"
     if stage == 3:
-        rep = row.get("rep")
-        return f"与「{titles.get(rep, rep)}」高度相关，去重时并入" if isinstance(rep, str) and rep else "去重时并入其他代表"
+        return f"与「{rep_title}」高度相关，去重时并入" if rep_title else "去重时并入其他代表"
     return ""
 
 
@@ -216,189 +263,260 @@ def stage_counts(factors) -> dict:
     return {"n_is": n(1), "n_obs": n(2), "n_trade": n(3), "n_final": n(4)}
 
 
-def build_source_data(run_dir) -> tuple[dict, dict]:
-    """One run directory -> (asset-level header, source dict). Reads ``confirm.*`` only if ``confirm.json`` exists."""
+def pool_representatives(order_keys, dev_by_key, thresh) -> dict:
+    """De-duplication over the pooled tradable factors (same greedy rule as ``pipeline.dedupe``): ``order_keys``
+    best t_dev first; returns key -> representative key."""
+    if not order_keys:
+        return {}
+    df = pd.DataFrame({k: dev_by_key[k] for k in order_keys})
+    return dedupe(order_keys, df, thresh, DEDUPE_MIN_OVERLAP)
+
+
+def _criteria_of(run: dict) -> dict:
+    vd = run["config"]["verdict"]
+    c = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
+    if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
+        c["min_net_sharpe"] = vd["min_net_sharpe"]
+    if "dedupe_corr" in vd:
+        c["dedupe_corr"] = vd["dedupe_corr"]
+    return c
+
+
+def _load_run(run_dir, idx: int) -> dict:
+    """Everything needed from one run directory. ``confirm.*`` is not read; whether the OOS is open is decided by
+    the existence of ``confirm.json`` alone and only then are OOS rows used."""
     d = Path(run_dir)
     run = _read_run(d)
-    target = run["target"]
-    slug = slugify(target)
     cfg = load_config(d / "config.toml")
     panel = Panel.load(d / "panel")
     opened = (d / "confirm.json").exists()
-
-    verdicts, oos_info = {}, {}
-    if opened:
-        cdf = pd.read_csv(d / "confirm.csv") if (d / "confirm.csv").exists() else pd.DataFrame()
-        for _, r in cdf.iterrows():
-            verdicts[r["id"]] = str(r["verdict"])
-            oos_info[r["id"]] = _jsonable({k: r[k] for k in ("n", "oos_start", "oos_end", "t_signed", "p_one",
-                                                                "ic_oos_signed", "retention_oos", "sharpe_net")
-                                           if k in r.index})
-    short = pd.read_csv(d / "shortlist.csv")
-    short_by_id = {r["id"]: r for _, r in short.iterrows()}
     cand = pd.read_csv(d / "candidates.csv")
     for c in ("flags", "obs_status", "trade_status", "rep"):
         if c in cand.columns:
             cand[c] = cand[c].fillna("").astype(str)
     cand = cand[cand["verdict"] != "REJECT"].reset_index(drop=True)          # everything that passed the IS bar
-    source_name = infer_source_name(cfg.universe.name, list(cand["series"]) + list(short["series"])
-                                    + list(panel.meta.index))
-    cfg_d = run["config"]
-    vd = cfg_d["verdict"]
-    criteria = {"z_weak": vd["z_weak"], "obs_min_retention": vd["obs_min_retention"]}
-    if "min_net_sharpe" in vd:                       # runs made before the tradability screen lack it
-        criteria["min_net_sharpe"] = vd["min_net_sharpe"]
-    if "dedupe_corr" in vd:
-        criteria["dedupe_corr"] = vd["dedupe_corr"]
-    short_ids = set(short["id"])
-    desc_of = panel.meta["description"] if "description" in panel.meta.columns else pd.Series(dtype=object)
-
-    def display(r):
-        desc = desc_of.get(r["series"], "")
-        desc = desc if isinstance(desc, str) and desc else str(r["series"])
-        return desc, f"{desc} · {transform_label(r['transform'])}"
-    titles = {r["id"]: display(r)[1] for _, r in cand.iterrows()}
-
     prep = prepare(panel, cfg)
-    S, rows = prep["S"], prep["rows"]
-    cal = panel.target.index
-    y_all = prep["y_fwd"].to_numpy(dtype=float)[rows]
-    sig_all = prep["sigma"].to_numpy(dtype=float)[rows]
-    S_np = S.to_numpy(dtype=float)[rows]
-    col_of = {c: i for i, c in enumerate(S.columns)}
-    is_m, obs_m, oos_m = prep["is_mask"], prep["obs_mask"], prep["oos_mask"]
-    real_dates = np.asarray(cal[rows + 1].strftime("%Y-%m-%d"))    # return of row p is realised on row p+1
-    rep_count = cand["rep"].value_counts() if "rep" in cand.columns else pd.Series(dtype=int)
+    rows = prep["rows"]
+    S_np = prep["S"].to_numpy(dtype=float)[rows]
+    return {"dir": d, "name": d.resolve().name, "idx": idx, "run": run, "cfg": cfg, "panel": panel,
+            "opened": bool(opened), "cand": cand, "prep": prep, "S_np": S_np,
+            "y": prep["y_fwd"].to_numpy(dtype=float)[rows], "sig": prep["sigma"].to_numpy(dtype=float)[rows],
+            "col_of": {c: i for i, c in enumerate(prep["S"].columns)},
+            "cal": panel.target.index, "criteria": _criteria_of(run)}
 
-    factors, skipped = [], []
-    for _, r in cand.iterrows():
-        cid = r["id"]
-        if cid not in col_of:
-            skipped.append({"id": cid, "reason": "信号不在候选池中"})
-            continue
-        j = col_of[cid]
-        mask = is_m[:, j] | obs_m[:, j] | (oos_m[:, j] if opened else False)
-        idx = np.flatnonzero(mask)
-        seg = np.where(is_m[idx, j], 0, np.where(obs_m[idx, j], 1, 2))
-        sign = float(r["sign"])
-        res = factor_nav(S_np[idx, j], y_all[idx], sig_all[idx], seg, real_dates[idx], sign,
-                         cfg.position.buffer, cfg.target.cost_per_side)
-        if res is None:
-            skipped.append({"id": cid, "reason": "样本内净收益波动为 0 或无法计算，无法标定净值"})
-            continue
-        segments = res["segments"]
-        if not opened:
-            segments[2] = {"seg": 2, "name": SEG_NAMES[2], "opened": False}
-        keep = downsample_idx(seg)
-        meta_row = panel.meta.loc[r["series"]]
-        desc, title = display(r)
-        stage = factor_stage(r, short_ids)
-        final = stage == 4
-        verdict = verdicts.get(cid) if (opened and final) else None
-        sr = short_by_id.get(cid)
-        csize = int(sr["cluster_size"]) if sr is not None else (int(rep_count.get(cid, 0)) or None)
-        factors.append(_jsonable({
-            "id": cid, "series": r["series"], "transform": r["transform"],
-            "title": title, "description": desc,
-            "group": r["group"], "sign": int(sign), "direction": direction_text(sign, target),
-            "formula": formula_text(meta_row, r["transform"], cfg, sign),
-            "is_verdict": str(r["verdict"]), "stage": stage, "stage_note": stage_note(r, stage, criteria, titles),
-            "z": float(r["z"]), "t_dev": float(r["t_dev"]) if pd.notna(r["t_dev"]) else None, "cluster_size": csize,
-            "flags": flag_texts(r["flags"]), "oos_verdict": verdict,
-            "oos_confirm": oos_info.get(cid) if (opened and final) else None,
-            "segments": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in sg.items()}
+
+def _display(ctx, r):
+    meta = ctx["panel"].meta
+    desc = meta["description"].get(r["series"], "") if "description" in meta.columns else ""
+    desc = desc if isinstance(desc, str) and desc else str(r["series"])
+    return desc, f"{desc} · {transform_label(r['transform'])}"
+
+
+def _dev_series(ctx, j) -> pd.Series:
+    prep = ctx["prep"]
+    idx = np.flatnonzero(prep["is_mask"][:, j] | prep["obs_mask"][:, j])
+    return pd.Series(ctx["S_np"][idx, j], index=ctx["cal"][prep["rows"][idx]])
+
+
+def _factor_nav(ctx, j, sign):
+    """Net value and segment stats of column j of one run (all three segments if its OOS is open, else DEV only)."""
+    prep, opened = ctx["prep"], ctx["opened"]
+    is_m, obs_m, oos_m = prep["is_mask"], prep["obs_mask"], prep["oos_mask"]
+    real_dates = np.asarray(ctx["cal"][prep["rows"] + 1].strftime("%Y-%m-%d"))   # return of row p: row p+1
+    mask = is_m[:, j] | obs_m[:, j] | (oos_m[:, j] if opened else False)
+    idx = np.flatnonzero(mask)
+    seg = np.where(is_m[idx, j], 0, np.where(obs_m[idx, j], 1, 2))
+    cfg = ctx["cfg"]
+    res = factor_nav(ctx["S_np"][idx, j], ctx["y"][idx], ctx["sig"][idx], seg, real_dates[idx], sign,
+                     cfg.position.buffer, cfg.target.cost_per_side)
+    if res is None:
+        return None
+    segments = res["segments"]
+    if not opened:
+        segments[2] = {"seg": 2, "name": SEG_NAMES[2], "opened": False}
+    keep = downsample_idx(seg)
+    return {"segments": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in sg.items()}
                          for sg in segments],
             "nav": {"dates": [str(x) for x in real_dates[idx][keep]],
                     "values": [round(float(v), 4) for v in res["nav"][keep]],
-                    "seg": [int(v) for v in seg[keep]]},
+                    "seg": [int(v) for v in seg[keep]]}}
+
+
+def _oos_conclusion(ctx, j, sign, ic_is):
+    """(verdict, details) of one factor of a run whose OOS is open, by the same rule and statistics as ``confirm``."""
+    prep = ctx["prep"]
+    m = prep["oos_mask"][:, j]
+    t_oos, ic_oos, n = hac_t(ctx["S_np"][m, j][:, None], ctx["y"][m], ctx["cfg"].stats.hac_lags, OOS_MIN_OBS)
+    t_signed, ic_signed = sign * t_oos[0], sign * ic_oos[0]
+    verdict = oos_verdict(t_signed, ic_signed, ic_is, ctx["cfg"].verdict.obs_min_retention)
+    return verdict, _jsonable({"n": int(n[0]), "t_signed": t_signed, "p_one": float(norm_sf(t_signed)),
+                               "ic_oos_signed": ic_signed, "retention_oos": ic_signed / abs(float(ic_is))})
+
+
+def build_asset_data(run_dirs) -> dict:
+    """The factor library of one target, pooled over one run directory or a list of them (same target; the order
+    is the registry order, later = newer)."""
+    if isinstance(run_dirs, (str, Path)):
+        run_dirs = [run_dirs]
+    ctxs = [_load_run(p, i) for i, p in enumerate(run_dirs)]
+    slugs = {slugify(c["run"]["target"]) for c in ctxs}
+    if len(slugs) != 1:
+        raise ValueError(f"run directories belong to different targets: {sorted(slugs)}")
+    target, slug = ctxs[0]["run"]["target"], slugs.pop()
+
+    # ---- 1. pool the factors that passed the IS bar, with their DEV signals
+    entries, skipped = [], []
+    for ctx in ctxs:
+        for _, r in ctx["cand"].iterrows():
+            if r["id"] not in ctx["col_of"]:
+                skipped.append({"id": r["id"], "reason": "信号不在候选池中"})
+                continue
+            j = ctx["col_of"][r["id"]]
+            entries.append({"ctx": ctx, "row": r, "j": j, "id": r["id"], "transform": r["transform"],
+                            "run_idx": ctx["idx"], "opened": ctx["opened"], "z": float(r["z"]),
+                            "dev": _dev_series(ctx, j)})
+    n_passed = len(entries)
+
+    # ---- 2. the same factor tested under different ids / in different runs is one factor
+    keepers = []
+    for g in group_same_factors(entries):
+        members = [entries[i] for i in g]
+        k = members[choose_keeper(members)]
+        k["also_as"] = list(dict.fromkeys(m["id"] for m in members if m is not k and m["id"] != k["id"]))
+        keepers.append(k)
+    n_merged = n_passed - len(keepers)
+
+    # ---- 3. net value and segment stats of every kept factor (OOS rows only from runs whose OOS is open)
+    pool = []
+    for e in keepers:
+        ctx, r = e["ctx"], e["row"]
+        sign = float(r["sign"])
+        nav = _factor_nav(ctx, e["j"], sign)
+        if nav is None:
+            skipped.append({"id": e["id"], "reason": "样本内净收益波动为 0 或无法计算，无法标定净值"})
+            continue
+        e["nav"], e["sign"] = nav, sign
+        e["desc"], e["title"] = _display(ctx, r)
+        pool.append(e)
+
+    # ---- 4. layers on the pooled factors; de-duplication is recomputed on the pooled tradable ones
+    criteria = ctxs[-1]["criteria"]                                      # gates of the newest run
+    criteria_mixed = any(c["criteria"] != criteria for c in ctxs)
+    for n_, e in enumerate(pool):
+        e["key"] = f"k{n_}"
+        e["obs_ok"] = e["row"]["obs_status"] != "DROP"
+        e["trade_ok"] = str(e["row"].get("trade_status", "")) != "DROP"
+    tradable = [e for e in pool if e["obs_ok"] and e["trade_ok"]]
+    t_of = lambda e: float(e["row"]["t_dev"]) if pd.notna(e["row"]["t_dev"]) else float("-inf")
+    tradable.sort(key=lambda e: -t_of(e))                                # stable: ties keep the pool order
+    thresh = criteria.get("dedupe_corr", 0.7)
+    rep_of = pool_representatives([e["key"] for e in tradable], {e["key"]: e["dev"] for e in tradable}, thresh)
+    by_key = {e["key"]: e for e in pool}
+
+    factors = []
+    for e in pool:
+        ctx, r = e["ctx"], e["row"]
+        rep = rep_of.get(e["key"])
+        stage = factor_stage(r, rep == e["key"])
+        verdict, detail = None, None
+        if stage == 4 and ctx["opened"]:
+            verdict, detail = _oos_conclusion(ctx, e["j"], e["sign"], float(r["ic"]))
+        factors.append(_jsonable({
+            "id": e["id"], "series": r["series"], "transform": r["transform"],
+            "title": e["title"], "description": e["desc"], "also_as": e["also_as"],
+            "group": r["group"], "sign": int(e["sign"]), "direction": direction_text(e["sign"], target),
+            "formula": formula_text(ctx["panel"].meta.loc[r["series"]], r["transform"], ctx["cfg"], e["sign"]),
+            "is_verdict": str(r["verdict"]), "stage": stage,
+            "stage_note": stage_note(r, stage, ctx["criteria"], by_key[rep]["title"] if stage == 3 else None),
+            "z": float(r["z"]), "t_dev": float(r["t_dev"]) if pd.notna(r["t_dev"]) else None,
+            "cluster_size": (sum(1 for v in rep_of.values() if v == e["key"]) if stage == 4 else None),
+            "flags": flag_texts(r["flags"]), "oos_opened": ctx["opened"],
+            "oos_verdict": verdict, "oos_confirm": detail,
+            "segments": e["nav"]["segments"], "nav": e["nav"]["nav"],
         }))
 
     def sort_key(f):
         if f["stage"] == 4:
-            v = VERDICT_ORDER.get(f["oos_verdict"], 4) if opened else 4
+            v = VERDICT_ORDER.get(f["oos_verdict"], 4)
             t = f["t_dev"] if f["t_dev"] is not None else float("-inf")
             return (-4, v, -t)
         return (-f["stage"], 0, -abs(f["z"]))
     factors.sort(key=sort_key)
 
-    vc = pd.Series([f["oos_verdict"] for f in factors if f["oos_verdict"]], dtype=object).value_counts()
-    header = {"target": target, "slug": slug, "db_published_at": run["panel_info"].get("published_at"),
-              "sample_start": run["dates"]["sample_start"], "sample_end": run["dates"]["sample_end"]}
-    source = {
-        "name": source_name, "run_dir": d.resolve().name,
-        "is_frac": cfg_d["sample"]["is_frac"], "obs_frac": cfg_d["sample"]["obs_frac"],
-        "oos_opened": bool(opened), "funnel": stage_counts(factors), "criteria": criteria,
-        "oos_counts": ({"confirmed": int(vc.get("CONFIRMED", 0)), "consistent": int(vc.get("CONSISTENT", 0)),
-                        "failed": int(vc.get("FAILED", 0)), "insufficient": int(vc.get("INSUFFICIENT", 0))}
-                       if opened else None),
-        "skipped": skipped, "factors": factors,
-    }
-    return header, source
-
-
-def combine_sources(headers: list[dict], sources: list[dict]) -> dict:
-    """Asset-level record from the per-run headers / sources of one target (command-line order is kept)."""
-    names = [s["name"] for s in sources]
-    dup = sorted({n for n in names if names.count(n) > 1})
-    if dup:
-        raise ValueError(f"target {headers[0]['target']!r}: duplicate source name(s) {dup}; "
-                         "set a distinct [universe] name in the run configs to tell them apart")
-    for i, s in enumerate(sources):
-        s["key"] = f"s{i}"                           # factor ids may repeat across sources; DOM keys are key + id
-    totals = {k: 0 for k in ("confirmed", "consistent", "failed", "insufficient")}
-    for s in sources:
-        for k, v in (s["oos_counts"] or {}).items():
-            totals[k] += v
-    pub = [h["db_published_at"] for h in headers if h["db_published_at"]]
+    final = [f for f in factors if f["stage"] == 4]
+    vc = pd.Series([f["oos_verdict"] for f in final if f["oos_verdict"]], dtype=object).value_counts()
+    oos_counts = {"confirmed": int(vc.get("CONFIRMED", 0)), "consistent": int(vc.get("CONSISTENT", 0)),
+                  "failed": int(vc.get("FAILED", 0)), "insufficient": int(vc.get("INSUFFICIENT", 0)),
+                  "unopened": sum(1 for f in final if not f["oos_opened"])}
+    pub = [c["run"]["panel_info"].get("published_at") for c in ctxs if c["run"]["panel_info"].get("published_at")]
+    last = ctxs[-1]["run"]["config"]["sample"]
     return {
-        "target": headers[0]["target"], "slug": headers[0]["slug"],
+        "target": target, "slug": slug,
         "db_published_at": max(pub) if pub else None,
-        "sample_start": min(h["sample_start"] for h in headers), "sample_end": max(h["sample_end"] for h in headers),
-        "sources": sources,
-        "summary": {"n_factors": sum(len(s["factors"]) for s in sources), "n_sources": len(sources),
-                    "n_final": sum(s["funnel"]["n_final"] for s in sources),
-                    "n_opened": sum(1 for s in sources if s["oos_opened"]), "oos_counts": totals},
+        "sample_start": min(c["run"]["dates"]["sample_start"] for c in ctxs),
+        "sample_end": max(c["run"]["dates"]["sample_end"] for c in ctxs),
+        "is_frac": last["is_frac"], "obs_frac": last["obs_frac"],
+        "funnel": stage_counts(factors), "oos_counts": oos_counts,
+        "criteria": criteria, "criteria_mixed": bool(criteria_mixed),
+        "n_merged": int(n_merged), "factors": factors, "skipped": skipped,
+        "runs": [c["name"] for c in ctxs],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def build_asset_data(run_dirs) -> dict:
-    """Asset data of one target from one run directory or a list of them (all of the same target)."""
-    if isinstance(run_dirs, (str, Path)):
-        run_dirs = [run_dirs]
-    pairs = [build_source_data(p) for p in run_dirs]
-    slugs = {h["slug"] for h, _ in pairs}
-    if len(slugs) != 1:
-        raise ValueError(f"run directories belong to different targets: {sorted(slugs)}")
-    return combine_sources([h for h, _ in pairs], [s for _, s in pairs])
-
-
 # --------------------------------------------------------------- site
-def build_site(run_dirs, out_dir) -> dict:
-    run_dirs = [Path(p) for p in run_dirs]
-    groups: dict[str, list[Path]] = {}                  # slug -> run dirs, in command-line order
-    for p in run_dirs:
-        groups.setdefault(slugify(_read_run(p)["target"]), []).append(p)
-    built = {slug: build_asset_data(ps) for slug, ps in groups.items()}    # all checks pass before anything is written
+REGISTRY = "runs.json"
+
+
+def load_registry(out: Path) -> list[str]:
+    p = out / REGISTRY
+    if not p.exists():
+        return []
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        raise ValueError(f"{p} must be a JSON list of run directory paths")
+    return data
+
+
+def build_site(run_dirs, out_dir, reset=False) -> dict:
+    """Build the site from the registry of the output directory (``runs.json``) plus ``run_dirs``, which are
+    appended to it (de-duplicated, first-seen order). ``reset`` ignores the existing registry."""
     out = Path(out_dir)
+    registry = [] if reset else load_registry(out)
+    for p in run_dirs:
+        ap = str(Path(p).resolve())
+        if ap not in registry:
+            registry.append(ap)
+    if not registry:
+        raise ValueError("no run directories: give at least one RUN_DIR (the registry in the output is empty)")
+    missing = [p for p in registry if not Path(p).is_dir()]
+    if missing:
+        raise ValueError("run directories in the registry do not exist: " + ", ".join(missing)
+                         + " (use --reset to rebuild from the given RUN_DIRs only)")
+    groups: dict[str, list[str]] = {}                  # slug -> run dirs, in registry order
+    for p in registry:
+        groups.setdefault(slugify(_read_run(Path(p))["target"]), []).append(p)
+    built = {slug: build_asset_data(ps) for slug, ps in groups.items()}    # all checks pass before anything is written
     (out / "data").mkdir(parents=True, exist_ok=True)
+    for old in (out / "data").glob("*.json"):
+        if old.stem not in built:
+            old.unlink()                                                    # generated files of targets no longer built
     assets = []
     for slug, data in built.items():
         (out / "data" / f"{slug}.json").write_text(
             json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")), encoding="utf-8")
         assets.append({"target": data["target"], "slug": slug, "sample_end": data["sample_end"],
-                       "db_published_at": data["db_published_at"], "summary": data["summary"],
-                       "sources": [{k: s[k] for k in ("key", "name", "oos_opened", "funnel", "oos_counts")}
-                                   | {"n_factors": len(s["factors"]), "n_skipped": len(s["skipped"])}
-                                   for s in data["sources"]]})
-        for s in data["sources"]:
-            print(f"[site] {data['target']} / {s['name']}: {len(s['factors'])} factors, oos_opened={s['oos_opened']}")
+                       "db_published_at": data["db_published_at"], "funnel": data["funnel"],
+                       "oos_counts": data["oos_counts"], "n_factors": len(data["factors"])})
+        print(f"[site] {data['target']}: {len(data['factors'])} factors from {len(data['runs'])} runs "
+              f"({data['n_merged']} duplicates merged)")
     head, body = render_page({"assets": assets})
     (out / "artifact.html").write_text(head + body, encoding="utf-8")
     (out / "index.html").write_text(
         "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
         + head + "</head>\n<body>\n" + body + "</body>\n</html>\n", encoding="utf-8")
+    (out / REGISTRY).write_text(json.dumps(registry, ensure_ascii=False, indent=1), encoding="utf-8")
     return {"assets": assets}
 
 
@@ -514,12 +632,7 @@ article.card.weak h3 { font-weight: 500; }
 .filterbars { margin: 0 0 22px; }
 .filterbars .filters { margin-bottom: 8px; }
 .glabel { color: var(--muted); font-size: 12px; margin-right: 4px; min-width: 5em; }
-.assetblock { margin: 0 0 26px; }
-.assethead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; cursor: pointer; font-size: 16px; }
-.assethead a { text-decoration: none; border-bottom: 1px solid var(--axis); }
-.srcsec { margin: 0 0 34px; }
-.srchead { font-size: 16px; padding-bottom: 6px; margin: 0 0 4px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
-.summary.srcinfo { margin: 10px 0 16px; padding-bottom: 0; border-bottom: 0; }
+.summary.crit { margin: 10px 0 16px; padding-bottom: 0; border-bottom: 0; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 30rem), 1fr)); gap: 16px; }
 article.card { border: 1px solid var(--border); background: var(--surface); padding: 14px 16px 12px; min-width: 0; }
 .card h3 { font-size: 15px; line-height: 1.35; margin: 0 0 4px; font-weight: 600; overflow-wrap: anywhere; }
@@ -627,9 +740,10 @@ function renderNav(active) {
 }
 
 function oosText(a) {
-  if (!a.oos_opened) return '样本外未打开';
-  var c = a.oos_counts || {};
-  return '确认 ' + c.confirmed + ' · 一致 ' + c.consistent + ' · 失败 ' + c.failed + (c.insufficient ? ' · 样本不足 ' + c.insufficient : '');
+  var c = a.oos_counts || {}, t = '确认 ' + c.confirmed + ' · 一致 ' + c.consistent + ' · 失败 ' + c.failed;
+  if (c.insufficient) t += ' · 样本不足 ' + c.insufficient;
+  if (c.unopened) t += ' · 未打开 ' + c.unopened;
+  return t;
 }
 
 var STAGES = {
@@ -642,31 +756,25 @@ var STAGES = {
 function renderOverview() {
   var root = h('div');
   root.appendChild(h('h1', {text: '因子跟踪看板'}));
-  root.appendChild(h('p', {class: 'sub', text: '每个标的资产一个页面：按来源（候选池）分组，展示全部通过样本内门槛的因子，并按漏斗逐层分开。点击标的或其中一行进入。'}));
+  root.appendChild(h('p', {class: 'sub', text: '每个标的资产一个因子库：展示全部通过样本内门槛的因子（同一因子只出现一次），并按漏斗逐层分开。点击一行进入。'}));
   if (!MANIFEST.assets.length) { root.appendChild(h('div', {class: 'empty', text: '没有资产。'})); return root; }
-  var head = ['来源', '样本内过门槛', '观察期保留', '可交易', '去重后留下', '样本外'];
+  var head = ['标的', '数据截止日', '样本内过门槛', '观察期保留', '可交易', '去重后留下', '样本外'];
+  var tb = h('tbody');
   MANIFEST.assets.forEach(function (a) {
-    var go = function (e) { if (e.target.tagName !== 'A') location.hash = '#' + a.slug; };
-    var tb = h('tbody');
-    a.sources.forEach(function (s) {
-      var f = s.funnel;
-      tb.appendChild(h('tr', {onclick: go}, [
-        h('td', {text: s.name}),
-        h('td', {class: 'n', text: fint(f.n_is)}),
-        h('td', {class: 'n', text: fint(f.n_obs)}),
-        h('td', {class: 'n', text: fint(f.n_trade)}),
-        h('td', {class: 'n', text: fint(f.n_final)}),
-        h('td', {text: oosText(s)})
-      ]));
-    });
-    var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 1 && i <= 4) ? 'n' : null, text: t}); }))]), tb]);
-    root.appendChild(h('section', {class: 'assetblock'}, [
-      h('h2', {class: 'assethead', onclick: go}, [h('a', {href: '#' + a.slug, text: a.target}),
-        h('span', {class: 'muted', text: ' · ' + a.sources.length + ' 个来源 · 因子 ' + a.summary.n_factors + ' 个 · 数据截止 ' + a.sample_end})]),
-      h('div', {class: 'scroll'}, [tbl])
+    var f = a.funnel;
+    tb.appendChild(h('tr', {onclick: function (e) { if (e.target.tagName !== 'A') location.hash = '#' + a.slug; }}, [
+      h('td', null, [h('a', {href: '#' + a.slug, text: a.target})]),
+      h('td', {class: 'mono', text: a.sample_end}),
+      h('td', {class: 'n', text: fint(f.n_is)}),
+      h('td', {class: 'n', text: fint(f.n_obs)}),
+      h('td', {class: 'n', text: fint(f.n_trade)}),
+      h('td', {class: 'n', text: fint(f.n_final)}),
+      h('td', {text: oosText(a)})
     ]));
   });
-  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：样本内过门槛 → 观察期保留 → 可交易（扣成本净 Sharpe 达标）→ 去重后留下 → 样本外确认 / 一致 / 失败。每一层的数字包含更靠后的层；每个来源有自己的漏斗，样本外各自独立：只有该来源运行过 confirm 之后才显示，且只对去重后留下的因子给结论。'}));
+  var tbl = h('table', {class: 'ov'}, [h('thead', null, [h('tr', null, head.map(function (t, i) { return h('th', {class: (i >= 2 && i <= 5) ? 'n' : null, text: t}); }))]), tb]);
+  root.appendChild(h('div', {class: 'scroll'}, [tbl]));
+  root.appendChild(h('p', {class: 'muted', style: 'margin-top:14px', text: '漏斗：样本内过门槛 → 观察期保留 → 可交易（扣成本净 Sharpe 达标）→ 去重后留下 → 样本外确认 / 一致 / 失败。每一层的数字包含更靠后的层。样本外只对去重后留下的因子给结论，且只有该因子所在的测试运行过 confirm 之后才显示，否则为「未打开」。'}));
   return root;
 }
 
@@ -678,6 +786,7 @@ function criteriaEl(a) {
   var txt = '样本内 |z| ≥ ' + c.z_weak + '；观察期方向一致且 IC 不低于样本内的 ' + (Math.round(c.obs_min_retention * 1000) / 10) + '%';
   if (c.min_net_sharpe != null) txt += '；扣成本后净 Sharpe ≥ ' + c.min_net_sharpe + '（样本内+观察期）';
   if (c.dedupe_corr != null) txt += '；去重相关阈值 ' + c.dedupe_corr;
+  if (a.criteria_mixed) txt += '。部分因子来自门槛不同的早期测试';
   return dl('入选条件', [txt], 'wide');
 }
 
@@ -693,36 +802,49 @@ function legendEl(opened, mixed) {
     h('span', null, [h('i', {class: 'key is'}), '样本内']),
     h('span', null, [h('i', {class: 'key obs'}), '观察期']),
     opened ? h('span', null, [h('i', {class: 'key oos'}), '样本外']) : h('span', {class: 'muted'}, [h('i', {class: 'key off'}), '样本外未打开']),
-    mixed ? h('span', {class: 'muted', text: '（仅已打开样本外的来源有此段）'}) : null
+    mixed ? h('span', {class: 'muted', text: '（部分因子的样本外未打开）'}) : null
   ]);
 }
 
+function funnelBar(a, cur, pick) {
+  var f = a.funnel, el = h('div', {class: 'funnel', role: 'group', 'aria-label': '漏斗：点击某一步只看到达该步的因子'});
+  [['样本内过门槛', f.n_is], ['观察期保留', f.n_obs], ['可交易', f.n_trade], ['去重后留下', f.n_final]].forEach(function (p, i) {
+    if (i) el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
+    el.appendChild(h('button', {type: 'button', class: 'fstep', 'aria-pressed': String(cur === i + 1), onclick: function () { pick(i + 1); }}, [p[0] + ' ', h('b', {text: String(p[1])})]));
+  });
+  el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
+  var c = a.oos_counts, kids = ['样本外：确认 ', h('b', {text: String(c.confirmed)}), ' · 一致 ', h('b', {text: String(c.consistent)}), ' · 失败 ', h('b', {text: String(c.failed)})];
+  if (c.insufficient) kids.push(' · 样本不足 ', h('b', {text: String(c.insufficient)}));
+  if (c.unopened) kids.push(' · 未打开 ', h('b', {text: String(c.unopened)}), ' 个');
+  el.appendChild(h('span', {class: 'fend'}, kids));
+  return el;
+}
+
 function renderAsset(a) {
-  var root = h('div'), srcs = a.sources, multi = srcs.length > 1;
-  var nOpen = srcs.filter(function (s) { return s.oos_opened; }).length;
-  var nSkip = srcs.reduce(function (n, s) { return n + s.skipped.length; }, 0);
+  var root = h('div'), cur = 1;
+  var nOpen = a.factors.filter(function (f) { return f.oos_opened; }).length;
+  var nSkip = a.skipped.length;
   root.appendChild(h('h1', {text: a.target + ' 因子跟踪'}));
-  root.appendChild(h('p', {class: 'sub', text: (multi ? srcs.length + ' 个来源，' : '') + '通过样本内门槛的因子共 ' + a.summary.n_factors + ' 个，其中去重后留下 ' + a.summary.n_final + ' 个' + (nSkip ? '；另有 ' + nSkip + ' 个无法标定净值而未出图' : '') + '。'}));
+  root.appendChild(h('p', {class: 'sub', text: '通过样本内门槛的因子共 ' + a.factors.length + ' 个（同一因子只算一次），其中去重后留下 ' + a.funnel.n_final + ' 个' + (nSkip ? '；另有 ' + nSkip + ' 个无法标定净值而未出图' : '') + '。'}));
   root.appendChild(h('dl', {class: 'summary'}, [
     dl('数据截止日', [h('span', {class: 'mono', text: a.sample_end})]),
     dl('标的样本', [h('span', {class: 'mono', text: a.sample_start + ' 至 ' + a.sample_end})]),
     dl('数据库发布', [h('span', {class: 'mono', text: (a.db_published_at || '–').slice(0, 10)})]),
     dl('净值定义', ['单利累计；扣除交易成本；样本内年化波动标定为 10%']),
-    dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < srcs.length)])
+    dl('三段图例', [legendEl(nOpen > 0, nOpen > 0 && nOpen < a.factors.length)])
   ]));
-  var sKey = 'ALL', step = {};
-  srcs.forEach(function (s) { step[s.key] = 1; });
-  var bars = h('div', {class: 'filterbars'});
+  var info = [criteriaEl(a),
+    dl('切分规则', ['每个因子在自身有效数据内按 ' + Math.round(a.is_frac * 100) + '/' + Math.round(a.obs_frac * 100) + '/' + Math.round((1 - a.is_frac - a.obs_frac) * 100) + ' 切成样本内 / 观察期 / 样本外'], 'wide')];
+  if (nSkip) info.push(dl('未出图', [a.skipped.map(function (k) { return k.id; }).join('、')], 'wide'));
   var vbar = h('div', {class: 'filters', role: 'group', 'aria-label': '按样本外结论筛选'});
-  var sbar = h('div', {class: 'filters', role: 'group', 'aria-label': '按来源筛选'});
-  var secs = h('div', {class: 'sections'});
-  var cnt = {ALL: a.summary.n_final};
-  srcs.forEach(function (s) { s.factors.forEach(function (f) { if (f.stage === 4) { var k = f.oos_verdict || 'NONE'; cnt[k] = (cnt[k] || 0) + 1; } }); });
-  var vopts = nOpen ? [['ALL', '全部'], ['CONFIRMED', '确认'], ['CONSISTENT', '一致'], ['FAILED', '失败'], ['INSUFFICIENT', '样本不足']] : [['ALL', '全部']];
+  var funnelHost = h('div'), secs = h('div', {class: 'sections'});
+  var cnt = {ALL: a.funnel.n_final};
+  a.factors.forEach(function (f) { if (f.stage === 4) { var k = f.oos_verdict || 'NONE'; cnt[k] = (cnt[k] || 0) + 1; } });
+  var vopts = [['ALL', '全部']];
+  if (nOpen) vopts.push(['CONFIRMED', '确认'], ['CONSISTENT', '一致'], ['FAILED', '失败'], ['INSUFFICIENT', '样本不足']);
+  if (cnt.NONE) vopts.push(['NONE', '未打开']);
   if (!vopts.some(function (o) { return o[0] === filterKey; })) filterKey = 'ALL';
-  var sopts = [['ALL', '全部', a.summary.n_factors]].concat(srcs.map(function (s) { return [s.key, s.name, s.factors.length]; }));
-  var items = [];
-  var io = null;
+  var items = [], io = null;
   if ('IntersectionObserver' in window) {
     io = new IntersectionObserver(function (es) {
       es.forEach(function (e) {
@@ -736,101 +858,68 @@ function renderAsset(a) {
     if (io) io.disconnect();
     items = [];
     redraws = [];
+    funnelHost.textContent = '';
+    funnelHost.appendChild(funnelBar(a, cur, function (k) { cur = k; fill(); }));
     secs.textContent = '';
-    srcs.forEach(function (s) {
-      if (sKey !== 'ALL' && sKey !== s.key) return;
-      secs.appendChild(section(s, a, items, step, function (k) { step[s.key] = k; fill(); }));
+    var vis = a.factors.filter(function (f) {
+      return f.stage >= cur && (filterKey === 'ALL' || (f.stage === 4 && (f.oos_verdict || 'NONE') === filterKey));
+    });
+    if (!vis.length) secs.appendChild(h('div', {class: 'empty', text: '当前筛选下没有因子。'}));
+    [4, 3, 2, 1].forEach(function (k) {
+      var fs = vis.filter(function (f) { return f.stage === k; });
+      if (!fs.length) return;
+      var list = h('div', {class: 'grid'});
+      fs.forEach(function (f) { list.appendChild(card(f, a, items)); });
+      secs.appendChild(h('section', {class: 'stagesec st' + k, 'aria-label': STAGES[k].name}, [
+        h('h3', {class: 'stagehead'}, [h('span', {class: 'shape', 'aria-hidden': 'true', text: STAGES[k].shape + ' '}), STAGES[k].name, h('span', {class: 'muted', text: ' · ' + fs.length + ' 个'})]),
+        h('p', {class: 'stagedesc muted', text: stageDesc(k, a.criteria)}),
+        list]));
     });
     items.forEach(function (it) {
-      var item = {done: false, draw: function () { item.done = true; drawChart(it.box, it.f, it.opened); }};
+      var item = {done: false, draw: function () { item.done = true; drawChart(it.box, it.f, it.f.oos_opened); }};
       it.box._item = item;
       redraws.push(function () { if (item.done) item.draw(); });
       var top = it.box.getBoundingClientRect().top;
       if (!io || top < window.innerHeight * 1.5) item.draw(); else io.observe(it.box);
     });
     Array.prototype.forEach.call(vbar.querySelectorAll('button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-k') === filterKey)); });
-    Array.prototype.forEach.call(sbar.querySelectorAll('button'), function (b) { b.setAttribute('aria-pressed', String(b.getAttribute('data-k') === sKey)); });
   }
   vbar.appendChild(h('span', {class: 'glabel', text: '样本外结论'}));
   vopts.forEach(function (o) {
     vbar.appendChild(h('button', {type: 'button', 'data-k': o[0], onclick: function () { filterKey = o[0]; fill(); }}, [o[1], h('span', {class: 'cnt', text: String(cnt[o[0]] || 0)})]));
   });
   vbar.appendChild(h('span', {class: 'muted', text: nOpen ? '只对「去重后留下」的因子给结论；选了某个结论时其他层隐藏。' : '样本外未打开，暂无结论可筛选。'}));
-  bars.appendChild(vbar);
-  if (multi) {
-    sbar.appendChild(h('span', {class: 'glabel', text: '来源'}));
-    sopts.forEach(function (o) {
-      sbar.appendChild(h('button', {type: 'button', 'data-k': o[0], onclick: function () { sKey = o[0]; fill(); }}, [o[1], h('span', {class: 'cnt', text: String(o[2])})]));
-    });
-    bars.appendChild(sbar);
-  }
-  root.appendChild(bars);
+  root.appendChild(funnelHost);
+  root.appendChild(h('dl', {class: 'summary crit'}, info));
+  root.appendChild(h('div', {class: 'filterbars'}, [vbar]));
   root.appendChild(secs);
   root._after = fill;
   return root;
-}
-
-function funnelBar(s, cur, pick) {
-  var f = s.funnel, el = h('div', {class: 'funnel', role: 'group', 'aria-label': s.name + ' 漏斗：点击某一步只看到达该步的因子'});
-  [['样本内过门槛', f.n_is], ['观察期保留', f.n_obs], ['可交易', f.n_trade], ['去重后留下', f.n_final]].forEach(function (p, i) {
-    if (i) el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
-    el.appendChild(h('button', {type: 'button', class: 'fstep', 'aria-pressed': String(cur === i + 1), onclick: function () { pick(i + 1); }}, [p[0] + ' ', h('b', {text: String(p[1])})]));
-  });
-  el.appendChild(h('span', {class: 'arr', 'aria-hidden': 'true', text: '→'}));
-  if (s.oos_opened) {
-    var c = s.oos_counts;
-    el.appendChild(h('span', {class: 'fend'}, ['样本外：确认 ', h('b', {text: String(c.confirmed)}), ' · 一致 ', h('b', {text: String(c.consistent)}), ' · 失败 ', h('b', {text: String(c.failed)}), (c.insufficient ? ' · 样本不足 ' : ''), (c.insufficient ? h('b', {text: String(c.insufficient)}) : null)]));
-  } else el.appendChild(h('span', {class: 'muted fend', text: '样本外未打开'}));
-  return el;
-}
-
-function section(s, a, items, step, pick) {
-  var cur = step[s.key];
-  var vis = s.factors.filter(function (f) {
-    return f.stage >= cur && (filterKey === 'ALL' || (f.stage === 4 && f.oos_verdict === filterKey));
-  });
-  var kids = [h('h2', {class: 'srchead'}, [s.name, h('span', {class: 'muted', text: ' · ' + s.factors.length + ' 个因子' + (vis.length !== s.factors.length ? '（当前显示 ' + vis.length + '）' : '')})]),
-    funnelBar(s, cur, pick)];
-  var info = [criteriaEl(s),
-    dl('切分规则', ['每个因子在自身有效数据内按 ' + Math.round(s.is_frac * 100) + '/' + Math.round(s.obs_frac * 100) + '/' + Math.round((1 - s.is_frac - s.obs_frac) * 100) + ' 切成样本内 / 观察期 / 样本外'], 'wide')];
-  if (s.skipped.length) info.push(dl('未出图', [s.skipped.length + ' 个因子无法标定净值：' + s.skipped.map(function (k) { return k.id; }).join('、')], 'wide'));
-  kids.push(h('dl', {class: 'summary srcinfo'}, info));
-  if (!vis.length) kids.push(h('div', {class: 'empty', text: '该来源在当前筛选下没有因子。'}));
-  [4, 3, 2, 1].forEach(function (k) {
-    var fs = vis.filter(function (f) { return f.stage === k; });
-    if (!fs.length) return;
-    var list = h('div', {class: 'grid'});
-    fs.forEach(function (f) { list.appendChild(card(f, s, a, items)); });
-    kids.push(h('section', {class: 'stagesec st' + k, 'aria-label': s.name + ' · ' + STAGES[k].name}, [
-      h('h3', {class: 'stagehead'}, [h('span', {class: 'shape', 'aria-hidden': 'true', text: STAGES[k].shape + ' '}), STAGES[k].name, h('span', {class: 'muted', text: ' · ' + fs.length + ' 个'})]),
-      h('p', {class: 'stagedesc muted', text: stageDesc(k, s.criteria)}),
-      list]));
-  });
-  return h('section', {class: 'srcsec', id: 'src-' + a.slug + '-' + s.key, 'aria-label': s.name}, kids);
 }
 
 function badge(cls, shape, text, extra) {
   return h('span', {class: 'badge ' + cls + (extra ? ' ' + extra : '')}, [h('span', {class: 'shape', 'aria-hidden': 'true', text: shape}), text]);
 }
 
-function card(f, s, a, items) {
+function card(f, a, items) {
   var v = VERD[f.oos_verdict || 'NONE'] || VERD.NONE, st = STAGES[f.stage];
   var box = h('div', {class: 'chartbox'});
   var badges = [badge('dir', f.sign > 0 ? '▲' : '▼', f.direction, 'dir'), badge('stage', st.shape, '到达：' + st.name, 'stage')];
   if (f.stage === 4) badges.push(badge(v.cls, v.shape, '样本外：' + v.label));
-  var el = h('article', {class: 'card' + (f.stage < 4 ? ' weak' : ''), id: 'card-' + a.slug + '-' + s.key + '-' + String(f.id).replace(/\s/g, '_'), 'data-source': s.key, 'data-stage': String(f.stage)}, [
+  var el = h('article', {class: 'card' + (f.stage < 4 ? ' weak' : ''), id: 'card-' + a.slug + '-' + String(f.id).replace(/\s/g, '_'), 'data-stage': String(f.stage)}, [
     h('h3', {text: f.title}),
     h('div', {class: 'idline'}, [h('span', {class: 'mono', text: f.id}), ' · ' + f.group + ' · ' + (f.is_verdict === 'PASS' ? '样本内通过' : '样本内弱通过') + ' · z ' + fx(f.z, 2) + (f.cluster_size > 1 ? ' · 同簇 ' + f.cluster_size + ' 个' : '')]),
+    f.also_as && f.also_as.length ? h('div', {class: 'idline'}, ['同一因子的其他写法：', h('span', {class: 'mono', text: f.also_as.join('、')})]) : null,
     h('div', {class: 'badges'}, badges),
     f.stage_note ? h('p', {class: 'stagenote', text: f.stage_note}) : null,
     h('pre', {class: 'formula', tabindex: '0', 'aria-label': '因子公式', text: f.formula.join('\n')}),
-    cardLegend(s.oos_opened),
+    cardLegend(f.oos_opened),
     box,
     statsTable(f),
     oosNote(f),
     f.flags.length ? h('ul', {class: 'flags'}, f.flags.map(function (t) { return h('li', {text: t}); })) : null
   ]);
-  items.push({box: box, f: f, opened: s.oos_opened});
+  items.push({box: box, f: f});
   return el;
 }
 

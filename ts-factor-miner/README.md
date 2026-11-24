@@ -279,38 +279,34 @@ python -m tsminer site runs/ty-v5 runs/eurusd-v5 --out site-out
 python -m http.server -d site-out        # 本地打开 index.html
 ```
 
-每个 run 目录对应一个来源（候选池）；target 相同的多个 run 合并到同一个标的下，按来源分组展示（来源顺序即命令行里 run 目录的顺序）。例如同一个标的可以同时传入"盲扫原始序列"的 run 与"研究者给定变量清单"的 run：
+每个标的一个统一的因子库：同一标的的所有 run（不论是盲扫原始序列还是研究者给定的变量清单，也不论哪次测的）汇集到一起，**同一个因子只出现一次**，看板不区分来源。
 
-```bash
-python -m tsminer site runs/ty-scan runs/ty-vars --out site-out
-```
+**登记册。** `--out DIR` 目录下维护 `runs.json`（纳入过的 run 目录的绝对路径列表，按首次纳入的顺序）。每次 `site RUN_DIR... --out DIR` 把命令行给出的 run 目录追加并入已有登记（去重），再用登记册里的**全部** run 重建站点；所以以后新测完一个 run，只需 `python -m tsminer site 新run --out DIR`，已有因子合并、新因子新增。`--reset` 忽略已有登记，只用命令行给出的 run。登记册里的目录已不存在时报错并列出缺失路径（退出码 1，可用 `--reset`）；没有任何 run（登记册为空且命令行没给）也报错。命令只读 run 目录，不运行 `mine` 或 `confirm`。
 
-**来源名。** 一个 run 的来源名由纯函数 `infer_source_name` 确定：配置里 `[universe] name` 非空则用它；否则若该 run 的 shortlist 或面板 meta 里存在以 `var:` 开头的序列，为"变量清单"；否则为"原始序列扫描"。同一标的下两个 run 的来源名相同则报错退出（退出码 1），此时在其中一个配置里设置 `[universe] name = "..."` 加以区分（`name` 可选，默认空串，必须是字符串，不影响挖掘本身）。
+**同一因子的合并。** 汇集各 run 中样本内过门槛（`candidates.csv` 里 `verdict` 为 PASS 或 WEAK_PASS）的全部因子。两个因子是同一个因子，当且仅当变换名相同，且在双方 DEV 行（样本内 ∪ 观察期）的共同日期上信号的相关系数绝对值 ≥ `IDENTITY_CORR = 0.999`（共同日期少于 250 个则不是同一个；符号相反也算同一个；判定是传递的，A≡B、B≡C 则三者一组）。典型情形：同一个底层序列在一个 run 里是原始序列、在另一个 run 里是变量清单里的公式变量。合并时保留所在 run 样本外已打开的那条，同等条件下保留较新（登记册里靠后）的 run 的那条，再按 \|z\| 取大；被合并掉的其他 id 记入保留者的 `also_as`，卡片上以"同一因子的其他写法"次要显示。
 
-**展示对象与四层漏斗。** 看板展示每个来源里**所有通过样本内门槛的因子**（`candidates.csv` 中 `verdict` 为 PASS 或 WEAK_PASS 的全部候选），不只是最终 shortlist，并按它们到达的最远一层分层（纯函数 `factor_stage`）：
+**展示对象与四层漏斗。** 看板展示合并后**所有通过样本内门槛的因子**，不只是最终入选的，并按它们到达的最远一层分层（纯函数 `factor_stage`）。前两层由因子自身的属性决定，去重则在合并后的"可交易"池上重新计算（按 `t_dev` 降序，NaN 最后；与已选代表在共同 DEV 日期上的 \|相关系数\| ≥ `dedupe_corr` 则并入第一个满足的代表，共同日期少于 100 视为不相关）。`dedupe_corr`、`z_weak`、`obs_min_retention`、`min_net_sharpe` 取自**最新**一个 run 的配置；各 run 的门槛不一致时数据里 `criteria_mixed` 为 true，页面在入选条件后注明"部分因子来自门槛不同的早期测试"。
 
 | stage | 层 | 含义 |
 |---|---|---|
 | 1 | 观察期未保留 | 过了样本内门槛，但 `obs_status = DROP`（观察期 IC 保留比例低于 `obs_min_retention` 或方向相反） |
-| 2 | 可交易筛选未通过 | 观察期保留（KEEP / INSUFFICIENT），但 `trade_status = DROP`（扣成本后净 Sharpe 低于 `min_net_sharpe`） |
-| 3 | 去重时被合并 | 前几层都过了，但去重时并入了别的代表（`rep` 非空且不是自己） |
-| 4 | 去重后留下 | 在 shortlist 里 |
+| 2 | 可交易筛选未通过 | 观察期保留（KEEP / INSUFFICIENT），但 `trade_status = DROP`（扣成本后净 Sharpe 低于 `min_net_sharpe`；没有 `trade_status` 列的旧 run 视为通过，不会有 stage 2） |
+| 3 | 去重时被合并 | 前几层都过了，但在合并池的去重中并入了别的代表 |
+| 4 | 去重后留下 | 合并池去重后的代表 |
 
-每个因子带 `stage` 与一句 `stage_note`（拦住它的那道门槛的具体数字，数值读自 `candidates.csv` 与 run 配置；stage 4 为空）。更早版本的 run 的 `candidates.csv` 没有 `trade_status` 列时，不会有 stage 2。因子排序：stage 降序；stage 4 内按样本外结论再按 `t_dev`，其余层按 \|z\| 降序。每个来源的漏斗条是 `样本内过门槛 N1 → 观察期保留 N2 → 可交易 N3 → 去重后留下 N4 → 样本外`（每层计数包含更靠后的层），可点击：点第 k 步只显示 stage ≥ k 的因子。被淘汰因子的净值与三段统计照常计算；样本外已打开时它们也画样本外段，但**样本外结论只给 stage 4 的因子**（被淘汰的 `oos_verdict` 为 null），样本外只作展示。看板**不显示、数据文件也不含**"共检验了多少候选"这类总数，只记录过了样本内门槛的因子。
+每个因子带 `stage` 与一句 `stage_note`（拦住它的那道门槛的具体数字，数值读自 `candidates.csv` 与它所在 run 的配置；stage 3 指向合并池里的代表；stage 4 为空）。因子排序：stage 降序；stage 4 内按样本外结论再按 `t_dev`，其余层按 \|z\| 降序。标的的漏斗条是 `样本内过门槛 N1 → 观察期保留 N2 → 可交易 N3 → 去重后留下 N4 → 样本外`（每层计数包含更靠后的层），可点击：点第 k 步只显示 stage ≥ k 的因子。看板**不显示、数据文件也不含**"共检验了多少候选"这类总数，只记录过了样本内门槛的因子。
 
-**各来源独立。** 每个来源保留自己的漏斗、入选条件、切分比例、因子分层与样本外状态：是否打开样本外只看该 run 目录里有没有 `confirm.json`，一个来源已 confirm 不影响另一个来源；未 confirm 的来源不读、不算、不输出任何样本外行。同一个因子 id 可以在两个来源里各出现一次，互不合并。页面里每个标的按来源分节，并提供"样本外结论"与"来源"两组筛选（同时生效）。
-
-该命令只读 run 目录，不运行 `mine` 或 `confirm`。
+**样本外结论由看板计算。** 判定规则是 `confirm.oos_verdict`（输入带符号的样本外 t、带符号的样本外 IC、样本内 IC、`obs_min_retention`；`confirm` 自己也用它）。看板对 stage 4 且所在 run 样本外已打开的因子，用该 run 的配置在样本外行上算同样的统计量（HAC t、IC）并套用该规则；因子在其 run 的 `confirm.csv` 里有记录时，结果与之相同。所在 run 样本外未打开的 stage 4 因子，结论为空，徽标"未打开"，漏斗条写"未打开 k 个"。被淘汰（stage 1–3）的因子在样本外已打开时照样画样本外净值与统计，但不给结论（`oos_verdict` 为 null）。
 
 输出文件：
 
 | 文件 | 内容 |
 |---|---|
-| `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个资产 `#<slug>`） |
+| `index.html` | 完整独立页面（单页，hash 路由：`#overview` 与每个标的 `#<slug>`） |
 | `artifact.html` | 同一模板生成的片段版（无 doctype / html / head / body 标签），用于发布到托管环境 |
-| `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。标的级字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`created_at`、`summary`（因子总数、各样本外结论总数）；`sources` 列表按命令行顺序，每个来源含 `name`、`key`、`run_dir`（目录名）、`is_frac` / `obs_frac`、`oos_opened`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`criteria`（入选条件：`z_weak`、`obs_min_retention`、`min_net_sharpe`、`dedupe_corr`，读自 run.json 的配置快照；没有这些键的旧 run 对应项不显示）、`oos_counts`（只统计 stage 4）、`skipped` 与 `factors`（全部过样本内门槛的因子：`stage`、`stage_note`、`is_verdict`、净值、分段统计、公式、方向，stage 4 另有样本外结论）。因子 id 可能跨来源重复，页面的 DOM id 带来源 `key` |
+| `runs.json` | 登记册，见上 |
+| `data/<slug>.json` | 每个标的一份（slug = target 小写），页面按需 `fetch`。字段：`target`、`slug`、`db_published_at`、`sample_start` / `sample_end`（多个 run 时取最早起点、最晚终点与最新的数据库发布时间）、`is_frac` / `obs_frac`（最新 run）、`created_at`、`funnel`（`n_is`、`n_obs`、`n_trade`、`n_final`）、`oos_counts`（只统计 stage 4：`confirmed`、`consistent`、`failed`、`insufficient`、`unopened`）、`criteria`（`z_weak`、`obs_min_retention`、`min_net_sharpe`、`dedupe_corr`）、`criteria_mixed`、`n_merged`（被合并掉的重复条数）、`skipped`、`runs`（纳入的 run 目录名，仅作追溯）与 `factors`（合并后的统一列表：`stage`、`stage_note`、`is_verdict`、`also_as`、`oos_opened`、净值、分段统计、公式、方向，stage 4 且样本外已打开的另有 `oos_verdict` 与 `oos_confirm`） |
 
-**净值定义。** 对每个展示的因子（不论 stage），取其有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
+**净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值点的日期取收益实现日（信号行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 
-**样本外何时显示。** 只有 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值并附 `confirm.csv` 的样本外结论。否则不读取、不计算、不输出任何样本外行，净值只到观察期末，页面标为"样本外未打开"。
-
+**样本外何时显示。** 只有因子所在的 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值；否则不读取、不计算、不输出该 run 的任何样本外行，净值只到观察期末，页面标为"样本外未打开"。一个 run 已 confirm 不影响同一标的另一个 run。
