@@ -389,17 +389,12 @@ def _oos_conclusion(ctx, j, sign, ic_is):
                                "ic_oos_signed": ic_signed, "retention_oos": ic_signed / abs(float(ic_is))})
 
 
-def build_asset_data(run_dirs) -> dict:
-    """The factor library of one target, pooled over one run directory or a list of them (same target; the order
-    is the registry order, later = newer)."""
-    if isinstance(run_dirs, (str, Path)):
-        run_dirs = [run_dirs]
-    ctxs = [_load_run(p, i) for i, p in enumerate(run_dirs)]
-    slugs = {slugify(c["run"]["target"]) for c in ctxs}
-    if len(slugs) != 1:
-        raise ValueError(f"run directories belong to different targets: {sorted(slugs)}")
-    target, slug = ctxs[0]["run"]["target"], slugs.pop()
-
+def pool_layers(ctxs):
+    """Steps 1-4 of the pooled factor library of one target (``ctxs``: ``_load_run`` outputs, same target):
+    pool the factors that passed the IS bar, merge the same factor, attach each kept factor's net value, and
+    de-duplicate the tradable ones. Returns (pool, rep_of, by_key, skipped, n_merged, criteria, criteria_mixed);
+    a pool entry is at its final layer (stage 4) iff ``factor_stage(e["row"], rep_of.get(e["key"]) == e["key"])``
+    is 4. ``build_asset_data`` and the portfolio engine both read the layers from here."""
     # ---- 1. pool the factors that passed the IS bar, with their DEV signals
     entries, skipped = [], []
     for ctx in ctxs:
@@ -448,6 +443,20 @@ def build_asset_data(run_dirs) -> dict:
     thresh = criteria.get("dedupe_corr", 0.7)
     rep_of = pool_representatives([e["key"] for e in tradable], {e["key"]: e["dev"] for e in tradable}, thresh)
     by_key = {e["key"]: e for e in pool}
+    return pool, rep_of, by_key, skipped, n_merged, criteria, criteria_mixed
+
+
+def build_asset_data(run_dirs) -> dict:
+    """The factor library of one target, pooled over one run directory or a list of them (same target; the order
+    is the registry order, later = newer)."""
+    if isinstance(run_dirs, (str, Path)):
+        run_dirs = [run_dirs]
+    ctxs = [_load_run(p, i) for i, p in enumerate(run_dirs)]
+    slugs = {slugify(c["run"]["target"]) for c in ctxs}
+    if len(slugs) != 1:
+        raise ValueError(f"run directories belong to different targets: {sorted(slugs)}")
+    target, slug = ctxs[0]["run"]["target"], slugs.pop()
+    pool, rep_of, by_key, skipped, n_merged, criteria, criteria_mixed = pool_layers(ctxs)
 
     factors = []
     for e in pool:

@@ -1,4 +1,4 @@
-"""Command line: ``python -m tsminer mine|confirm|site``."""
+"""Command line: ``python -m tsminer mine|confirm|site|portfolio``."""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +28,21 @@ def main(argv=None) -> int:
                          "registered runs, and the same factor tested twice appears once")
     ps.add_argument("--out", required=True, metavar="DIR", help="output directory of the site")
     ps.add_argument("--reset", action="store_true", help="ignore the existing registry; use only the given RUN_DIRs")
+    pp = sub.add_parser("portfolio", help="state machines + equal-weight portfolio of the final-layer factors")
+    pp.add_argument("config", help="TOML with a [portfolio] section (configs/portfolio.toml)")
+    pp.add_argument("run_dirs", nargs="+", metavar="RUN_DIR", help="run directories, grouped by target like `site`")
+    pp.add_argument("--out", required=True, metavar="DIR", help="output directory")
     a = ap.parse_args(argv)
+
+    if a.cmd == "portfolio":
+        from .portfolio import run_portfolio
+        try:
+            run_portfolio(a.config, a.run_dirs, a.out)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"portfolio: {e}", file=sys.stderr)
+            return 1
+        print(f"[portfolio] wrote {a.out}")
+        return 0
 
     if a.cmd == "site":
         from .site import build_site

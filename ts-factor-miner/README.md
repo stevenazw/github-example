@@ -345,3 +345,30 @@ python -m http.server -d site-out        # 本地打开 index.html
 **净值定义。** 对每个展示的因子（不论 stage），取其所在 run 里的有效行，在这些行上一次连续计算（缓冲带状态跨段延续）：`pos = positions(s, sign, buffer)`，`net = pos × y_fwd − cost_per_side × |Δ(pos/σ)|`（首行用 |pos₀/σ₀|）。标定 `k = (0.10/√252) / std(net，样本内行, ddof=1)`，`ret = k × net`，净值 = `1 + cumsum(ret)`（单利累计，不复利），即样本内年化波动标定为 10%。样本内 std 为 0 或非有限的因子不出图，记入 `skipped`。净值用的信号是已含成交延迟的持有信号（见 3.1）；看板数据的 `criteria` 带 `execution_delay`（旧 run 缺省则不显示），资产页"净值定义"附近写"成交：信号形成后第 d 个收盘"，公式里的仓位行为 `pos[t] = ±1 × s[t−d] ÷ σ[t]`。净值点的日期取收益实现日（行 p 的下一个日历行）；这与 `candidates.csv` 的 `is_end` 等日期（信号行的日期）晚一个日历行。每段统计有区间、天数、带符号 IC、净 Sharpe、累计收益（该段 ret 之和）、最大回撤。每个因子最多约 1500 个点，保留各段首末点。
 
 **样本外何时显示。** 只有因子所在的 run 目录里存在 `confirm.json`（即已运行过 `confirm`）才显示：此时输出三段净值；否则不读取、不计算、不输出该 run 的任何样本外行，净值只到观察期末，页面标为"样本外未打开"。一个 run 已 confirm 不影响同一标的另一个 run。
+
+## 10. 因子组合引擎（`portfolio`）
+
+```bash
+python -m tsminer portfolio configs/portfolio.toml runs/ty-v12 runs/ty-vars-v6 runs/ty-recipes-v4 runs/eurusd-v12 --out runs/portfolio-v1
+```
+
+对每个标的（run 目录按 target 分组，同看板），取**看板的最终层**（stage 4「去重后留下」，同一份汇集、合并与去重代码 `site.pool_layers`，不论样本外结论），先给每个因子逐日标上 有效 / 失效，再只持有效因子做等权组合。同一标的的所有 run 必须在标的序列、`cost_per_side`、`buffer`、`vol_halflife` 上一致，否则报错。
+
+**时点约定（严格 T+1，无前视）。** 行是 `prepare` 的行（`y_fwd` 有限的日历位置）。行 t 的信号在 t−1 收盘后形成，承担 `y_fwd[t] = r[t+1]/σ_t`，要到 t+1 收盘才知道。所以行 t 用的状态是 t−1 收盘后定的，只能用行 ≤ t−2 的 `y_fwd` 与信号：状态机在因子**自己的有效行**上用滚动量算（含当行），再整体后移 2 行（`portfolio.LAG`）。基线 `always` 不用任何信息，不后移。预热期与输入缺失一律失效。
+
+**状态机（参数在 `configs/portfolio.toml`，固定，不调参）。** `ric` 是带方向符号的 252 行滚动 IC（`site.rolling_ic`，正 = 因子方向对），L = 63：
+
+| 方法 | 规则 |
+|---|---|
+| `always` 基线 | 有信号就有效 |
+| `slope` 方法一（纯趋势） | `ric[t] > ric[t−L]` 则有效 |
+| `hyst` 方法二（趋势+水平，滞回） | 失效→有效：`ric>0` 且 `ric[t]>ric[t−L]`；有效→失效：`ric<0` 且 `ric[t]<ric[t−L]`；否则保持；初始失效 |
+| `cumic` 方法三（累计 IC 站上均线） | 每日贡献 `sign·s·y_fwd`，累计曲线站上自己的 126 行均线（须满窗）则有效 |
+
+**组合与三种仓位。** 行 t 的有效集合 V_t = 状态有效且有信号且该样本合格的因子；等权，V_t 为空则空仓。`cont` 连续版：各因子（带缓冲带、在因子整段历史上因果地算一次的）仓位 `sign·p_i[t]` 的均值；`binA` 二元·因子级：`sign_i·sign(s_i[t])` 的均值，落在 [−1, 1]；`binB` 二元·组合级：`binA` 的符号（票数相等或无有效因子为 0）。损益由 `engine.simulate` 对每个变体在整个行区间上一次算出，成本按**净仓位**收取。
+
+**两个样本。** `full`：每个最终层因子在自己的全部行上合格——含挑选因子所用的数据，**有选择偏差，偏乐观**。`oos`：因子只在自己的样本外段合格（纳入与样本外结论无关），状态仍可用它更早的历史；组合从各因子最早的样本外起点开始，这是较诚实的样本，但段很短。未打开样本外（无 `confirm.json`）的 run 与看板一样不读取其样本外行：该因子只有 IS + OBS 行，在 `oos` 中无贡献，在 `full` 中止于观察期末（它在观察期末后一日的收益 `y_fwd` 与看板净值一样会用到）。每个样本的行区间 = 其最早合格行到最晚合格行，同一样本内各方法区间相同，预热期计为空仓。
+
+输出（每个标的一组，slug = target 小写）：`pnl_<slug>.csv`（date, method, position_version, sample, n_valid, position, gross, net；date 为持仓所在行的日期，损益是该日收盘到下一行收盘）、`summary_<slug>.csv`（每个 方法×仓位×样本 一行：区间、净/毛 Sharpe、按本样本事后标定到 10% 年化波动的单利净值的最大回撤与累计收益（仅作展示）、日均仓位变化、平均有效因子数、空仓占比、与做多标的日收益的相关与后者的 Sharpe）、`state_changes_<slug>.csv`（只含状态变化）、`current_<slug>.csv`（每因子最后一行的状态、该状态自何日起、最新滚动 IC）、`portfolio.json`（参数、数据指纹、因子清单、汇总）与中文 `report.md`。
+
+注意：多个方法、多种仓位在同一份数据上比较，表现最好的不是一次发现；`oos` 段短，夏普误差大。

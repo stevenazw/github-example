@@ -1,0 +1,9 @@
+# 组合引擎参数 (python -m tsminer portfolio configs/portfolio.toml RUN_DIR... --out DIR)。
+# 全部在看结果之前固定, 不做调参。
+
+[portfolio]
+ic_window = 252          # 滚动 IC 窗口 (因子自己有效行上的行数)
+slope_lookback = 63      # L: 滚动 IC 与 L 行之前的滚动 IC 比较 (方法一 / 方法二)
+cumic_ma = 126           # 累计 IC 曲线的移动平均长度 (方法三)
+methods = ["always", "slope", "hyst", "cumic"]   # always 为基线 (永远有效)
+positions = ["cont", "binA", "binB"]             # 连续版 / 二元·因子级 / 二元·组合级

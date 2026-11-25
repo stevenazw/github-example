@@ -108,6 +108,23 @@ class VerdictConfig:
     min_net_sharpe: float = 0.3   # DEV (IS+OBS) annualised net Sharpe floor, applied before de-duplication
 
 
+PORTFOLIO_METHODS = ("always", "slope", "hyst", "cumic")
+PORTFOLIO_POSITIONS = ("cont", "binA", "binB")
+
+
+@dataclass
+class PortfolioConfig:
+    """Portfolio engine parameters (``[portfolio]`` of configs/portfolio.toml); fixed before looking at results."""
+    ic_window: int = 252                 # rolling IC window (rows of the factor's own valid history)
+    slope_lookback: int = 63             # L: compare the rolling IC with its value L rows earlier
+    cumic_ma: int = 126                  # moving-average length of the cumulative IC curve
+    methods: list[str] = field(default_factory=lambda: list(PORTFOLIO_METHODS))
+    positions: list[str] = field(default_factory=lambda: list(PORTFOLIO_POSITIONS))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class Config:
     target: TargetConfig
@@ -390,3 +407,31 @@ def load_run_config(run_dir: str | os.PathLike) -> Config:
     if "execution_delay" not in snap.get("config", {}).get("position", {}):
         cfg.position.execution_delay = 0
     return cfg
+
+
+def load_portfolio_config(path: str | os.PathLike) -> PortfolioConfig:
+    """Load ``[portfolio]`` from a TOML file (the only allowed section); strict like ``load_config``."""
+    with open(path, "rb") as fh:
+        try:
+            raw = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"invalid TOML in {path}: {e}") from e
+    unknown = set(raw) - {"portfolio"}
+    if unknown:
+        raise ValueError(f"unknown top-level section(s): {sorted(unknown)}")
+    if "portfolio" not in raw:
+        raise ValueError("missing required section [portfolio]")
+    sec = _section(raw, "portfolio", {"ic_window", "slope_lookback", "cumic_ma", "methods", "positions"})
+    for k in ("ic_window", "slope_lookback", "cumic_ma"):
+        if k in sec:
+            _check_type(sec[k], (int,), f"portfolio.{k}")
+    for k, allowed in (("methods", PORTFOLIO_METHODS), ("positions", PORTFOLIO_POSITIONS)):
+        if k in sec:
+            v = _str_list(sec[k], f"portfolio.{k}")
+            bad = [x for x in v if x not in allowed]
+            if bad or not v or len(set(v)) != len(v):
+                raise ValueError(f"portfolio.{k}: a non-empty list of distinct names from {list(allowed)}, got {v}")
+    pc = PortfolioConfig(**sec)
+    if pc.ic_window < 2 or pc.slope_lookback < 1 or pc.cumic_ma < 2:
+        raise ValueError("portfolio requires ic_window >= 2, slope_lookback >= 1 and cumic_ma >= 2")
+    return pc
